@@ -246,6 +246,16 @@ function startServer() {
     app.use('/api/inventaireemb', verifyToken, inventairePackageRoutes);
     app.use('/api/purchase-orders', verifyToken, bonCommandeRoutes);
 
+// --- SERVIR LE FRONTEND REACT (PRODUCTION / CLOUD) ---
+const frontendBuildPath = path.join(__dirname, "../frontend/build");
+app.use(express.static(frontendBuildPath));
+
+app.get('*', (req, res) => {
+    if (req.path.startsWith('/api')) {
+        return res.status(404).json({ error: 'Route API introuvable' });
+    }
+    res.sendFile(path.join(frontendBuildPath, 'index.html'));
+});
     // --- DÉMARRAGE ÉCOUTE ---
     server.listen(PORT, '0.0.0.0', async () => { 
        console.log(`🟢 ERP ACTIF SUR PORT ${PORT}`);
