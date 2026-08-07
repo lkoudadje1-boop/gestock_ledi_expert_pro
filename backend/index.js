@@ -5,7 +5,7 @@ const { purgeOldAttempts } = require('./controllers/auth.controller');
 
 // --- 2. RÉCUPÉRATION DU CHEMIN DE DONNÉES ---
 // En Dev, si USER_DATA_PATH n'existe pas, on utilise un dossier /data local
-const userDataPath = process.env.USER_DATA_PATH || (require('path').join(__dirname, '../data'));
+const userDataPath = process.env.USER_DATA_PATH || path.join(__dirname, '../data');
 
 async function bootstrap() {
     try {
@@ -26,4 +26,4 @@ async function bootstrap() {
     }
 }
 
-bootstrap();const path = require('path');
+bootstrap();
