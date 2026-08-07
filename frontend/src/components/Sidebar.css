@@ -1,0 +1,73 @@
+/* ====================================================== */
+/* CORRECTION CRITIQUE DU CHEVAUCHEMENT DE LA SIDEBAR     */
+/* ====================================================== */
+
+/* Force le menu de navigation à empiler verticalement ses éléments sans collision */
+.sidebar-nav,
+.sidebar-nav-3d {
+  display: flex;
+  flex-direction: column;
+  gap: 6px; /* Ajoute un espace de sécurité entre chaque bouton */
+  width: 100%;
+}
+
+/* Ajustement global des conteneurs de boutons pour empêcher la superposition */
+.nav-item,
+.nav-item-3d {
+  display: flex !important;
+  align-items: center;
+  justify-content: flex-start;
+  width: 100% !important;
+  height: auto !important; /* Laisse le bouton s'adapter à la taille de son texte */
+  min-height: 40px; /* Assure une zone de clic minimale confortable */
+  padding: 10px 14px;
+  text-align: left;
+  white-space: normal !important; /* Permet le retour à la ligne si le texte est long (ex: Espagnol) */
+  word-break: break-word; /* Coupe proprement les mots si nécessaire */
+}
+
+/* Alignement interne des textes et icônes */
+.nav-item span,
+.nav-item-3d span {
+  display: inline-block;
+  line-height: 1.4; /* Améliore le confort de lecture sur les lignes multiples */
+  width: 100%;
+}
+
+/* ====================================================== */
+/* STRUCTURE NETTE ET PROPRE POUR LES SOUS-MENUS          */
+/* ====================================================== */
+
+/* Espace réservé pour la liste des sous-menus imbriqués */
+.sub-menu-list,
+.sub-menu-list-3d {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-left: 15px; /* Décalage pour l'arborescence */
+  margin: 4px 0 12px 12px;
+  border-left: 1px solid rgba(255, 255, 255, 0.1); /* Ligne guide discrète */
+}
+
+/* Style des sous-items */
+.sub-item,
+.sub-item-3d {
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  text-align: left;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  border-radius: 8px;
+  white-space: normal !important;
+  width: 100%;
+  transition: all 0.2s ease;
+}
+
+.sub-item:hover,
+.sub-item-3d:hover {
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.05);
+}

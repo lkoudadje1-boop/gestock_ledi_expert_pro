@@ -1,0 +1,521 @@
+/* ====================================================== */
+/* 🎨 CONFIGURATION DES THÈMES INTERACTIFS (GLOW & GLASS)  */
+/* ====================================================== */
+
+:root, [data-theme="dark"] {
+  --bg-main: #090d16;
+  --bg-card: rgba(15, 23, 42, 0.55);
+  --bg-card-hover: rgba(20, 32, 59, 0.7);
+  --border-color: rgba(51, 65, 85, 0.6);
+  --border-badge: rgba(71, 85, 105, 0.5);
+  --text-main: #f8fafc;
+  --text-muted: #94a3b8;
+  --text-secondary: #64748b;
+  --btn-sec-bg: rgba(30, 41, 59, 0.4);
+  --btn-sec-text: #f8fafc;
+  --btn-sec-hover: rgba(51, 65, 85, 0.7);
+  --shadow-primary: rgba(67, 24, 255, 0.6);
+  --shadow-panel: rgba(0, 0, 0, 0.7);
+  --toggle-bg: rgba(30, 41, 59, 0.4);
+  --toggle-border: rgba(71, 85, 105, 0.5);
+  --grid-color: rgba(255, 255, 255, 0.02);
+  --glow-color: rgba(67, 24, 255, 0.15);
+}
+
+[data-theme="light"] {
+  --bg-main: #f4f7fe;
+  --bg-card: rgba(255, 255, 255, 0.85);
+  --bg-card-hover: rgba(241, 245, 249, 0.95);
+  --border-color: rgba(203, 213, 225, 0.8);
+  --border-badge: rgba(148, 163, 184, 0.6);
+  --text-main: #0f172a;
+  --text-muted: #475569;
+  --text-secondary: #94a3b8;
+  --btn-sec-bg: rgba(241, 245, 249, 0.9);
+  --btn-sec-text: #0f172a;
+  --btn-sec-hover: rgba(226, 232, 240, 1);
+  --shadow-primary: rgba(67, 24, 255, 0.2);
+  --shadow-panel: rgba(148, 163, 184, 0.15);
+  --toggle-bg: #ffffff;
+  --toggle-border: rgba(203, 213, 225, 1);
+  --grid-color: rgba(0, 0, 0, 0.02);
+  --glow-color: rgba(67, 24, 255, 0.04);
+}
+
+/* ====================================================== */
+/* 🖥️ STRUCTURE DE BASE & PERSPECTIVE CINÉMATIQUE 3D      */
+/* ====================================================== */
+
+.auth-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-main);
+  color: var(--text-main);
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  position: relative;
+  overflow: hidden;
+  padding: 40px 20px;
+  box-sizing: border-box;
+  perspective: 1200px; /* Force l'univers tridimensionnel en profondeur */
+  transition: background 0.4s ease, color 0.4s ease;
+}
+
+/* Grille tech d'infrastructure arrière-plan */
+.auth-page::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background-image: 
+    linear-gradient(var(--grid-color) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-color) 1px, transparent 1px);
+  background-size: 40px 40px;
+  pointer-events: none;
+  z-index: 1;
+}
+
+/* Halos lumineux néon diffus d'ambiance */
+.auth-page::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 600px;
+  height: 600px;
+  background: radial-gradient(circle, var(--glow-color) 0%, transparent 70%);
+  pointer-events: none;
+  z-index: 1;
+  filter: blur(40px);
+}
+
+/* ====================================================== */
+/* 🏠 BOUTON RETOUR ACCUEIL IMMERSIF (BLEU MARINE)        */
+/* ====================================================== */
+
+.back-home-btn {
+  position: absolute;
+  top: 30px;
+  right: 30px;
+  z-index: 150;
+  background: var(--toggle-bg);
+  border: 1px solid var(--toggle-border);
+  color: #1b2559; /* Teinte d'origine bleu marine de vos titres h2 */
+  padding: 10px 18px;
+  border-radius: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  font-family: inherit;
+  font-weight: bold;
+  font-size: 13px;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  box-shadow: 0 4px 12px var(--shadow-panel);
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.back-home-btn:hover {
+  transform: translateY(-2px);
+  border-color: #4318ff;
+  color: #4318ff; /* Évolution vers le bleu violet d'action au survol */
+  box-shadow: 0 6px 16px rgba(67, 24, 255, 0.25);
+}
+
+.back-home-btn svg {
+  color: #1b2559;
+  transition: all 0.2s ease;
+}
+
+.back-home-btn:hover svg {
+  color: #4318ff;
+  transform: scale(1.05);
+}
+
+/* ====================================================== */
+/* 🎴 ENVELOPPE CRISTAL EN ANGLE INCLINÉ 3D               */
+/* ====================================================== */
+
+.auth-card {
+  background: var(--bg-card);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid var(--border-color);
+  padding: 40px;
+  border-radius: 28px;
+  width: 100%;
+  max-width: 440px;
+  box-sizing: border-box;
+  z-index: 2;
+  /* Légère inclinaison cinématique par défaut */
+  transform: rotateY(-8deg) rotateX(4deg) translateZ(0);
+  box-shadow: 
+    -15px 25px 50px var(--shadow-panel),
+    0 0 30px -10px var(--glow-color);
+  transition: all 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* Redressement progressif de la carte 3D au survol de l'utilisateur */
+.auth-card:hover {
+  transform: rotateY(0deg) rotateX(0deg) scale(1.01) translateZ(10px);
+  box-shadow: 
+    0 30px 60px var(--shadow-panel),
+    0 0 40px -5px var(--shadow-primary);
+}
+
+.auth-header {
+  text-align: center;
+  margin-bottom: 30px;
+}
+
+.auth-header h2 {
+  margin: 0 0 8px 0;
+  color: #1b2559; /* Conserve le bleu marine d'origine */
+  font-size: 26px;
+  font-weight: 800;
+  letter-spacing: -0.5px;
+}
+
+.auth-header p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 14px;
+}
+
+/* ====================================================== */
+/* ⌨️ ENTRÉES DE SAISIE MODÈLES CONTRASTÉES                */
+/* ====================================================== */
+
+.auth-form {
+  display: flex;
+  flex-direction: column;
+}
+
+.input-group {
+  display: flex;
+  align-items: center;
+  border: 1px solid var(--border-color);
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 14px;
+  padding: 14px;
+  margin-bottom: 18px;
+  position: relative;
+  transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+[data-theme="light"] .input-group {
+  background: rgba(255, 255, 255, 0.6);
+  border-color: #e0e5f2;
+}
+
+.input-group:focus-within {
+  border-color: #4318ff;
+  background: rgba(255, 255, 255, 0.05);
+  box-shadow: 0 0 0 4px rgba(67, 24, 255, 0.15);
+}
+
+[data-theme="light"] .input-group:focus-within {
+  background: #ffffff;
+}
+
+.input-group .icon {
+  color: var(--text-secondary);
+  flex-shrink: 0;
+}
+
+.input-group input {
+  border: none;
+  outline: none;
+  width: 100%;
+  margin-left: 12px;
+  font-size: 14.5px;
+  font-weight: 500;
+  background: transparent;
+  color: var(--text-main);
+}
+
+.input-group input::placeholder {
+  color: var(--text-secondary);
+  opacity: 0.8;
+}
+
+.toggle-password {
+  background: none;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  padding: 0;
+}
+
+/* BOUTONS ET CONTROLE DE CHARGEMENT */
+.btn-primary {
+  width: 100%;
+  background: linear-gradient(135deg, #4318ff 0%, #3311cc 100%);
+  color: white;
+  border: none;
+  padding: 16px;
+  border-radius: 14px;
+  font-weight: bold;
+  font-size: 15px;
+  cursor: pointer;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 10px;
+  box-shadow: 0 10px 25px rgba(67, 24, 255, 0.3);
+  transition: all 0.3s ease;
+}
+
+.btn-primary:hover:not(:disabled) {
+  transform: translateY(-2px);
+  box-shadow: 0 15px 30px rgba(67, 24, 255, 0.45);
+}
+
+.btn-primary:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.spinner {
+  width: 20px;
+  height: 20px;
+  border: 3px solid rgba(255, 255, 255, 0.3);
+  border-radius: 50%;
+  border-top-color: #ffffff;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* ====================================================== */
+/* ⚠️ INCIDENTS, REUSSITES ET STRUCTURES DES MODALES       */
+/* ====================================================== */
+
+.error-badge {
+  background: #fee2e2;
+  color: #dc2626;
+  padding: 12px;
+  border-radius: 8px;
+  margin-bottom: 20px;
+  font-size: 0.9rem;
+  text-align: center;
+  border: 1px solid #fecaca;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  animation: shake 0.4s ease-in-out;
+}
+
+.success-badge {
+  background: #f0fdf4;
+  color: #166534;
+  padding: 12px;
+  border-radius: 8px;
+  margin-bottom: 20px;
+  font-size: 0.9rem;
+  text-align: center;
+  border: 1px solid #bbf7d0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(4, 6, 11, 0.6);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
+}
+
+.session-modal {
+  background: var(--bg-card);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--border-color);
+  padding: 40px;
+  border-radius: 24px;
+  width: 90%;
+  max-width: 440px;
+  text-align: center;
+  box-shadow: 0 30px 60px var(--shadow-panel);
+  animation: slideIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+.modal-icon {
+  margin-bottom: 1rem;
+  display: flex;
+  justify-content: center;
+}
+
+.modal-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 1.5rem;
+}
+
+.btn-modal-primary {
+  background: #3182ce;
+  color: white;
+  padding: 14px;
+  border-radius: 12px;
+  border: none;
+  font-weight: bold;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(49, 130, 206, 0.2);
+}
+
+.btn-modal-secondary {
+  background: var(--btn-sec-bg);
+  color: var(--btn-sec-text);
+  border: 1px solid var(--border-color);
+  padding: 14px;
+  border-radius: 12px;
+  cursor: pointer;
+  font-weight: bold;
+  transition: background 0.2s ease;
+}
+
+.btn-modal-secondary:hover {
+  background: var(--btn-sec-hover);
+}
+
+/* --- Conteneur de succès (Post-Signup / Reset) --- */
+.success-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 2rem;
+  background: var(--bg-card);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--border-color);
+  border-radius: 24px;
+  box-shadow: 0 30px 60px var(--shadow-panel);
+  width: 100%;
+  max-width: 450px;
+  margin: auto;
+}
+
+/* --- Pied de page des formulaires --- */
+.auth-footer {
+  margin-top: 25px;
+  font-size: 0.9rem;
+  color: #64748b;
+  text-align: center;
+}
+
+.auth-footer a {
+  color: #4318ff;
+  text-decoration: none;
+  font-weight: 600;
+  transition: color 0.2s ease;
+}
+
+.auth-footer a:hover {
+  color: #3311cc;
+  text-decoration: underline;
+}
+
+/* ====================================================== */
+/* 🍞 LOGIQUE DE NOTIFICATION TOAST                      */
+/* ====================================================== */
+
+/* ====================================================== */
+/* 🍞 COMPOSANT TOAST DETACHE ET FLOTTANT (FIXED)         */
+/* ====================================================== */
+
+.toast-notification {
+  position: fixed !important;   /* Extrait l'élément de la flexbox globale */
+  top: 30px !important;         /* Aligne le bloc en haut de l'écran */
+  right: 30px !important;       /* Aligne le bloc sur le bord droit */
+  transform: none !important;   /* Annule les anciens décalages X/Y */
+  
+  background-color: #22c55e !important; /* Couleur verte de validation */
+  color: #ffffff !important;
+  font-weight: 600;
+  font-size: 13px;
+  backdrop-filter: blur(10px);
+  padding: 12px 20px;
+  border-radius: 10px;
+  z-index: 999999 !important;   /* Passe au-dessus de l'application */
+  
+  display: flex !important;
+  align-items: center;
+  gap: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.15);
+  animation: fadeInToast 0.3s ease forwards;
+}
+
+@keyframes fadeInToast {
+  from { 
+    opacity: 0; 
+    transform: translateX(50px) scale(0.9); /* Arrive de la droite en étant un peu plus petit */
+  }
+  to { 
+    opacity: 1; 
+    transform: translateX(0) scale(1); 
+  }
+}
+
+.toast-notification.success {
+  background: #22c55e;
+  border: 1px solid #16a34a;
+}
+
+.toast-notification.error {
+  background: #ef4444;
+  border: 1px solid #dc2626;
+  animation: slideInToast 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards, 
+             shake 0.4s ease-in-out 0.3s;
+}
+
+/* ====================================================== */
+/* 🎭 KEYFRAMES CINÉMATIQUES DES AXES D'ANIMATION         */
+/* ====================================================== */
+
+@keyframes slideIn {
+  from { transform: translateY(-20px) rotateY(-8deg); opacity: 0; }
+  to { transform: translateY(0) rotateY(-8deg); opacity: 1; }
+}
+
+@keyframes slideInToast {
+  to { transform: translateY(0); opacity: 1; }
+}
+
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-5px); }
+  75% { transform: translateX(5px); }
+}
+
+/* RESPONSIVE DESIGN COMPACT */
+@media (max-width: 580px) {
+  .back-home-btn {
+    top: 20px;
+    right: 20px;
+    padding: 12px;
+    border-radius: 10px;
+  }
+  .back-home-btn span {
+    display: none;
+  }
+  .auth-card {
+    padding: 30px 20px;
+    border-radius: 20px;
+    transform: none !important; /* Désactive la 3D sur mobile pour optimiser la lisibilité tactile */
+    box-shadow: 0 10px 25px var(--shadow-panel);
+  }
+}

@@ -1,0 +1,33 @@
+.auth-container {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    min-height: 100vh;
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    font-family: 'Segoe UI', sans-serif;
+}
+
+.auth-card {
+    background: white;
+    padding: 30px;
+    border-radius: 12px;
+    box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+    width: 100%;
+    max-width: 400px;
+    text-align: center;
+}
+
+.form-group { text-align: left; margin-bottom: 15px; }
+.form-group label { display: block; font-weight: bold; margin-bottom: 5px; color: #333; }
+.form-group input { 
+    width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 6px; 
+}
+
+.login-button {
+    width: 100%; padding: 12px; background: #4e54c8; color: white;
+    border: none; border-radius: 6px; cursor: pointer; font-weight: bold;
+}
+
+.alert { padding: 10px; border-radius: 6px; margin-bottom: 15px; font-size: 14px; }
+.alert-danger { background: #fee2e2; color: #b91c1c; border: 1px solid #f87171; }
+.alert-success { background: #dcfce7; color: #15803d; border: 1px solid #4ade80; }
