@@ -7,13 +7,13 @@
   "engines": {
     "node": "22.x"
   },
-  "scripts": {
-    "start": "concurrently \"npm run backend\" \"npm run ui\" \"npm run desktop\"",
+"scripts": {
+    "start": "node backend/index.js",
     "backend": "node backend/index.js",
     "ui": "npm start --prefix frontend",
     "desktop": "wait-on http://localhost:3000 && electron .",
     "rebuild": "electron-rebuild -v 30.5.1 -f -w better-sqlite3-multiple-ciphers",
-    "postinstall": "electron-builder install-app-deps",
+    "postinstall": "npm rebuild better-sqlite3-multiple-ciphers --update-binary",
     "prod:build-ui": "npm run build --prefix frontend",
     "prod:bundle-backend": "ncc build backend/index.js -o backend_dist --no-cache --external better-sqlite3-multiple-ciphers",
     "prod:obfuscate-backend": "javascript-obfuscator backend_dist/index.js --output backend_dist/index.js --compact true --string-array true --string-array-encoding base64 --string-array-threshold 1.0",
