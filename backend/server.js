@@ -66,9 +66,9 @@ const syncRoutes = require('./routes/sync.routes'); // 🚀 IMPORTATION DES ROUT
 const app = express();
 const PORT = process.env.PORT || 3030;
 
-// --- CLOUD LISTENER ---
 const setupCloudListener = (companyId) => {
-    const CLOUD_URL = 'https://erp-ledi-expert-backend-v1.onrender.com';
+    // 🌐 Remplacement de l'ancienne URL Render par Railway
+    const CLOUD_URL = 'https://erplediexpertcloud-production.up.railway.app';
     const cloudSocket = ioClient(CLOUD_URL, {
         transports: ['websocket'],
         reconnection: true,
@@ -246,16 +246,17 @@ function startServer() {
     app.use('/api/inventaireemb', verifyToken, inventairePackageRoutes);
     app.use('/api/purchase-orders', verifyToken, bonCommandeRoutes);
 
-// --- SERVIR LE FRONTEND REACT (PRODUCTION / CLOUD) ---
-const frontendBuildPath = path.join(__dirname, "../frontend/build");
-app.use(express.static(frontendBuildPath));
+    // --- SERVIR LE FRONTEND REACT (PRODUCTION / CLOUD) ---
+    const frontendBuildPath = path.join(__dirname, "../frontend/build");
+    app.use(express.static(frontendBuildPath));
 
-app.get('*', (req, res) => {
-    if (req.path.startsWith('/api')) {
-        return res.status(404).json({ error: 'Route API introuvable' });
-    }
-    res.sendFile(path.join(frontendBuildPath, 'index.html'));
-});
+    app.get('*', (req, res) => {
+        if (req.path.startsWith('/api')) {
+            return res.status(404).json({ error: 'Route API introuvable' });
+        }
+        res.sendFile(path.join(frontendBuildPath, 'index.html'));
+    });
+
     // --- DÉMARRAGE ÉCOUTE ---
     server.listen(PORT, '0.0.0.0', async () => { 
        console.log(`🟢 ERP ACTIF SUR PORT ${PORT}`);
