@@ -1,60 +1,127 @@
-const { getDb } = require('../config/database');
+// backend/services/Rap_BalanceAgee.service.js
+const { CloudPlanTiers, CloudLigneEcriture } = require('../models/cloud.model');
 
 class BalanceAgeeService {
     /**
-     * Récupère les données de la balance âgée avec calcul des tranches de retard
+     * Récupère les données de la balance âgée avec calcul des tranches de retard (MongoDB Pipeline)
      */
     async fetchBalanceAgee(filters, companyId) {
-        const db = getDb();
         const { exerciceId, typeTiers, datePivot } = filters;
+        const pivotDate = new Date(datePivot || Date.now());
 
-        // Gestion du filtre dynamique par type de tiers
-        let typeFilter = "";
-        const queryParams = [datePivot, datePivot, datePivot, datePivot, datePivot, companyId, exerciceId];
-        
+        const matchStage = {
+            company_id: companyId.toString(),
+            exercice_id: exerciceId.toString(),
+            is_deleted: { $ne: 1 }
+        };
+
+        const tierMatch = {
+            company_id: companyId.toString()
+        };
+
         if (typeTiers && typeTiers !== 'TOUT') {
-            typeFilter = `AND pt.type_tiers = ?`;
-            queryParams.push(typeTiers);
+            tierMatch.type_tiers = typeTiers;
         }
 
-        const sql = `
-            SELECT 
-                pt.numero_tiers as num_tiers,
-                pt.nom as nom_tiers,
-                pt.type_tiers,
-                ROUND(SUM(l.debit - l.credit), 2) as solde,
-                
-                -- 1. NON ÉCHU : Échéance >= Date Pivot
-                ROUND(SUM(CASE WHEN l.date_echeance >= ? THEN (l.debit - l.credit) ELSE 0 END), 2) as non_echu,
+        const pipeline = [
+            { $match: matchStage },
+            {
+                $lookup: {
+                    from: 'cloud_plan_tiers',
+                    let: { tierNum: '$num_tiers', cid: companyId.toString() },
+                    pipeline: [
+                        {
+                            $match: {
+                                $expr: {
+                                    $and: [
+                                        { $eq: ['$numero_tiers', '$$tierNum'] },
+                                        { $eq: ['$company_id', '$$cid'] },
+                                        ...(typeTiers && typeTiers !== 'TOUT' ? [{ $eq: ['$type_tiers', typeTiers] }] : [])
+                                    ]
+                                }
+                            }
+                        }
+                    ],
+                    as: 'tier'
+                }
+            },
+            { $unwind: '$tier' },
+            {
+                $addFields: {
+                    netAmount: { $subtract: ['$debit', '$credit'] },
+                    // Calcul de la différence en jours entre la date pivot et la date d'échéance
+                    diffDays: {
+                        $cond: {
+                            if: { $and: ['$date_echeance', { $ne: ['$date_echeance', null] }] },
+                            then: {
+                                $divide: [
+                                    { $subtract: [pivotDate, { $toDate: '$date_echeance' }] },
+                                    1000 * 60 * 60 * 24
+                                ]
+                            },
+                            then: 0
+                        }
+                    }
+                }
+            },
+            {
+                $group: {
+                    _id: {
+                        numero_tiers: '$tier.numero_tiers',
+                        nom: '$tier.nom',
+                        type_tiers: '$tier.type_tiers'
+                    },
+                    solde: { $sum: '$netAmount' },
+                    non_echu: {
+                        $sum: {
+                            $cond: [{ $gte: ['$diffDays', 0] }, '$netAmount', 0]
+                        }
+                    },
+                    tranche_1_30: {
+                        $sum: {
+                            $cond: [{ $and: [{ $gte: ['$diffDays', 1] }, { $lte: ['$diffDays', 30] }] }, '$netAmount', 0]
+                        }
+                    },
+                    tranche_31_45: {
+                        $sum: {
+                            $cond: [{ $and: [{ $gte: ['$diffDays', 31] }, { $lte: ['$diffDays', 45] }] }, '$netAmount', 0]
+                        }
+                    },
+                    tranche_46_60: {
+                        $sum: {
+                            $cond: [{ $and: [{ $gte: ['$diffDays', 46] }, { $lte: ['$diffDays', 60] }] }, '$netAmount', 0]
+                        }
+                    },
+                    tranche_plus_61: {
+                        $sum: {
+                            $cond: [{ $gt: ['$diffDays', 60] }, '$netAmount', 0]
+                        }
+                    }
+                }
+            },
+            {
+                $match: {
+                    $expr: { $gt: [{ $abs: '$solde' }, 0.01] }
+                }
+            },
+            {
+                $project: {
+                    _id: 0,
+                    num_tiers: '$_id.numero_tiers',
+                    nom_tiers: '$_id.nom',
+                    type_tiers: '$_id.type_tiers',
+                    solde: { $round: ['$solde', 2] },
+                    non_echu: { $round: ['$non_echu', 2] },
+                    tranche_1_30: { $round: ['$tranche_1_30', 2] },
+                    tranche_31_45: { $round: ['$tranche_31_45', 2] },
+                    tranche_46_60: { $round: ['$tranche_46_60', 2] },
+                    tranche_plus_61: { $round: ['$tranche_plus_61', 2] }
+                }
+            },
+            { $sort: { num_tiers: 1 } }
+        ];
 
-                -- 2. Tranche 1-30j : Retard entre 1 et 30 jours
-                ROUND(SUM(CASE WHEN (julianday(?) - julianday(l.date_echeance)) BETWEEN 1 AND 30 
-                    THEN (l.debit - l.credit) ELSE 0 END), 2) as tranche_1_30,
-
-                -- 3. Tranche 31-45j : Retard entre 31 et 45 jours
-                ROUND(SUM(CASE WHEN (julianday(?) - julianday(l.date_echeance)) BETWEEN 31 AND 45 
-                    THEN (l.debit - l.credit) ELSE 0 END), 2) as tranche_31_45,
-
-                -- 4. Tranche 46-60j : Retard entre 46 et 60 jours
-                ROUND(SUM(CASE WHEN (julianday(?) - julianday(l.date_echeance)) BETWEEN 46 AND 60 
-                    THEN (l.debit - l.credit) ELSE 0 END), 2) as tranche_46_60,
-
-                -- 5. Tranche +61j : Retard strictement supérieur à 60 jours
-                ROUND(SUM(CASE WHEN (julianday(?) - julianday(l.date_echeance)) > 60 
-                    THEN (l.debit - l.credit) ELSE 0 END), 2) as tranche_plus_61
-
-            FROM plan_tiers pt
-            JOIN lignes_ecritures l ON pt.numero_tiers = l.num_tiers
-            WHERE l.company_id = ? 
-              AND l.exercice_id = ? 
-              AND l.is_deleted = 0
-              ${typeFilter}
-            GROUP BY pt.numero_tiers, pt.nom, pt.type_tiers
-            HAVING ABS(SUM(l.debit - l.credit)) > 0.01
-            ORDER BY pt.numero_tiers ASC
-        `;
-
-        return db.prepare(sql).all(...queryParams);
+        return await CloudLigneEcriture.aggregate(pipeline);
     }
 }
 

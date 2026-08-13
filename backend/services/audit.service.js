@@ -1,46 +1,32 @@
-const { getDb } = require('../config/database');
+// backend/services/audit.service.js
+const { CloudAuditLog } = require('../models/cloud.model');
 
 class AuditService {
     async findLogs(params) {
-        const db = getDb();
         const { companyId, type, table, limit } = params;
 
         // On définit proprement la limite pour éviter le NaN
-        const cleanLimit = parseInt(limit) || 100;
+        const cleanLimit = parseInt(limit, 10) || 100;
 
-        let sqlParams = [companyId];
-        let sql = `
-            SELECT 
-                id, 
-                date_action, 
-                user_name, 
-                action_type, 
-                table_concernee, 
-                reference_id, 
-                description
-            FROM audit_log 
-            WHERE company_id = ?
-        `;
+        const query = { company_id: companyId.toString() };
 
         if (type && type !== 'all') {
-            sql += " AND action_type = ?";
-            sqlParams.push(type);
+            query.action_type = type.toUpperCase();
         }
         if (table) {
-            sql += " AND table_concernee = ?";
-            sqlParams.push(table);
+            query.table_concernee = table;
         }
 
-        sql += " ORDER BY date_action DESC LIMIT ?";
-        sqlParams.push(cleanLimit);
-
         try {
-            const rows = db.prepare(sql).all(...sqlParams);
+            const rows = await CloudAuditLog.find(query)
+                .sort({ date_action: -1, createdAt: -1 })
+                .limit(cleanLimit)
+                .lean();
             
             // On s'assure que chaque ligne a les bonnes clés pour React
             return rows.map(row => ({
-                id: row.id || `LOG-${Math.random()}`,
-                date_action: row.date_action,
+                id: row.localId || row._id?.toString() || `LOG-${Math.random()}`,
+                date_action: row.date_action || row.createdAt,
                 user_name: row.user_name || "Système",
                 action_type: row.action_type || "INFO",
                 table_concernee: row.table_concernee || "---",
@@ -48,21 +34,9 @@ class AuditService {
                 description: row.description || ""
             }));
         } catch (error) {
-            console.error("Erreur SQL Audit:", error);
+            console.error("Erreur Cloud Audit:", error);
             return [];
         }
-    }
-
-    getInsertExportSql() {
-        // 🔄 Ajout de sync_status = 'pending' pour garantir l'intégrité de la synchronisation cloud
-        return `
-            INSERT INTO audit_log 
-            (id, user_id, user_name, action_type, table_concernee, reference_id, description, company_id, sync_status)
-            VALUES (
-                'LOG-' || STRFTIME('%s', 'now') || '-' || LOWER(HEX(RANDOMBLOB(2))),
-                ?, ?, 'EXPORT', ?, ?, ?, ?, 'pending'
-            )
-        `;
     }
 }
 

@@ -1,7 +1,12 @@
+// backend/controllers/planComptableController.js
 const fs = require('fs');
 const path = require('path');
-const { getDb } = require('../config/database');
-const { logAction } = require('../utils/auditHelper'); 
+const mongoose = require('mongoose');
+const { 
+    CloudCompany, 
+    CloudPlanComptable, 
+    CloudAuditLog 
+} = require('../models/cloud.model');
 
 // Utilitaire de contexte harmonisé
 const getContext = (req) => {
@@ -26,17 +31,15 @@ const generateSecureId = (prefix, index = 0) => {
 /**
  * Initialise un plan standard ou importe un fichier personnalisé
  */
-exports.initialiserOuImporterPlan = (req, res) => {
-    const db = getDb();
+exports.initialiserOuImporterPlan = async (req, res) => {
     const context = getContext(req);
-
     if (!context.companyId) return res.status(401).json({ error: "ID entreprise manquant." });
 
     const { typePlan, source } = req.body; 
     let comptes = [];
 
     try {
-        const company = db.prepare("SELECT plan_precision FROM companies WHERE id = ?").get(context.companyId);
+        const company = await CloudCompany.findOne({ localId: context.companyId }).lean();
         const precision = company?.plan_precision || 8; 
 
         if (source === 'standard') {
@@ -54,20 +57,13 @@ exports.initialiserOuImporterPlan = (req, res) => {
             }).filter(c => c.num && c.lib);
         }
 
-        db.transaction(() => {
-            const anciensComptes = db.prepare("SELECT id FROM plan_comptable WHERE company_id = ?").all(context.companyId);
-            const syncDelStmt = db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('plan_comptable', ?, 'DELETE', ?)");
-            
-            anciensComptes.forEach(c => syncDelStmt.run(c.id, context.companyId));
-            db.prepare("DELETE FROM plan_comptable WHERE company_id = ?").run(context.companyId);
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            // Suppression des anciens comptes de l'entreprise
+            await CloudPlanComptable.deleteMany({ company_id: context.companyId }).session(session);
 
-            const stmt = db.prepare(`
-                INSERT OR IGNORE INTO plan_comptable (
-                    id, numero_compte, intitule, type_compte, company_id, 
-                    sync_status, classe, nature, type_etat, sens_normal
-                ) VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
-            `);
-            const syncInsStmt = db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('plan_comptable', ?, 'INSERT', ?)");
+            const comptesToInsert = [];
 
             comptes.forEach((c, index) => {
                 const numeroBrut = c.num || c.code; 
@@ -88,17 +84,45 @@ exports.initialiserOuImporterPlan = (req, res) => {
                     } else { nature = 'ACTIF'; sens = 'DEBIT'; }
                 } else if (['2', '3', '5'].includes(firstDigit)) { nature = 'ACTIF'; sens = 'DEBIT'; }
 
-                const result = stmt.run(idGenerated, numeroFinal, libelle, nature, context.companyId, parseInt(firstDigit) || 0, nature, type_etat, sens);
-                if (result.changes > 0) syncInsStmt.run(idGenerated, context.companyId);
+                comptesToInsert.push({
+                    localId: idGenerated,
+                    company_id: context.companyId,
+                    numero_compte: numeroFinal,
+                    intitule: libelle,
+                    type_compte: nature,
+                    classe: parseInt(firstDigit) || 0,
+                    nature: nature,
+                    type_etat: type_etat,
+                    sens_normal: sens,
+                    sync_status: 'synced',
+                    updated_at: new Date()
+                });
             });
 
-            logAction({
-                userId: context.userId, userName: context.userName,
-                actionType: 'INSERTION', tableConcernee: 'plan_comptable',
-                description: `Importation massive du plan comptable (${comptes.length} comptes)`,
-                companyId: context.companyId
-            });
-        })();
+            if (comptesToInsert.length > 0) {
+                await CloudPlanComptable.insertMany(comptesToInsert, { session });
+            }
+
+            const logId = `LOG-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+            await CloudAuditLog.create([{
+                localId: logId,
+                user_id: context.userId,
+                user_name: context.userName,
+                action_type: 'INSERTION',
+                table_concernee: 'plan_comptable',
+                description: `Importation massive du plan comptable (${comptesToInsert.length} comptes)`,
+                date_action: new Date(),
+                company_id: context.companyId,
+                sync_status: 'synced'
+            }], { session });
+
+            await session.commitTransaction();
+            session.endSession();
+        } catch (txErr) {
+            await session.abortTransaction();
+            session.endSession();
+            throw txErr;
+        }
 
         // 🔥 SIGNAL SOCKET GLOBAL
         if (req.io) {
@@ -110,6 +134,7 @@ exports.initialiserOuImporterPlan = (req, res) => {
         return res.json({ success: true, message: `Plan initialisé avec succès.` });
 
     } catch (err) {
+        console.error("❌ Erreur initialiserOuImporterPlan:", err.message);
         return res.status(500).json({ error: "Erreur lors de l'importation : " + err.message });
     }
 };
@@ -117,46 +142,69 @@ exports.initialiserOuImporterPlan = (req, res) => {
 /**
  * Ajoute manuellement un compte
  */
-exports.ajouterCompte = (req, res) => {
-    const db = getDb();
+exports.ajouterCompte = async (req, res) => {
     const context = getContext(req);
     const { numero_compte, intitule } = req.body;
 
     try {
+        const company = await CloudCompany.findOne({ localId: context.companyId }).lean();
+        const precision = company?.plan_precision || 8;
+        const numeroFinal = numero_compte.toString().trim().padEnd(precision, '0').substring(0, precision);
+        
+        const existing = await CloudPlanComptable.findOne({ company_id: context.companyId, numero_compte: numeroFinal }).lean();
+        if (existing) throw new Error("Ce numéro de compte existe déjà.");
+
         const newId = generateSecureId('PC', 'MAN');
-        db.transaction(() => {
-            const company = db.prepare("SELECT plan_precision FROM companies WHERE id = ?").get(context.companyId);
-            const precision = company?.plan_precision || 8;
-            const numeroFinal = numero_compte.toString().trim().padEnd(precision, '0').substring(0, precision);
-            const firstDigit = numeroFinal.charAt(0);
-            
-            let nature = 'ACTIF', type_etat = 'BILAN', sens = 'DEBIT';
-            if (['6', '8'].includes(firstDigit)) { nature = 'CHARGE'; type_etat = 'RESULTAT'; }
-            else if (firstDigit === '7') { nature = 'PRODUIT'; type_etat = 'RESULTAT'; sens = 'CREDIT'; }
-            else if (['1'].includes(firstDigit)) { nature = 'PASSIF'; sens = 'CREDIT'; }
-            else if (firstDigit === '4') {
-                if (numeroFinal.startsWith('40') || numeroFinal.startsWith('42') || numeroFinal.startsWith('43') || numeroFinal.startsWith('44')) {
-                    nature = 'PASSIF'; sens = 'CREDIT';
-                } else { nature = 'ACTIF'; sens = 'DEBIT'; }
-            } else if (['2', '3', '5'].includes(firstDigit)) { nature = 'ACTIF'; sens = 'DEBIT'; }
+        const firstDigit = numeroFinal.charAt(0);
+        
+        let nature = 'ACTIF', type_etat = 'BILAN', sens = 'DEBIT';
+        if (['6', '8'].includes(firstDigit)) { nature = 'CHARGE'; type_etat = 'RESULTAT'; }
+        else if (firstDigit === '7') { nature = 'PRODUIT'; type_etat = 'RESULTAT'; sens = 'CREDIT'; }
+        else if (['1'].includes(firstDigit)) { nature = 'PASSIF'; sens = 'CREDIT'; }
+        else if (firstDigit === '4') {
+            if (numeroFinal.startsWith('40') || numeroFinal.startsWith('42') || numeroFinal.startsWith('43') || numeroFinal.startsWith('44')) {
+                nature = 'PASSIF'; sens = 'CREDIT';
+            } else { nature = 'ACTIF'; sens = 'DEBIT'; }
+        } else if (['2', '3', '5'].includes(firstDigit)) { nature = 'ACTIF'; sens = 'DEBIT'; }
 
-            const stmt = db.prepare(`
-                INSERT OR IGNORE INTO plan_comptable (id, numero_compte, intitule, type_compte, company_id, sync_status, classe, nature, type_etat, sens_normal)
-                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
-            `);
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            await CloudPlanComptable.create([{
+                localId: newId,
+                company_id: context.companyId,
+                numero_compte: numeroFinal,
+                intitule: intitule.toUpperCase(),
+                type_compte: nature,
+                classe: parseInt(firstDigit) || 0,
+                nature: nature,
+                type_etat: type_etat,
+                sens_normal: sens,
+                sync_status: 'synced',
+                updated_at: new Date()
+            }], { session });
 
-            const result = stmt.run(newId, numeroFinal, intitule.toUpperCase(), nature, context.companyId, parseInt(firstDigit) || 0, nature, type_etat, sens);
-            if (result.changes === 0) throw new Error("Ce numéro de compte existe déjà.");
+            const logId = `LOG-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+            await CloudAuditLog.create([{
+                localId: logId,
+                user_id: context.userId,
+                user_name: context.userName,
+                action_type: 'INSERTION',
+                table_concernee: 'plan_comptable',
+                reference_id: newId,
+                description: `Création manuelle du compte ${numeroFinal}`,
+                date_action: new Date(),
+                company_id: context.companyId,
+                sync_status: 'synced'
+            }], { session });
 
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('plan_comptable', ?, 'INSERT', ?)").run(newId, context.companyId);
-
-            logAction({
-                userId: context.userId, userName: context.userName,
-                actionType: 'INSERTION', tableConcernee: 'plan_comptable',
-                referenceId: newId, description: `Création manuelle du compte ${numeroFinal}`,
-                companyId: context.companyId
-            });
-        })();
+            await session.commitTransaction();
+            session.endSession();
+        } catch (txErr) {
+            await session.abortTransaction();
+            session.endSession();
+            throw txErr;
+        }
 
         // 🔥 SIGNAL SOCKET
         if (req.io) {
@@ -174,33 +222,55 @@ exports.ajouterCompte = (req, res) => {
 /**
  * Modifie un compte
  */
-exports.modifierCompte = (req, res) => {
-    const db = getDb();
+exports.modifierCompte = async (req, res) => {
     const context = getContext(req);
     const { id } = req.params;
     const { numero_compte, intitule } = req.body;
 
     try {
-        db.transaction(() => {
-            const company = db.prepare("SELECT plan_precision FROM companies WHERE id = ?").get(context.companyId);
-            const precision = company?.plan_precision || 8;
-            const numeroFinal = numero_compte.toString().trim().padEnd(precision, '0').substring(0, precision);
-            
-            db.prepare(`
-                UPDATE plan_comptable 
-                SET numero_compte = ?, intitule = ?, sync_status = 'pending'
-                WHERE id = ? AND company_id = ?
-            `).run(numeroFinal, intitule.toUpperCase(), id, context.companyId);
+        const company = await CloudCompany.findOne({ localId: context.companyId }).lean();
+        const precision = company?.plan_precision || 8;
+        const numeroFinal = numero_compte.toString().trim().padEnd(precision, '0').substring(0, precision);
+        
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            const result = await CloudPlanComptable.updateOne(
+                { localId: id, company_id: context.companyId },
+                {
+                    $set: {
+                        numero_compte: numeroFinal,
+                        intitule: intitule.toUpperCase(),
+                        sync_status: 'synced',
+                        updated_at: new Date()
+                    }
+                },
+                { session }
+            );
 
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('plan_comptable', ?, 'UPDATE', ?)").run(id, context.companyId);
+            if (result.matchedCount === 0) throw new Error("Compte introuvable.");
 
-            logAction({
-                userId: context.userId, userName: context.userName,
-                actionType: 'MODIFICATION', tableConcernee: 'plan_comptable',
-                referenceId: id, description: `Modification du compte en ${numeroFinal}`,
-                companyId: context.companyId
-            });
-        })();
+            const logId = `LOG-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+            await CloudAuditLog.create([{
+                localId: logId,
+                user_id: context.userId,
+                user_name: context.userName,
+                action_type: 'MODIFICATION',
+                table_concernee: 'plan_comptable',
+                reference_id: id,
+                description: `Modification du compte en ${numeroFinal}`,
+                date_action: new Date(),
+                company_id: context.companyId,
+                sync_status: 'synced'
+            }], { session });
+
+            await session.commitTransaction();
+            session.endSession();
+        } catch (txErr) {
+            await session.abortTransaction();
+            session.endSession();
+            throw txErr;
+        }
 
         if (req.io) {
             const room = String(context.companyId);
@@ -210,33 +280,47 @@ exports.modifierCompte = (req, res) => {
 
         res.json({ success: true, message: "Compte mis à jour." });
     } catch (err) {
-        res.status(500).json({ error: "Erreur lors de la modification." });
+        res.status(500).json({ error: err.message || "Erreur lors de la modification." });
     }
 };
 
 /**
  * Supprime un compte
  */
-exports.supprimerCompte = (req, res) => {
-    const db = getDb();
+exports.supprimerCompte = async (req, res) => {
     const context = getContext(req);
     const { id } = req.params;
 
     try {
-        db.transaction(() => {
-            const compte = db.prepare("SELECT numero_compte FROM plan_comptable WHERE id = ? AND company_id = ?").get(id, context.companyId);
-            if (!compte) throw new Error("Compte introuvable.");
+        const compte = await CloudPlanComptable.findOne({ localId: id, company_id: context.companyId }).lean();
+        if (!compte) return res.status(404).json({ error: "Compte introuvable." });
 
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('plan_comptable', ?, 'DELETE', ?)").run(id, context.companyId);
-            db.prepare("DELETE FROM plan_comptable WHERE id = ? AND company_id = ?").run(id, context.companyId);
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            await CloudPlanComptable.deleteOne({ localId: id, company_id: context.companyId }).session(session);
 
-            logAction({
-                userId: context.userId, userName: context.userName,
-                actionType: 'SUPPRESSION', tableConcernee: 'plan_comptable',
-                referenceId: id, description: `Suppression du compte ${compte.numero_compte}`,
-                companyId: context.companyId
-            });
-        })();
+            const logId = `LOG-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+            await CloudAuditLog.create([{
+                localId: logId,
+                user_id: context.userId,
+                user_name: context.userName,
+                action_type: 'SUPPRESSION',
+                table_concernee: 'plan_comptable',
+                reference_id: id,
+                description: `Suppression du compte ${compte.numero_compte}`,
+                date_action: new Date(),
+                company_id: context.companyId,
+                sync_status: 'synced'
+            }], { session });
+
+            await session.commitTransaction();
+            session.endSession();
+        } catch (txErr) {
+            await session.abortTransaction();
+            session.endSession();
+            throw txErr;
+        }
 
         if (req.io) {
             const room = String(context.companyId);
@@ -253,39 +337,46 @@ exports.supprimerCompte = (req, res) => {
 /**
  * Vide intégralement le plan
  */
-exports.viderPlanComptable = (req, res) => {
-    const db = getDb();
+exports.viderPlanComptable = async (req, res) => {
     const context = getContext(req);
 
     try {
-        db.transaction(() => {
-            const comptes = db.prepare("SELECT id FROM plan_comptable WHERE company_id = ?").all(context.companyId);
-            const syncStmt = db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('plan_comptable', ?, 'DELETE', ?)");
-            
-            comptes.forEach(c => syncStmt.run(c.id, context.companyId));
-            const result = db.prepare("DELETE FROM plan_comptable WHERE company_id = ?").run(context.companyId);
+        const countBefore = await CloudPlanComptable.countDocuments({ company_id: context.companyId });
 
-            logAction({
-                userId: context.userId, 
-                userName: context.userName,
-                actionType: 'SUPPRESSION',
-                tableConcernee: 'plan_comptable',
-                description: `Vidage complet du plan (${result.changes} comptes)`,
-                companyId: context.companyId
-            });
-        })();
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            await CloudPlanComptable.deleteMany({ company_id: context.companyId }).session(session);
+
+            const logId = `LOG-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+            await CloudAuditLog.create([{
+                localId: logId,
+                user_id: context.userId,
+                user_name: context.userName,
+                action_type: 'SUPPRESSION',
+                table_concernee: 'plan_comptable',
+                description: `Vidage complet du plan (${countBefore} comptes)`,
+                date_action: new Date(),
+                company_id: context.companyId,
+                sync_status: 'synced'
+            }], { session });
+
+            await session.commitTransaction();
+            session.endSession();
+        } catch (txErr) {
+            await session.abortTransaction();
+            session.endSession();
+            throw txErr;
+        }
 
         // 🔥 SIGNAL SOCKET GLOBAL
         if (req.io && context.companyId) {
             const room = String(context.companyId);
-            
-            // On signale un DELETE massif sur la table
             req.io.to(room).emit('DATA_EVENT', { 
                 table: 'plan_comptable', 
                 action: 'DELETE_ALL' 
             });
 
-            // On force le rafraîchissement du module Plan Comptable côté UI
             req.io.to(room).emit('REFRESH_PLAN', { 
                 message: "Le plan comptable a été réinitialisé." 
             });
@@ -298,32 +389,33 @@ exports.viderPlanComptable = (req, res) => {
     }
 };
 
-exports.getPlanComptable = (req, res) => {
-    const db = getDb();
+exports.getPlanComptable = async (req, res) => {
     const companyId = req.user?.company_id || req.user?.companyId;
     const { collectif } = req.query; 
     try {
-        const company = db.prepare("SELECT plan_precision FROM companies WHERE id = ?").get(companyId);
+        const company = await CloudCompany.findOne({ localId: companyId }).lean();
         const precision = company?.plan_precision || 8;
-        let query = "SELECT * FROM plan_comptable WHERE company_id = ?";
-        let params = [companyId];
-        if (collectif === 'true') { query += " AND length(numero_compte) = ?"; params.push(precision); }
-        const plan = db.prepare(query + " ORDER BY numero_compte ASC").all(...params);
+        
+        let query = { company_id: companyId };
+        if (collectif === 'true') {
+            query.$expr = { $eq: [{ $strLenCP: "$numero_compte" }, precision] };
+        }
+
+        const plan = await CloudPlanComptable.find(query).sort({ numero_compte: 1 }).lean();
         res.json({ success: true, data: plan }); 
-    } catch (err) { res.status(500).json({ success: false, error: err.message }); }
+    } catch (err) { 
+        res.status(500).json({ success: false, error: err.message }); 
+    }
 };
 
-exports.exportPlanComptable = (req, res) => {
-    const db = getDb();
+exports.exportPlanComptable = async (req, res) => {
     const companyId = req.user?.company_id || req.user?.companyId;
 
     try {
-        const data = db.prepare(`
-            SELECT numero_compte, intitule, nature, type_etat, sens_normal 
-            FROM plan_comptable 
-            WHERE company_id = ? 
-            ORDER BY numero_compte ASC
-        `).all(companyId);
+        const data = await CloudPlanComptable.find(
+            { company_id: companyId },
+            { numero_compte: 1, intitule: 1, nature: 1, type_etat: 1, sens_normal: 1, _id: 0 }
+        ).sort({ numero_compte: 1 }).lean();
 
         const SEP = ";"; 
         const NEW_LINE = "\r\n";
@@ -331,13 +423,11 @@ exports.exportPlanComptable = (req, res) => {
 
         let csv = `Numero${SEP}Intitule${SEP}Nature${SEP}Etat${SEP}Sens${NEW_LINE}`;
 
-        // Dans exportPlanComptable
-data.forEach(row => {
-    // Remplacer les points-virgules par des virgules dans l'intitulé pour éviter les sauts de colonnes
-    const libClean = (row.intitule || "").replace(/;/g, ',').replace(/"/g, '""');
-    const lib = `"${libClean}"`;
-    csv += `${row.numero_compte}${SEP}${lib}${SEP}${row.nature}${SEP}${row.type_etat}${SEP}${row.sens_normal}${NEW_LINE}`;
-});
+        data.forEach(row => {
+            const libClean = (row.intitule || "").replace(/;/g, ',').replace(/"/g, '""');
+            const lib = `"${libClean}"`;
+            csv += `${row.numero_compte}${SEP}${lib}${SEP}${row.nature}${SEP}${row.type_etat}${SEP}${row.sens_normal}${NEW_LINE}`;
+        });
 
         res.setHeader('Content-Type', 'text/csv; charset=utf-8');
         res.setHeader('Content-Disposition', 'attachment; filename=PlanComptable.csv');

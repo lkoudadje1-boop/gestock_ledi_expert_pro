@@ -1,5 +1,5 @@
+// backend/controllers/ConfigEcrituresAuto.controller.js
 const service = require('../services/ConfigEcrituresAuto.service');
-const { getDb } = require('../config/database');
 
 /**
  * Utilitaire pour extraire le contexte entreprise proprement
@@ -14,10 +14,10 @@ const getCtx = (req) => {
  */
 exports.saveSchema = async (req, res) => {
     try {
-        const { companyId } = getCtx(req); // On extrait juste l'ID
+        const { companyId } = getCtx(req);
         
-        // On passe companyId directement
-        const result = service.saveSchemaDynamique(req.body, companyId); 
+        // service.saveSchemaDynamique doit être async dans le modèle Cloud
+        const result = await service.saveSchemaDynamique(req.body, companyId); 
         
         if (req.io) {
             const room = String(companyId);
@@ -28,51 +28,51 @@ exports.saveSchema = async (req, res) => {
             req.io.to(room).emit('DATA_EVENT', { table: 'config_ecritures_auto', action: 'UPDATE' });
         }
         
-        res.json(result);
+        return res.json(result);
     } catch (err) { 
-        res.status(400).json({ error: err.message }); 
+        return res.status(400).json({ error: err.message }); 
     }
 };
 
 /**
  * 2. Lister les configurations pour une table donnée (Onglet Liste du Front)
  */
-exports.listConfigsByTable = (req, res) => {
+exports.listConfigsByTable = async (req, res) => {
     try {
         const { companyId } = getCtx(req);
-        const data = service.listByTable(req.params.tableName, companyId);
-        res.json({ success: true, data });
+        const data = await service.listByTable(req.params.tableName, companyId);
+        return res.json({ success: true, data });
     } catch (err) { 
-        res.status(500).json({ error: err.message }); 
+        return res.status(500).json({ error: err.message }); 
     }
 };
 
 /**
- * 3. Récupérer les colonnes d'une table SQL (Version Nettoyée)
+ * 3. Récupérer les colonnes d'une table (Version Cloud)
  */
-exports.getTableColumns = (req, res) => {
+exports.getTableColumns = async (req, res) => {
     try {
         const { tableName } = req.params;
         
-        // Sécurité anti-injection
-        if (!/^[a-z0-9_]+$/i.test(tableName)) throw new Error("Table invalide.");
+        // Sécurité renforcée
+        if (!/^[a-z0-9_]+$/i.test(tableName)) throw new Error("Nom de table invalide.");
         
-        // 🔥 On appelle la fonction PROPRE du service que tu as ajoutée à la fin
-        const data = service.getTableColumns(tableName);
+        // Appelle la version async du service pour récupérer la structure du modèle MongoDB/Mongoose
+        const data = await service.getTableColumns(tableName);
         
-        res.json({ success: true, data });
+        return res.json({ success: true, data });
     } catch (err) { 
-        res.status(500).json({ error: err.message }); 
+        return res.status(500).json({ error: err.message }); 
     }
 };
 
 /**
  * 4. Supprimer une configuration
  */
-exports.supprimerConfig = (req, res) => {
+exports.supprimerConfig = async (req, res) => {
     try {
         const { companyId } = getCtx(req);
-        service.deleteConfig(req.params.id, companyId);
+        await service.deleteConfig(req.params.id, companyId);
         
         if (req.io) {
             req.io.to(String(companyId)).emit('DATA_EVENT', { 
@@ -81,8 +81,8 @@ exports.supprimerConfig = (req, res) => {
             });
         }
         
-        res.json({ success: true, message: "Configuration supprimée avec succès." });
+        return res.json({ success: true, message: "Configuration supprimée avec succès." });
     } catch (err) { 
-        res.status(500).json({ error: err.message }); 
+        return res.status(500).json({ error: err.message }); 
     }
 };

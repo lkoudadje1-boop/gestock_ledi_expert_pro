@@ -1,5 +1,6 @@
+// backend/controllers/PlanTiers.Controller.js
 const PlanTiersService = require('../services/PlanTiers.service');
-const { getDb } = require('../config/database');
+const { CloudPlanTiers } = require('../models/cloud.model');
 
 // Utilitaire de contexte harmonisé
 const getContext = (req) => {
@@ -22,6 +23,7 @@ const PlanTiersController = {
             const result = await PlanTiersService.getAllData(type, companyId);
             res.json({ success: true, data: result.tiersEnregistres, available: result.disponibles });
         } catch (err) {
+            console.error("❌ Erreur getAll PlanTiers:", err.message);
             res.status(500).json({ success: false, error: err.message });
         }
     },
@@ -32,33 +34,35 @@ const PlanTiersController = {
             const { nom, collectifId } = req.query;
             if (!nom || !collectifId) return res.json({ success: true, suggestion: "" });
 
-            const suggestion = PlanTiersService.getSuggestionNum(nom, collectifId, companyId);
+            const suggestion = await PlanTiersService.getSuggestionNum(nom, collectifId, companyId);
             res.json({ success: true, suggestion });
         } catch (err) {
+            console.error("❌ Erreur getSuggestion PlanTiers:", err.message);
             res.status(500).json({ success: false, error: err.message });
         }
     },
 
     create: async (req, res) => {
-    const context = getContext(req);
-    try {
-        const result = await PlanTiersService.createTier(req.body, req.user);
+        const context = getContext(req);
+        try {
+            await PlanTiersService.createTier(req.body, req.user);
 
-        if (req.io && context.companyId) {
-            const room = String(context.companyId);
-            // 🔥 SIGNAL UNIVERSEL (Utilisé par tous les composants)
-            req.io.to(room).emit('DATA_EVENT', { 
-                table: 'plan_tiers', 
-                action: 'INSERT' 
-            });
-            // Compatibilité spécifique
-            req.io.to(room).emit('REFRESH_PLAN_TIERS', { action: 'CREATE' });
+            if (req.io && context.companyId) {
+                const room = String(context.companyId);
+                // 🔥 SIGNAL UNIVERSEL (Utilisé par tous les composants)
+                req.io.to(room).emit('DATA_EVENT', { 
+                    table: 'plan_tiers', 
+                    action: 'INSERT' 
+                });
+                // Compatibilité spécifique
+                req.io.to(room).emit('REFRESH_PLAN_TIERS', { action: 'CREATE' });
+            }
+            res.json({ success: true, message: "Compte tiers créé et synchronisé" });
+        } catch (err) {
+            console.error("❌ Erreur create PlanTiers:", err.message);
+            res.status(500).json({ success: false, error: err.message });
         }
-        res.json({ success: true, message: "Compte tiers créé et synchronisé" });
-    } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
-    }
-},
+    },
 
     update: async (req, res) => {
         const context = getContext(req);
@@ -78,6 +82,7 @@ const PlanTiersController = {
 
             res.json({ success: true, message: "Tiers mis à jour avec succès" });
         } catch (err) {
+            console.error("❌ Erreur update PlanTiers:", err.message);
             res.status(500).json({ success: false, error: err.message });
         }
     },
@@ -100,6 +105,7 @@ const PlanTiersController = {
 
             res.json({ success: true, message: "Lien supprimé localement et sur le Cloud" });
         } catch (err) {
+            console.error("❌ Erreur delete PlanTiers:", err.message);
             res.status(500).json({ success: false, error: err.message });
         }
     },
@@ -134,20 +140,37 @@ const PlanTiersController = {
 
             res.json({ success: true, message: `${tiersData.length} tiers importés avec succès.` });
         } catch (err) {
+            console.error("❌ Erreur importTiers:", err.message);
             res.status(500).json({ success: false, error: err.message });
         }
     },
 
     exportTiers: async (req, res) => {
-        const db = getDb();
         const { companyId } = getContext(req);
         try {
-            const data = db.prepare(`
-                SELECT pt.numero_tiers, pt.nom, pt.type_tiers, pt.delai_paiement, pc.numero_compte as collectif
-                FROM plan_tiers pt
-                LEFT JOIN plan_comptable pc ON pt.compte_collectif_id = pc.id
-                WHERE pt.company_id = ? ORDER BY pt.numero_tiers ASC
-            `).all(companyId);
+            const data = await CloudPlanTiers.aggregate([
+                { $match: { company_id: companyId.toString() } },
+                {
+                    $lookup: {
+                        from: 'cloud_plan_comptable',
+                        localField: 'compte_collectif_id',
+                        foreignField: 'localId',
+                        as: 'comptable'
+                    }
+                },
+                { $unwind: { path: '$comptable', preserveNullAndEmptyArrays: true } },
+                {
+                    $project: {
+                        numero_tiers: 1,
+                        nom: 1,
+                        type_tiers: 1,
+                        delai_paiement: 1,
+                        collectif: '$comptable.numero_compte',
+                        _id: 0
+                    }
+                },
+                { $sort: { numero_tiers: 1 } }
+            ]);
 
             const SEP = ";", NL = "\r\n", BOM = "\ufeff";
             let csv = `Numero_Tiers${SEP}Nom_Raison_Sociale${SEP}Type${SEP}Delai_Paiement${SEP}Compte_Collectif${NL}`;
@@ -161,6 +184,7 @@ const PlanTiersController = {
             res.setHeader('Content-Disposition', 'attachment; filename=PlanTiers.csv');
             return res.status(200).send(BOM + csv);
         } catch (err) {
+            console.error("❌ Erreur exportTiers:", err.message);
             return res.status(500).send("Erreur lors de l'exportation.");
         }
     }

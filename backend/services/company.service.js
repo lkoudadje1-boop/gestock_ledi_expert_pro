@@ -1,23 +1,28 @@
+// backend/services/company.service.js
+const mongoose = require('mongoose');
 const { generateUniqueCode, hashPassword } = require('../utils/helpers'); 
-const { getDb } = require('../config/database');
+const { 
+    CloudCompany, CloudExercice, CloudUser, CloudCustomer, 
+    CloudSupplier, CloudStaff, CloudPlanComptable, CloudAuditLog 
+} = require('../models/cloud.model');
 const { logAction } = require('../utils/auditHelper'); 
 
 const generateId = (prefix) => `${prefix}-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 100)}`;
 
 // --- RÉCUPÉRATION PARAMÈTRES ---
-exports.fetchSettings = (companyId) => {
-    const db = getDb();
-    return db.prepare(`
-        SELECT name, email, phone, address, logo_data, nif_number, rccm_number,
-               default_customer_id, default_supplier_id, default_staff_id,
-               gestion_analytique, plan_precision, regime_tva_recuperable
-        FROM companies WHERE id = ?
-    `).get(companyId);
+exports.fetchSettings = async (companyId) => {
+    return await CloudCompany.findOne(
+        { $or: [{ localId: companyId }, { _id: mongoose.isValidObjectId(companyId) ? companyId : null }] },
+        {
+            name: 1, email: 1, phone: 1, address: 1, logo_data: 1, nif_number: 1, rccm_number: 1,
+            default_customer_id: 1, default_supplier_id: 1, default_staff_id: 1,
+            gestion_analytique: 1, plan_precision: 1, regime_tva_recuperable: 1
+        }
+    ).lean();
 };
 
 // --- INITIALISATION COMPLÈTE SOCIÉTÉ ---
-exports.initCompany = (data) => {
-    const db = getDb();
+exports.initCompany = async (data) => {
     const { companyName, name, username, adminUsername, email, password, adminPassword, plan_precision } = data;
     
     const finalCompName = companyName || name || "MA SOCIETE";
@@ -33,70 +38,107 @@ exports.initCompany = (data) => {
     const staffId = generateId('STF');
     const currentYear = new Date().getFullYear();
 
-    db.transaction(() => {
-        db.exec('PRAGMA foreign_keys = OFF;');
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-        // 1. Insertion Société (Initialisée en régime récupérable par défaut)
-        db.prepare(`
-            INSERT INTO companies (id, company_code, name, email, plan_precision, regime_tva_recuperable, sync_status) 
-            VALUES (?, ?, ?, ?, ?, 1, 'pending')
-        `).run(companyId, companyCode, finalCompName, email, parseInt(plan_precision) || 8);
+    try {
+        // 1. Insertion Société
+        await CloudCompany.create([{
+            localId: companyId,
+            company_code: companyCode,
+            name: finalCompName,
+            email: email,
+            plan_precision: parseInt(plan_precision) || 8,
+            regime_tva_recuperable: 1,
+            sync_status: 'synced'
+        }], { session });
 
         // 2. Insertion Exercice
-        db.prepare(`
-            INSERT INTO exercices (id, company_id, libelle, date_debut, date_fin, statut, sync_status) 
-            VALUES (?, ?, ?, ?, ?, 'OUVERT', 'pending')
-        `).run(exerciceId, companyId, `EXERCICE ${currentYear}`, `${currentYear}-01-01`, `${currentYear}-12-31`);
+        await CloudExercice.create([{
+            localId: exerciceId,
+            company_id: companyId,
+            libelle: `EXERCICE ${currentYear}`,
+            date_debut: `${currentYear}-01-01`,
+            date_fin: `${currentYear}-12-31`,
+            statut: 'OUVERT',
+            sync_status: 'synced'
+        }], { session });
 
         // 3. Insertion Admin
         const hashed = hashPassword(finalAdminPass);
-        db.prepare(`INSERT INTO users (id, username, email, password, role, company_id, sync_status) VALUES (?, ?, ?, ?, 'admin', ?, 'pending')`)
-          .run(userId, finalAdminName, email, hashed, companyId);
+        await CloudUser.create([{
+            localId: userId,
+            username: finalAdminName,
+            email: email,
+            password: hashed,
+            role: 'admin',
+            company_id: companyId,
+            sync_status: 'synced'
+        }], { session });
 
         // 4. Insertion Client
-        db.prepare(`
-            INSERT INTO customers (id, nom, nif, contact, telephone, adresse, is_active, company_id, sync_status) 
-            VALUES (?, ?, '0', 'DIRECTION', ?, 'MAGASIN', 1, ?, 'pending')
-        `).run(customerId, `CLIENT COMPTANT (${companyCode})`, `0000-${companyCode}`, companyId);
+        await CloudCustomer.create([{
+            localId: customerId,
+            nom: `CLIENT COMPTANT (${companyCode})`,
+            nif: '0',
+            contact: 'DIRECTION',
+            telephone: '',
+            adresse: 'MAGASIN',
+            is_active: 1,
+            company_id: companyId,
+            sync_status: 'synced'
+        }], { session });
 
         // 5. Insertion Fournisseur
-        db.prepare(`
-            INSERT INTO suppliers (id, nom, nif, contact, telephone, adresse, is_active, company_id, sync_status) 
-            VALUES (?, ?, '0', 'DIRECTION', '0000', 'MAGASIN', 1, ?, 'pending')
-        `).run(supplierId, `FOURNISSEUR DIVERS (${companyCode})`, companyId);
+        await CloudSupplier.create([{
+            localId: supplierId,
+            nom: `FOURNISSEUR DIVERS (${companyCode})`,
+            nif: '0',
+            contact: 'DIRECTION',
+            telephone: '0000',
+            adresse: 'MAGASIN',
+            is_active: 1,
+            company_id: companyId,
+            sync_status: 'synced'
+        }], { session });
 
         // 6. Insertion Personnel
-        db.prepare(`
-            INSERT INTO staff (
-                id, name, phone, email, adresse, nif, cnss, 
-                fonction, company_id, is_active, sync_status
-            ) VALUES (?, ?, '0000', 'divers@erp.com', 'MAGASIN', '0', '0', 'PERSONNEL', ?, 1, 'pending')
-        `).run(staffId, `PERSONNEL DIVERS (${companyCode})`, companyId);
+        await CloudStaff.create([{
+            localId: staffId,
+            name: `PERSONNEL DIVERS (${companyCode})`,
+            phone: '0000',
+            email: 'divers@erp.com',
+            adresse: 'MAGASIN',
+            nif: '0',
+            cnss: '0',
+            fonction: 'PERSONNEL',
+            company_id: companyId,
+            is_active: 1,
+            sync_status: 'synced'
+        }], { session });
 
-        // Synchronisation
-        const syncStmt = db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES (?, ?, 'INSERT', ?)");
-        const entities = [
-            ['companies', companyId], ['exercices', exerciceId], ['users', userId],
-            ['customers', customerId], ['suppliers', supplierId], ['staff', staffId]
-        ];
-        entities.forEach(([table, id]) => syncStmt.run(table, id, companyId));
+        await session.commitTransaction();
+        session.endSession();
 
-        db.exec('PRAGMA foreign_keys = ON;');
-    })();
-
-    // --- RETOUR DES IDENTIFIANTS GÉNÉRÉS ---
-    return {
-        companyId: companyId,    // L'ID technique (ex: CPY-57472885)
-        companyCode: companyCode, // Le code court (8 caractères)
-        adminId: userId,          // L'ID de l'utilisateur créé
-        exerciceId: exerciceId    // L'ID de l'exercice par défaut
-    };
+        return {
+            companyId: companyId, 
+            companyCode: companyCode, 
+            adminId: userId, 
+            exerciceId: exerciceId 
+        };
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
 // --- MISE À JOUR SOCIÉTÉ ---
-exports.modifyCompany = (id, body, user) => {
-    const db = getDb();
-    const current = db.prepare("SELECT * FROM companies WHERE id = ?").get(id);
+exports.modifyCompany = async (id, body, user) => {
+    const current = await CloudCompany.findOne({ 
+        $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }] 
+    }).lean();
+
     if (!current) throw new Error("Société non trouvée");
 
     const { 
@@ -104,109 +146,119 @@ exports.modifyCompany = (id, body, user) => {
         gestion_analytique, plan_precision, regime_tva_recuperable 
     } = body;
 
-    const params = [
-        name || current.name,
-        email !== undefined ? email : current.email,
-        address !== undefined ? address : current.address,
-        phone !== undefined ? phone : current.phone,
-        logo_data !== undefined ? logo_data : current.logo_data,
-        nif_number !== undefined ? nif_number : current.nif_number,
-        rccm_number !== undefined ? rccm_number : current.rccm_number,
-        gestion_analytique !== undefined ? (gestion_analytique ? 1 : 0) : current.gestion_analytique,
-        plan_precision !== undefined ? parseInt(plan_precision) : current.plan_precision,
-        regime_tva_recuperable !== undefined ? (regime_tva_recuperable ? 1 : 0) : current.regime_tva_recuperable,
-        id
-    ];
+    const updateFields = {
+        name: name || current.name,
+        email: email !== undefined ? email : current.email,
+        address: address !== undefined ? address : current.address,
+        phone: phone !== undefined ? phone : current.phone,
+        logo_data: logo_data !== undefined ? logo_data : current.logo_data,
+        nif_number: nif_number !== undefined ? nif_number : current.nif_number,
+        rccm_number: rccm_number !== undefined ? rccm_number : current.rccm_number,
+        gestion_analytique: gestion_analytique !== undefined ? (gestion_analytique ? 1 : 0) : current.gestion_analytique,
+        plan_precision: plan_precision !== undefined ? parseInt(plan_precision) : current.plan_precision,
+        regime_tva_recuperable: regime_tva_recuperable !== undefined ? (regime_tva_recuperable ? 1 : 0) : current.regime_tva_recuperable,
+        updated_at: new Date(),
+        sync_status: 'synced'
+    };
 
-    db.transaction(() => {
-        db.prepare(`
-            UPDATE companies 
-            SET name = ?, email = ?, address = ?, phone = ?, logo_data = ?, 
-                nif_number = ?, rccm_number = ?, gestion_analytique = ?, 
-                plan_precision = ?, regime_tva_recuperable = ?, 
-                sync_status = 'pending', updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-        `).run(...params);
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-        // 🔄 Inscription dans la file de synchronisation Cloud
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('companies', ?, 'UPDATE', ?)
-        `).run(id, id);
+    try {
+        await CloudCompany.updateOne(
+            { $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }] },
+            { $set: updateFields }
+        ).session(session);
 
-        logAction({
-            userId: user.userId, userName: user.userName, actionType: 'MODIFICATION',
-            tableConcernee: 'companies', referenceId: id,
-            description: `Mise à jour paramètres (TVA: ${regime_tva_recuperable ? 'Récupérable' : 'Non-récupérable'})`,
-            companyId: id
-        });
-    })();
+        await CloudAuditLog.create([{
+            localId: `LOG-${Date.now()}`,
+            user_id: user.userId, 
+            user_name: user.userName, 
+            action_type: 'MODIFICATION',
+            table_concernee: 'companies', 
+            reference_id: id,
+            description: `Mise à jour paramètres (TVA: ${updateFields.regime_tva_recuperable ? 'Récupérable' : 'Non-récupérable'})`,
+            company_id: id,
+            sync_status: 'synced'
+        }], { session });
+
+        await session.commitTransaction();
+        session.endSession();
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
 // --- MISE À JOUR PRÉCISION ET STRUCTURE COMPTABLE ---
-exports.modifyPrecision = (id, body, user) => {
-    const db = getDb();
+exports.modifyPrecision = async (id, body, user) => {
     const { plan_precision, gestion_analytique, regime_tva_recuperable } = body;
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    db.transaction(() => {
+    try {
         let logDesc = "";
         let planComptableModifie = false;
+        let updateData = { updated_at: new Date(), sync_status: 'synced' };
 
         if (gestion_analytique !== undefined) {
-            db.prepare(`UPDATE companies SET gestion_analytique = ?, sync_status = 'pending' WHERE id = ?`)
-              .run(gestion_analytique ? 1 : 0, id);
+            updateData.gestion_analytique = gestion_analytique ? 1 : 0;
             logDesc += `Analytique: ${gestion_analytique ? 'Activé' : 'Désactivé'}. `;
         }
 
-        // Ajout de la gestion TVA dans la structure comptable si besoin
         if (regime_tva_recuperable !== undefined) {
-            db.prepare(`UPDATE companies SET regime_tva_recuperable = ?, sync_status = 'pending' WHERE id = ?`)
-              .run(regime_tva_recuperable ? 1 : 0, id);
+            updateData.regime_tva_recuperable = regime_tva_recuperable ? 1 : 0;
             logDesc += `Régime TVA: ${regime_tva_recuperable ? 'Récupérable' : 'Non-récupérable'}. `;
         }
 
         if (plan_precision !== undefined) {
-            const newPrecision = parseInt(plan_precision);
-            const currentConfig = db.prepare("SELECT plan_precision FROM companies WHERE id = ?").get(id);
+            const newPrecision = parseInt(plan_precision, 10);
+            const currentConfig = await CloudCompany.findOne({ 
+                $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }] 
+            }).session(session);
+            
             const oldPrecision = currentConfig?.plan_precision || 8;
+            updateData.plan_precision = newPrecision;
 
-            db.prepare(`UPDATE companies SET plan_precision = ?, sync_status = 'pending' WHERE id = ?`)
-              .run(newPrecision, id);
-
-            if (newPrecision > oldPrecision) {
-                const zeros = '0'.repeat(newPrecision - oldPrecision);
-                db.prepare(`UPDATE plan_comptable SET numero_compte = numero_compte || ?, sync_status = 'pending' WHERE company_id = ?`)
-                  .run(zeros, id);
-                planComptableModifie = true;
-            } 
-            else if (newPrecision < oldPrecision) {
-                db.prepare(`UPDATE plan_comptable SET numero_compte = substr(numero_compte, 1, ?), sync_status = 'pending' WHERE company_id = ?`)
-                  .run(newPrecision, id);
+            if (newPrecision > oldPrecision || newPrecision < oldPrecision) {
+                const accounts = await CloudPlanComptable.find({ company_id: id.toString() }).session(session);
+                for (const acc of accounts) {
+                    let newNumero = acc.numero_compte;
+                    if (newPrecision > oldPrecision) {
+                        newNumero = newNumero.padEnd(newPrecision, '0');
+                    } else {
+                        newNumero = newNumero.substring(0, newPrecision);
+                    }
+                    await CloudPlanComptable.updateOne({ _id: acc._id }, { $set: { numero_compte: newNumero } }).session(session);
+                }
                 planComptableModifie = true;
             }
             logDesc += `Précision: ${oldPrecision} -> ${newPrecision} chiffres. `;
         }
 
-        // 🔄 Inscription de la société mise à jour dans la file de synchronisation Cloud
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('companies', ?, 'UPDATE', ?)
-        `).run(id, id);
+        await CloudCompany.updateOne(
+            { $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }] },
+            { $set: updateData }
+        ).session(session);
 
-        // 🔄 Si le plan comptable a subi une modification de format, on enregistre chaque compte impacté dans la sync_queue
-        if (planComptableModifie) {
-            const affectedAccounts = db.prepare("SELECT id FROM plan_comptable WHERE company_id = ?").all(id);
-            const syncQueueStmt = db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('plan_comptable', ?, 'UPDATE', ?)");
-            affectedAccounts.forEach(acc => {
-                syncQueueStmt.run(acc.id, id);
-            });
-        }
-
-        logAction({
-            userId: user.userId, userName: user.userName, actionType: 'MODIFICATION',
-            tableConcernee: 'companies', referenceId: id,
+        await CloudAuditLog.create([{
+            localId: `LOG-${Date.now()}`,
+            user_id: user.userId, 
+            user_name: user.userName, 
+            action_type: 'MODIFICATION',
+            table_concernee: 'companies', 
+            reference_id: id,
             description: `Mise à jour structure comptable : ${logDesc.trim()}`,
-            companyId: id
-        });
-    })();
+            company_id: id.toString(),
+            sync_status: 'synced'
+        }], { session });
+
+        await session.commitTransaction();
+        session.endSession();
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };

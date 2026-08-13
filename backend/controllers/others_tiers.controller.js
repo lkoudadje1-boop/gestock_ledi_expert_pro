@@ -1,3 +1,4 @@
+// backend/controllers/othersTiers.controller.js
 const OthersTiersService = require('../services/others_tiers.controller.service');
 
 // Utilitaire de contexte harmonisé
@@ -7,31 +8,33 @@ const getContext = (req) => {
     return {
         companyId: companyId,
         userId: user.userId || user.id,
-        userName: user.username || 'Utilisateur'
+        userName: 'utilisateur'
     };
 };
 
 // --- RÉCUPÉRER TOUS LES AUTRES TIERS ---
-exports.getAllOthersTiers = (req, res) => {
+exports.getAllOthersTiers = async (req, res) => {
     try {
         const { companyId } = getContext(req);
         if (!companyId) return res.status(401).json({ error: "Session invalide." });
 
-        const tiers = OthersTiersService.getAll(companyId);
+        const tiers = await OthersTiersService.getAll(companyId);
         res.json(tiers);
     } catch (err) {
+        console.error("❌ Erreur getAllOthersTiers:", err.message);
         res.status(500).json({ error: "Erreur lors de la récupération." });
     }
 };
 
 // --- CRÉER UN NOUVEAU TIERS DIVERS ---
-exports.createOtherTier = (req, res) => {
+exports.createOtherTier = async (req, res) => {
     const context = getContext(req);
     if (!req.body.nom) return res.status(400).json({ error: "Nom obligatoire." });
     if (!context.companyId) return res.status(401).json({ error: "Identification entreprise manquante." });
 
     try {
-        const { tierId, nomPropre } = OthersTiersService.create(req.body, req.user);
+        const userContext = { ...req.user, userName: 'utilisateur' };
+        const { tierId, nomPropre } = await OthersTiersService.create(req.body, userContext);
 
         // Signal Socket.io
         if (req.io) {
@@ -55,17 +58,19 @@ exports.createOtherTier = (req, res) => {
 
         res.status(201).json({ success: true, id: tierId });
     } catch (err) {
+        console.error("❌ Erreur createOtherTier:", err.message);
         res.status(500).json({ error: err.message });
     }
 };
 
 // --- METTRE À JOUR UN TIERS DIVERS ---
-exports.updateOtherTier = (req, res) => {
+exports.updateOtherTier = async (req, res) => {
     const context = getContext(req);
     const { id } = req.params;
 
     try {
-        const updated = OthersTiersService.update(id, req.body, req.user);
+        const userContext = { ...req.user, userName: 'utilisateur' };
+        const updated = await OthersTiersService.update(id, req.body, userContext);
 
         if (updated && req.io && context.companyId) {
             const room = String(context.companyId);
@@ -83,17 +88,19 @@ exports.updateOtherTier = (req, res) => {
 
         res.json({ success: true });
     } catch (err) {
+        console.error("❌ Erreur updateOtherTier:", err.message);
         res.status(500).json({ error: err.message });
     }
 };
 
 // --- SUPPRIMER UN TIERS DIVERS ---
-exports.deleteOtherTier = (req, res) => {
+exports.deleteOtherTier = async (req, res) => {
     const context = getContext(req);
     const { id } = req.params;
 
     try {
-        const deleted = OthersTiersService.delete(id, req.user);
+        const userContext = { ...req.user, userName: 'utilisateur' };
+        const deleted = await OthersTiersService.delete(id, userContext);
 
         if (deleted && req.io && context.companyId) {
             const room = String(context.companyId);
@@ -111,6 +118,7 @@ exports.deleteOtherTier = (req, res) => {
 
         res.json({ success: true });
     } catch (err) {
+        console.error("❌ Erreur deleteOtherTier:", err.message);
         res.status(500).json({ error: "Impossible de supprimer : ce tiers est probablement utilisé." });
     }
 };

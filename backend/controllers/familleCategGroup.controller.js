@@ -1,21 +1,22 @@
+// backend/controllers/familleCategGroup.controller.js
 const service = require('../services/familleCategGroup.service');
 const InventoryService = require('../services/inventory.service');
-const { getDb } = require('../config/database');
 
 // 📌 RECUPERATION GENERIQUE
-exports.getAll = (req, res) => {
+exports.getAll = async (req, res) => {
     try {
-        const data = service.getAll(req.params.type, req.user.companyId);
-        res.json(data);
+        const companyId = req.user?.companyId || req.user?.company_id;
+        const data = await service.getAll(req.params.type, companyId);
+        return res.json(data);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        return res.status(500).json({ error: err.message });
     }
 };
 
 // 📌 CREATION GENERIQUE
 exports.create = async (req, res) => {
     try {
-        const companyId = req.user.companyId;
+        const companyId = req.user?.companyId || req.user?.company_id;
 
         // 🛡️ VERROU INVENTAIRE
         const invStatus = await InventoryService.checkStatus(companyId);
@@ -25,13 +26,12 @@ exports.create = async (req, res) => {
             });
         }
 
-        // 🎯 Envoi sécurisé des paramètres (Gestion de la casse id/userId)
-        const id = service.create({
+        const id = await service.create({
             type: req.params.type,
             data: req.body,
             companyId: companyId,
-            userId: req.user.id || req.user.userId,
-            userName: req.user.username
+            userId: req.user?.id || req.user?.userId,
+            userName: 'user' // Respect consigne [2026-02-08]
         });
 
         if (req.io) {
@@ -39,18 +39,17 @@ exports.create = async (req, res) => {
             req.io.to(room).emit('DATA_EVENT', { table: 'products_structure', action: 'INSERT', subModule: req.params.type.toUpperCase() });
             req.io.to(room).emit('REFRESH_UI', { module: 'PRODUCTS', action: 'CREATE_STRUCTURE' });
         }
-        res.status(201).json({ success: true, id });
+        return res.status(201).json({ success: true, id });
     } catch (err) {
-        res.status(400).json({ error: err.message });
+        return res.status(400).json({ error: err.message });
     }
 };
 
 // 📌 MODIFICATION STATUT (ACTIVATION / ARCHIVAGE)
 exports.updateStatus = async (req, res) => {
     try {
-        const companyId = req.user.companyId;
+        const companyId = req.user?.companyId || req.user?.company_id;
 
-        // 🛡️ VERROU INVENTAIRE : Sécurité indispensable pour bloquer aussi les modifications de statut
         const invStatus = await InventoryService.checkStatus(companyId);
         if (invStatus.en_cours) {
             return res.status(403).json({ 
@@ -58,30 +57,30 @@ exports.updateStatus = async (req, res) => {
             });
         }
 
-        const result = service.updateStatus({
+        const result = await service.updateStatus({
             type: req.params.type,
             id: req.params.id,
             is_active: req.body.is_active,
             companyId: companyId,
-            userId: req.user.id || req.user.userId,
-            userName: req.user.username
+            userId: req.user?.id || req.user?.userId,
+            userName: 'user'
         });
 
-        if (result.changes > 0 && req.io) {
+        if (result && req.io) {
             const room = companyId.toString();
             req.io.to(room).emit('DATA_EVENT', { table: 'products_structure', action: 'UPDATE' });
             req.io.to(room).emit('REFRESH_UI', { module: 'PRODUCTS', action: 'UPDATE_STATUS' });
         }
-        res.json({ success: true });
+        return res.json({ success: true });
     } catch (err) {
-        res.status(400).json({ error: err.message });
+        return res.status(400).json({ error: err.message });
     }
 };
+
 exports.update = async (req, res) => {
     try {
-        const companyId = req.user.companyId;
+        const companyId = req.user?.companyId || req.user?.company_id;
 
-        // 🛡️ SÉCURITÉ INVENTAIRE : Bloque si un inventaire est en cours
         const invStatus = await InventoryService.checkStatus(companyId);
         if (invStatus.en_cours) {
             return res.status(403).json({ 
@@ -89,37 +88,35 @@ exports.update = async (req, res) => {
             });
         }
 
-        // Appel de la méthode de mise à jour du service
         await service.update({
-            type: req.params.type,  // 'familles', 'categories' ou 'groups'
-            id: req.params.id,      // L'identifiant (ex: FAM-33644150)
-            data: req.body,         // Le corps de la requête contenant { nom: "NOUVEAU NOM" }
+            type: req.params.type,  
+            id: req.params.id,      
+            data: req.body,         
             companyId: companyId,
-            userId: req.user.id || req.user.userId,
-            userName: req.user.username
+            userId: req.user?.id || req.user?.userId,
+            userName: 'user'
         });
 
-        // Notification Socket.io en temps réel pour rafraîchir les catalogues des utilisateurs connectés
         if (req.io) {
             const room = companyId.toString();
             req.io.to(room).emit('DATA_EVENT', { table: 'products_structure', action: 'UPDATE' });
             req.io.to(room).emit('REFRESH_UI', { module: 'PRODUCTS', action: 'STRUCTURE_NOM_CHANGED' });
         }
 
-        res.json({ success: true, message: "Structure mise à jour avec succès !" });
+        return res.json({ success: true, message: "Structure mise à jour avec succès !" });
     } catch (err) {
         console.error("❌ Erreur de modification structure :", err.message);
-        res.status(400).json({ error: err.message });
+        return res.status(400).json({ error: err.message });
     }
 };
 
 // 📌 EXPORTATION CSV
 exports.exportData = async (req, res) => {
     const { type } = req.params;
-    const companyId = req.user.companyId;
+    const companyId = req.user?.companyId || req.user?.company_id;
 
     try {
-        const data = service.getAll(type, companyId);
+        const data = await service.getAll(type, companyId);
         const SEP = ";", NL = "\r\n", BOM = "\ufeff";
         
         let csv = "";
@@ -157,12 +154,11 @@ exports.exportData = async (req, res) => {
 // 📌 IMPORTATION MASSIVE CSV
 exports.processMassiveImport = async (req, res) => {
     const { type } = req.params;
-    const companyId = req.user.companyId;
+    const companyId = req.user?.companyId || req.user?.company_id;
 
     if (!req.file) return res.status(400).json({ error: "Fichier CSV manquant." });
 
     try {
-        // 🛡️ VERROU INVENTAIRE
         const invStatus = await InventoryService.checkStatus(companyId);
         if (invStatus.en_cours) {
             return res.status(403).json({ 
@@ -189,13 +185,14 @@ exports.processMassiveImport = async (req, res) => {
             };
         }).filter(item => item.nom);
 
-        await service.processMassiveImport(type, rawItems, req.user);
+        const modifiedReqUser = { ...req.user, userName: 'user' };
+        await service.processMassiveImport(type, rawItems, modifiedReqUser);
 
         if (req.io) {
             req.io.to(String(companyId)).emit('DATA_EVENT', { table: 'products_structure', action: 'IMPORT' });
         }
-        res.json({ success: true, message: `${rawItems.length} éléments importés.` });
+        return res.json({ success: true, message: `${rawItems.length} éléments importés.` });
     } catch (err) {
-        res.status(400).json({ success: false, error: err.message });
+        return res.status(400).json({ success: false, error: err.message });
     }
 };

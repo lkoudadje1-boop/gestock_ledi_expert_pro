@@ -1,80 +1,77 @@
-const { getDb } = require('../config/database');
+// backend/services/dashboard.service.js
+const { 
+    CloudProduct, CloudSale, CloudBrouillardTreso, CloudPayment, 
+    CloudPurchase, CloudBrouillonEcriture, CloudClotureCaisse, CloudCompany 
+} = require('../models/cloud.model');
 
-exports.fetchDashboardStats = (companyId) => {
-    const db = getDb();
-    const today = new Date().toISOString().split('T')[0];
+exports.fetchDashboardStats = async (companyId) => {
+    const todayStr = new Date().toISOString().split('T')[0];
+    const startOfDay = new Date(`${todayStr}T00:00:00.000Z`);
+    const endOfDay = new Date(`${todayStr}T23:59:59.999Z`);
 
     // 1. Produits & Alertes
-    const products = db.prepare(`
-        SELECT COUNT(*) as total,
-        SUM(CASE WHEN stock_actuel <= stockAlerte AND stockAlerte > 0 THEN 1 ELSE 0 END) as alerts
-        FROM products WHERE company_id = ? AND is_active = 1
-    `).get(companyId);
+    const productsList = await CloudProduct.find({ company_id: companyId.toString(), is_active: 1 }).lean();
+    let totalProducts = productsList.length;
+    let stockAlerts = productsList.filter(p => p.stock_actuel <= p.stockAlerte && p.stockAlerte > 0).length;
 
-    // 2. Ventes nettes du jour (Modifié : Prise en compte de 'VALIDEE' et 'RETOUR')
-    // 🔑 Note : s.montant_total est déjà recalculé net (Ventes - Retours) dans handleReturnSaleItem
-    const sales = db.prepare(`
-        SELECT SUM(montant_total) as total FROM sales 
-        WHERE company_id = ? 
-        AND statut_vente IN ('VALIDEE', 'RETOUR') -- 🔑 Inclus les ventes qui ont eu un retour
-        AND strftime('%Y-%m-%d', date_vente) = ?
-    `).get(companyId, today);
+    // 2. Ventes nettes du jour (statut 'VALIDEE' ou 'RETOUR')
+    const todaysSales = await CloudSale.find({
+        company_id: companyId.toString(),
+        statut_vente: { $in: ['VALIDEE', 'RETOUR'] },
+        date_vente: { $gte: startOfDay, $lte: endOfDay }
+    }).lean();
+    const dailySales = todaysSales.reduce((sum, s) => sum + (Number(s.montant_total) || 0), 0);
 
-    // 3. Trésorerie
-    const cash = db.prepare(`
-        SELECT SUM(solde_actuel) as total FROM brouillards_treso 
-        WHERE company_id = ? AND type = 'CAISSE' AND actif = 1
-    `).get(companyId);
+    // 3. Trésorerie (Caisse & Banque)
+    const tresos = await CloudBrouillardTreso.find({ company_id: companyId.toString(), actif: 1 }).lean();
+    const cashBalance = tresos.filter(t => t.type === 'CAISSE').reduce((sum, t) => sum + (Number(t.solde_actuel) || 0), 0);
+    const bankBalance = tresos.filter(t => t.type === 'BANQUE').reduce((sum, t) => sum + (Number(t.solde_actuel) || 0), 0);
 
-    const bank = db.prepare(`
-        SELECT SUM(solde_actuel) as total FROM brouillards_treso 
-        WHERE company_id = ? AND type = 'BANQUE' AND actif = 1
-    `).get(companyId);
+    // 4. Retours cumulés (Remboursements)
+    const payments = await CloudPayment.find({ 
+        company_id: companyId.toString(), 
+        is_active: 1 
+    }).lean();
+    const totalAvoirs = payments
+        .filter(p => (p.type_paiement || '').trim().toUpperCase() === 'REMBOURSEMENT')
+        .reduce((sum, p) => sum + (Number(p.montant) || 0), 0);
 
-    // 4. Retours cumulés (Modifié : Calculé sur la somme des remboursements financiers réels)
-    // 🔑 Permet de suivre exactement le flux de sortie d'argent dû aux avoirs clients
-    const avoirs = db.prepare(`
-        SELECT IFNULL(SUM(montant), 0) as total FROM payments 
-        WHERE company_id = ? 
-        AND TRIM(UPPER(type_paiement)) = 'REMBOURSEMENT'
-        AND is_active = 1
-    `).get(companyId);
+    // 5. Dettes & Crédits
+    const purchases = await CloudPurchase.find({ company_id: companyId.toString() }).lean();
+    const supplierDebt = purchases.reduce((sum, p) => sum + (Number(p.reste_a_payer) || 0), 0);
 
-    // 5. Dettes & Crédits (Modifié : Crédits clients basés sur les ventes valides ET les retours partiels)
-    const supplierDebt = db.prepare(`SELECT SUM(reste_a_payer) as total FROM purchases WHERE company_id = ?`).get(companyId);
-    const customerCredit = db.prepare(`
-        SELECT SUM(reste_a_payer) as total FROM sales 
-        WHERE company_id = ? 
-        AND statut_vente IN ('VALIDEE', 'RETOUR') -- 🔑 Inclus le reste à payer mis à jour après retour
-    `).get(companyId);
+    const validSalesForCredit = await CloudSale.find({
+        company_id: companyId.toString(),
+        statut_vente: { $in: ['VALIDEE', 'RETOUR'] }
+    }).lean();
+    const customerCredit = validSalesForCredit.reduce((sum, s) => sum + (Number(s.reste_a_payer) || 0), 0);
 
-    // 6. NOTIFICATIONS
-    const brouillons = db.prepare(`
-        SELECT COUNT(*) as count FROM brouillon_ecritures 
-        WHERE company_id = ? AND statut = 'EN_ATTENTE'
-    `).get(companyId);
+    // 6. Notifications & Infos diverses
+    const pendingBrouillons = await CloudBrouillonEcriture.countDocuments({
+        company_id: companyId.toString(),
+        statut: 'EN_ATTENTE'
+    });
 
-    const lastClosure = db.prepare(`
-        SELECT date_cloture FROM clotures_caisse 
-        WHERE company_id = ? AND statut = 'VALIDE'
-        ORDER BY date_cloture DESC LIMIT 1
-    `).get(companyId);
+    const lastClosure = await CloudClotureCaisse.findOne({
+        company_id: companyId.toString(),
+        statut: 'VALIDE'
+    }).sort({ created_at: -1 }).lean();
 
-    const company = db.prepare(`
-        SELECT license_start_date FROM companies WHERE id = ?
-    `).get(companyId);
+    const company = await CloudCompany.findOne({
+        $or: [{ localId: companyId }, { _id: mongoose.isValidObjectId(companyId) ? companyId : null }]
+    }).lean();
 
     return {
-        totalProducts: products?.total || 0,
-        stockAlerts: products?.alerts || 0,
-        dailySales: sales?.total || 0,
-        cashBalance: cash?.total || 0,
-        bankBalance: bank?.total || 0,
-        totalAvoirs: avoirs?.total || 0,
-        supplierDebt: supplierDebt?.total || 0,
-        customerCredit: customerCredit?.total || 0,
-        pendingBrouillons: brouillons?.count || 0,
-        lastClosureDate: lastClosure?.date_cloture || null,
+        totalProducts,
+        stockAlerts,
+        dailySales,
+        cashBalance,
+        bankBalance,
+        totalAvoirs,
+        supplierDebt,
+        customerCredit,
+        pendingBrouillons,
+        lastClosureDate: lastClosure?.date_cloture || lastClosure?.created_at || null,
         licenceExpiry: company?.license_start_date || null
     };
 };

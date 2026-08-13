@@ -1,10 +1,18 @@
-const { getDb } = require('../config/database');
+// backend/services/JournalEcritureBrouillon.service.js
+const mongoose = require('mongoose');
+const { 
+    CloudBrouillonEcriture, CloudBrouillonLigne, CloudJournal, 
+    CloudPlanComptable, CloudExercice, CloudEcriture, 
+    CloudLigneEcriture, CloudBrouillonLigneAnalytique, 
+    CloudLigneAnalytique, CloudBrouillardLignesTreso, CloudAuditLog 
+} = require('../models/cloud.model');
+const { logAction } = require('../utils/auditHelper');
 
 class JournalEcritureBrouillonService {
     // 1. Créer une écriture groupée
-    async creerEcritureBrouillon({ companyId, userId, userName, body }) {
-        const db = getDb();
+    async creerEcritureBrouillon({ companyId, userId, userName = 'user', body }) {
         const { journal_id, exercice_id, date_ecriture, libelle_general, piece_manuelle, lignes } = body;
+        const companyStr = companyId.toString();
 
         const totalDebit = lignes.reduce((sum, l) => sum + parseFloat(l.debit || 0), 0);
         const totalCredit = lignes.reduce((sum, l) => sum + parseFloat(l.credit || 0), 0);
@@ -13,172 +21,305 @@ class JournalEcritureBrouillonService {
             throw new Error("L'écriture brouillon n'est pas équilibrée.");
         }
 
-        const ecritureId = `BR-ECR-${Date.now()}`;
+        const journal = await CloudJournal.findOne({ 
+            $or: [{ localId: journal_id }, { _id: mongoose.isValidObjectId(journal_id) ? journal_id : null }], 
+            company_id: companyStr 
+        }).lean();
+        if (!journal) throw new Error("Journal introuvable.");
 
-        return db.transaction(() => {
-            const journal = db.prepare("SELECT * FROM journaux WHERE id = ? AND company_id = ?").get(journal_id, companyId);
-            if (!journal) throw new Error("Journal introuvable.");
+        const session = await mongoose.startSession();
+        session.startTransaction();
 
+        try {
             let numeroPiece = piece_manuelle;
             if (journal.mode_numerotation === 'AUTO') {
-                const sequence = journal.compteur_brouillon.toString().padStart(journal.longueur_compteur || 1, '0');
+                const compteur = journal.compteur_brouillon || 1;
+                const sequence = compteur.toString().padStart(journal.longueur_compteur || 1, '0');
                 numeroPiece = `BR-${sequence}`;
-                db.prepare("UPDATE journaux SET compteur_brouillon = compteur_brouillon + 1 WHERE id = ?").run(journal_id);
+                
+                await CloudJournal.updateOne(
+                    { _id: journal._id },
+                    { $inc: { compteur_brouillon: 1 } }
+                ).session(session);
             }
 
-            db.prepare(`
-                INSERT INTO brouillon_ecritures (id, company_id, journal_id, exercice_id, date_ecriture, piece_provisoire, libelle, user_saisie, statut, sync_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'EN_ATTENTE', 'pending')
-            `).run(ecritureId, companyId, journal_id, exercice_id, date_ecriture, numeroPiece.toString(), libelle_general.toUpperCase(), userName);
+            const ecritureId = `BR-ECR-${Date.now()}`;
+            const dateObj = new Date(date_ecriture);
 
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillon_ecritures', ?, 'INSERT', ?)").run(ecritureId, companyId);
+            await CloudBrouillonEcriture.create([{
+                localId: ecritureId,
+                company_id: companyStr,
+                journal_id,
+                exercice_id,
+                date_ecriture: dateObj,
+                piece_provisoire: numeroPiece.toString(),
+                libelle: libelle_general.toUpperCase(),
+                user_saisie: userName,
+                statut: 'EN_ATTENTE',
+                sync_status: 'synced'
+            }], { session });
 
-            const insertLigne = db.prepare(`
-                INSERT INTO brouillon_lignes (id, company_id, brouillon_id, journal_id, exercice_id, date_ecriture, piece_provisoire, facture, reference, compte_id, num_compte, libelle, debit, credit, statut, sync_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'EN_ATTENTE', 'pending')
-            `);
-            
-            lignes.forEach((lig, index) => {
+            for (let index = 0; index < lignes.length; index++) {
+                const lig = lignes[index];
                 const ligneId = `BRLIG-${Date.now()}-${index}`;
-                const numCompte = db.prepare("SELECT numero_compte FROM plan_comptable WHERE id = ?").get(lig.compte_id)?.numero_compte || '';
-                
-                insertLigne.run(ligneId, companyId, ecritureId, journal_id, exercice_id, date_ecriture, numeroPiece.toString(), lig.facture || '', lig.reference || '', lig.compte_id, numCompte, lig.libelle.toUpperCase(), lig.debit || 0, lig.credit || 0);
-                db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillon_lignes', ?, 'INSERT', ?)").run(ligneId, companyId);
-            });
 
+                const compte = await CloudPlanComptable.findOne({ 
+                    $or: [{ localId: lig.compte_id }, { _id: mongoose.isValidObjectId(lig.compte_id) ? lig.compte_id : null }] 
+                }).lean();
+
+                await CloudBrouillonLigne.create([{
+                    localId: ligneId,
+                    company_id: companyStr,
+                    brouillon_id: ecritureId,
+                    journal_id,
+                    exercice_id,
+                    date_ecriture: dateObj,
+                    piece_provisoire: numeroPiece.toString(),
+                    facture: lig.facture || '',
+                    reference: lig.reference || '',
+                    compte_id: lig.compte_id,
+                    num_compte: compte?.numero_compte || '',
+                    libelle: lig.libelle.toUpperCase(),
+                    debit: lig.debit || 0,
+                    credit: lig.credit || 0,
+                    statut: 'EN_ATTENTE',
+                    sync_status: 'synced'
+                }], { session });
+            }
+
+            await session.commitTransaction();
+            session.endSession();
             return { id: ecritureId };
-        })();
+        } catch (err) {
+            await session.abortTransaction();
+            session.endSession();
+            throw err;
+        }
     }
 
     // 2. Saisie individuelle (Kilométrique)
-    async enregistrerLigneBrouillonIndividuelle({ companyId, userName, body }) {
-        const db = getDb();
+    async enregistrerLigneBrouillonIndividuelle({ companyId, userName = 'user', body }) {
         const { id, journal_id, exercice_id, date_ecriture, date_echeance, piece, facture, reference, num_compte, num_tiers, libelle, debit, credit, compte_id } = body;
+        const companyStr = companyId.toString();
 
-        return db.transaction(() => {
-            const journal = db.prepare(`
-                SELECT j.*, p.numero_compte as compte_contrepartie 
-                FROM journaux j 
-                LEFT JOIN plan_comptable p ON j.compte_contrepartie_id = p.id 
-                WHERE j.id = ? AND j.company_id = ?
-            `).get(journal_id, companyId);
-            
-            if (!journal) throw new Error("Journal introuvable");
+        const journal = await CloudJournal.findOne({ 
+            $or: [{ localId: journal_id }, { _id: mongoose.isValidObjectId(journal_id) ? journal_id : null }], 
+            company_id: companyStr 
+        }).lean();
+        if (!journal) throw new Error("Journal introuvable");
 
+        const session = await mongoose.startSession();
+        session.startTransaction();
+
+        try {
             let pieceDeTravail = piece ? piece.toString() : '';
+            const dateObj = new Date(date_ecriture);
 
             if (!id && journal.mode_numerotation === 'AUTO' && !piece) {
-                const pieceInachevee = db.prepare(`
-                    SELECT piece_provisoire FROM brouillon_lignes 
-                    WHERE journal_id = ? AND exercice_id = ? AND company_id = ? 
-                    GROUP BY piece_provisoire 
-                    HAVING ROUND(SUM(debit) - SUM(credit), 2) != 0 LIMIT 1
-                `).get(journal_id, exercice_id, companyId);
-                
-                pieceDeTravail = pieceInachevee ? pieceInachevee.piece_provisoire : `BR-${journal.compteur_brouillon.toString().padStart(4, '0')}`;
+                const inachevee = await CloudBrouillonLigne.aggregate([
+                    { $match: { journal_id: journal_id, exercice_id: exercice_id, company_id: companyStr } },
+                    { $group: { _id: '$piece_provisoire', solde: { $sum: { $subtract: ['$debit', '$credit'] } } } },
+                    { $match: { solde: { $ne: 0 } } },
+                    { $limit: 1 }
+                ]).session(session);
+
+                if (inachevee && inachevee.length > 0) {
+                    pieceDeTravail = inachevee[0]._id.toString();
+                } else {
+                    const compteur = journal.compteur_brouillon || 1;
+                    pieceDeTravail = `BR-${compteur.toString().padStart(4, '0')}`;
+                }
             }
+
+            let entete = await CloudBrouillonEcriture.findOne({ 
+                piece_provisoire: pieceDeTravail, 
+                journal_id, 
+                company_id: companyStr 
+            }).session(session);
 
             let ecriture_id;
             const finalLibelle = libelle ? libelle.toUpperCase() : '';
 
-            let entete = db.prepare(`SELECT id FROM brouillon_ecritures WHERE piece_provisoire = ? AND journal_id = ? AND company_id = ?`).get(pieceDeTravail, journal_id, companyId);
-            
             if (!entete) {
                 ecriture_id = `BR-ECR-${Date.now()}`;
-                db.prepare(`
-                    INSERT INTO brouillon_ecritures (id, company_id, journal_id, exercice_id, date_ecriture, piece_provisoire, libelle, user_saisie, statut, sync_status) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'EN_ATTENTE', 'pending')
-                `).run(ecriture_id, companyId, journal_id, exercice_id, date_ecriture, pieceDeTravail, finalLibelle, userName);
-                
-                db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillon_ecritures', ?, 'INSERT', ?)").run(ecriture_id, companyId);
+                await CloudBrouillonEcriture.create([{
+                    localId: ecriture_id,
+                    company_id: companyStr,
+                    journal_id,
+                    exercice_id,
+                    date_ecriture: dateObj,
+                    piece_provisoire: pieceDeTravail,
+                    libelle: finalLibelle,
+                    user_saisie: userName,
+                    statut: 'EN_ATTENTE',
+                    sync_status: 'synced'
+                }], { session });
             } else {
-                ecriture_id = entete.id;
+                ecriture_id = entete.localId || entete._id.toString();
             }
 
             const ligneId = id || `BRLIG-${Date.now()}`;
+            const finalEcheance = date_echeance ? new Date(date_echeance) : null;
+            let aEteIncremente = false;
 
             if (id) {
-                db.prepare(`
-                    UPDATE brouillon_lignes 
-                    SET piece_provisoire = ?, facture = ?, reference = ?, num_compte = ?, num_tiers = ?, 
-                        libelle = ?, debit = ?, credit = ?, date_echeance = ?, 
-                        sync_status = 'pending', updated_at = CURRENT_TIMESTAMP 
-                    WHERE id = ?
-                `).run(pieceDeTravail, facture || '', reference || '', num_compte, num_tiers || null, finalLibelle, parseFloat(debit || 0), parseFloat(credit || 0), date_echeance || null, id);
+                await CloudBrouillonLigne.updateOne(
+                    { localId: id, company_id: companyStr },
+                    {
+                        $set: {
+                            piece_provisoire: pieceDeTravail,
+                            facture: facture || '',
+                            reference: reference || '',
+                            num_compte,
+                            num_tiers: num_tiers || null,
+                            libelle: finalLibelle,
+                            debit: parseFloat(debit || 0),
+                            credit: parseFloat(credit || 0),
+                            date_echeance: finalEcheance,
+                            updated_at: new Date(),
+                            sync_status: 'synced'
+                        }
+                    }
+                ).session(session);
 
-                db.prepare(`
-                    UPDATE brouillon_lignes SET libelle = ?, reference = ?, facture = ?, sync_status = 'pending'
-                    WHERE piece_provisoire = ? AND journal_id = ? AND company_id = ?
-                `).run(finalLibelle, reference || '', facture || '', pieceDeTravail, journal_id, companyId);
+                await CloudBrouillonLigne.updateMany(
+                    { piece_provisoire: pieceDeTravail, journal_id, company_id: companyStr },
+                    { $set: { libelle: finalLibelle, reference: reference || '', facture: facture || '', sync_status: 'synced' } }
+                ).session(session);
 
-                db.prepare(`UPDATE brouillon_ecritures SET libelle = ?, sync_status = 'pending' WHERE id = ?`).run(finalLibelle, ecriture_id);
-                db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillon_ecritures', ?, 'UPDATE', ?)").run(ecriture_id, companyId);
+                await CloudBrouillonEcriture.updateOne(
+                    { localId: ecriture_id },
+                    { $set: { libelle: finalLibelle, sync_status: 'synced' } }
+                ).session(session);
             } else {
-                db.prepare(`
-                    INSERT INTO brouillon_lignes (id, company_id, brouillon_id, journal_id, exercice_id, date_ecriture, piece_provisoire, facture, reference, compte_id, num_compte, num_tiers, libelle, debit, credit, date_echeance, statut, sync_status) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'EN_ATTENTE', 'pending')
-                `).run(ligneId, companyId, ecriture_id, journal_id, exercice_id, date_ecriture, pieceDeTravail, facture || '', reference || '', compte_id, num_compte, num_tiers || null, finalLibelle, parseFloat(debit || 0), parseFloat(credit || 0), date_echeance || null);
+                await CloudBrouillonLigne.create([{
+                    localId: ligneId,
+                    company_id: companyStr,
+                    brouillon_id: ecriture_id,
+                    journal_id,
+                    exercice_id,
+                    date_ecriture: dateObj,
+                    piece_provisoire: pieceDeTravail,
+                    facture: facture || '',
+                    reference: reference || '',
+                    compte_id,
+                    num_compte,
+                    num_tiers: num_tiers || null,
+                    libelle: finalLibelle,
+                    debit: parseFloat(debit || 0),
+                    credit: parseFloat(credit || 0),
+                    date_echeance: finalEcheance,
+                    statut: 'EN_ATTENTE',
+                    sync_status: 'synced'
+                }], { session });
             }
 
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillon_lignes', ?, ?, ?)")
-              .run(ligneId, id ? 'UPDATE' : 'INSERT', companyId);
+            const soldeAgg = await CloudBrouillonLigne.aggregate([
+                { $match: { piece_provisoire: pieceDeTravail, journal_id, company_id: companyStr } },
+                { $group: { _id: null, reste: { $sum: { $subtract: ['$debit', '$credit'] } } } }
+            ]).session(session);
 
-            const solde = db.prepare(`SELECT ROUND(SUM(debit) - SUM(credit), 2) as reste FROM brouillon_lignes WHERE piece_provisoire = ? AND journal_id = ? AND company_id = ?`).get(pieceDeTravail, journal_id, companyId);
-            
-            let aEteIncremente = false;
-            if (journal.mode_numerotation === 'AUTO' && solde && Math.abs(solde.reste) < 0.01) {
-                db.prepare("UPDATE journaux SET compteur_brouillon = compteur_brouillon + 1 WHERE id = ?").run(journal_id);
+            const soldePiece = soldeAgg.length > 0 ? soldeAgg[0].reste : 0;
+
+            if (journal.mode_numerotation === 'AUTO' && Math.abs(soldePiece) < 0.01) {
+                await CloudJournal.updateOne({ _id: journal._id }, { $inc: { compteur_brouillon: 1 } }).session(session);
                 aEteIncremente = true;
             }
 
-            return { id: ligneId, ecriture_id, numPieceFinale: pieceDeTravail, aEteIncremente, soldePiece: solde ? solde.reste : 0, contrepartie: journal.compte_contrepartie };
-        })();
+            let contrepartieNum = null;
+            if (journal.compte_contrepartie_id) {
+                const cpte = await CloudPlanComptable.findOne({ 
+                    $or: [{ localId: journal.compte_contrepartie_id }, { _id: mongoose.isValidObjectId(journal.compte_contrepartie_id) ? journal.compte_contrepartie_id : null }] 
+                }).lean();
+                contrepartieNum = cpte?.numero_compte || null;
+            }
+
+            await session.commitTransaction();
+            session.endSession();
+            return { id: ligneId, ecriture_id, numPieceFinale: pieceDeTravail, aEteIncremente, soldePiece, contrepartie: contrepartieNum };
+        } catch (err) {
+            await session.abortTransaction();
+            session.endSession();
+            throw err;
+        }
     }
 
     // 3. Récupération périodique
     async getLignesBrouillonParPeriode({ journal_id, exercice_id, moisIdx, companyId }) {
-        const db = getDb();
-        let patternDate = '%'; 
+        const companyStr = companyId.toString();
+        let patternDate = ''; 
         let ancienSolde = 0, mvtDebitMois = 0, mvtCreditMois = 0;
 
         if (exercice_id && exercice_id !== 'ALL' && exercice_id !== 'undefined') {
-            const exercice = db.prepare("SELECT date_debut FROM exercices WHERE id = ?").get(exercice_id);
+            const exercice = await CloudExercice.findOne({ localId: exercice_id, company_id: companyStr }).lean();
             if (exercice) {
-                const annee = exercice.date_debut.split('-')[0];
+                const annee = new Date(exercice.date_debut).getFullYear();
                 const moisNum = (parseInt(moisIdx) + 1).toString().padStart(2, '0');
-                patternDate = `${annee}-${moisNum}-%`;
+                patternDate = `${annee}-${moisNum}-`;
                 const dateDebutMois = `${annee}-${moisNum}-01`;
 
                 if (journal_id && journal_id !== 'ALL') {
-                    const journal = db.prepare("SELECT compte_contrepartie_id FROM journaux WHERE id = ?").get(journal_id);
+                    const journal = await CloudJournal.findOne({ 
+                        $or: [{ localId: journal_id }, { _id: mongoose.isValidObjectId(journal_id) ? journal_id : null }], 
+                        company_id: companyStr 
+                    }).lean();
+
                     if (journal?.compte_contrepartie_id) {
-                        const compte = db.prepare("SELECT numero_compte FROM plan_comptable WHERE id = ?").get(journal.compte_contrepartie_id);
+                        const compte = await CloudPlanComptable.findOne({ 
+                            $or: [{ localId: journal.compte_contrepartie_id }, { _id: mongoose.isValidObjectId(journal.compte_contrepartie_id) ? journal.compte_contrepartie_id : null }] 
+                        }).lean();
+
                         if (compte) {
-                            ancienSolde = db.prepare(`SELECT (SUM(debit) - SUM(credit)) as solde FROM lignes_ecritures WHERE num_compte = ? AND company_id = ? AND date_ecriture < ? AND is_deleted = 0`).get(compte.numero_compte, companyId, dateDebutMois)?.solde || 0;
-                            const resMvts = db.prepare(`SELECT SUM(debit) as debits, SUM(credit) as credits FROM brouillon_lignes WHERE num_compte = ? AND company_id = ? AND date_ecriture LIKE ?`).get(compte.numero_compte, companyId, patternDate);
-                            mvtDebitMois = resMvts?.debits || 0;
-                            mvtCreditMois = resMvts?.credits || 0;
+                            const ancienAgg = await CloudLigneEcriture.aggregate([
+                                { $match: { num_compte: compte.numero_compte, company_id: companyStr, date_ecriture: { $lt: new Date(dateDebutMois) }, is_deleted: 0 } },
+                                { $group: { _id: null, solde: { $sum: { $subtract: ['$debit', '$credit'] } } } }
+                            ]);
+                            ancienSolde = ancienAgg.length > 0 ? ancienAgg[0].solde : 0;
+
+                            const mvtsAgg = await CloudBrouillonLigne.aggregate([
+                                { 
+                                    $match: { 
+                                        num_compte: compte.numero_compte, 
+                                        company_id: companyStr, 
+                                        date_ecriture: { 
+                                            $gte: new Date(`${annee}-${moisNum}-01`), 
+                                            $lte: new Date(`${annee}-${moisNum}-31`) 
+                                        } 
+                                    } 
+                                },
+                                { $group: { _id: null, debits: { $sum: '$debit' }, credits: { $sum: '$credit' } } }
+                            ]);
+                            mvtDebitMois = mvtsAgg.length > 0 ? mvtsAgg[0].debits : 0;
+                            mvtCreditMois = mvtsAgg.length > 0 ? mvtsAgg[0].credits : 0;
                         }
                     }
                 }
             }
         }
 
-        const data = db.prepare(`
-            SELECT 
-                l.*, 
-                l.piece_provisoire as piece,
-                j.code as journal_code,
-                EXISTS (SELECT 1 FROM brouillon_lignes_analytiques la WHERE la.ligne_brouillon_id = l.id) as is_ventilated
-            FROM brouillon_lignes l
-            JOIN journaux j ON l.journal_id = j.id
-            WHERE l.company_id = ? 
-              AND (l.journal_id = ? OR ? = 'ALL' OR ? = 'undefined') 
-              AND (l.exercice_id = ? OR ? = 'ALL' OR ? = 'undefined') 
-              AND l.date_ecriture LIKE ?
-            ORDER BY l.created_at DESC, l.id DESC
-        `).all(companyId, journal_id, journal_id, journal_id, exercice_id, exercice_id, exercice_id, patternDate);
-        
+        const matchQuery = { company_id: companyStr };
+        if (journal_id && journal_id !== 'ALL' && journal_id !== 'undefined') matchQuery.journal_id = journal_id;
+        if (exercice_id && exercice_id !== 'ALL' && exercice_id !== 'undefined') matchQuery.exercice_id = exercice_id;
+        if (patternDate) {
+            matchQuery.date_ecriture = { $regex: new RegExp(`^${patternDate}`) };
+        }
+
+        const lignes = await CloudBrouillonLigne.find(matchQuery)
+            .populate('journal_id', 'code')
+            .sort({ created_at: -1, _id: -1 })
+            .lean();
+
+        const data = [];
+        for (const l of lignes) {
+            const hasAna = await CloudBrouillonLigneAnalytique.exists({ ligne_brouillon_id: l.localId || l._id.toString() });
+            data.push({
+                ...l,
+                piece: l.piece_provisoire,
+                journal_code: l.journal_id?.code,
+                is_ventilated: !!hasAna
+            });
+        }
+
         return { 
             data, 
             ancienSolde: parseFloat(ancienSolde), 
@@ -190,56 +331,75 @@ class JournalEcritureBrouillonService {
 
     // 4. Suppression
     async supprimerPieceBrouillon(ids, companyId) {
-        const db = getDb();
-        return db.transaction(() => {
-            const placeholders = ids.map(() => '?').join(',');
-            const entetes = db.prepare(`SELECT DISTINCT brouillon_id FROM brouillon_lignes WHERE id IN (${placeholders})`).all(...ids);
-            
-            ids.forEach(ligneId => {
-                db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillon_lignes', ?, 'DELETE', ?)").run(ligneId, companyId);
-            });
+        const companyStr = companyId.toString();
+        const session = await mongoose.startSession();
+        session.startTransaction();
 
-            db.prepare(`DELETE FROM brouillon_lignes WHERE id IN (${placeholders}) AND company_id = ?`).run(...ids, companyId);
+        try {
+            const lignes = await CloudBrouillonLigne.find({ localId: { $in: ids }, company_id: companyStr }).session(session);
+            const brouillonIds = [...new Set(lignes.map(l => l.brouillon_id))];
 
-            entetes.forEach(e => {
-                const reste = db.prepare(`SELECT COUNT(*) as nb FROM brouillon_lignes WHERE brouillon_id = ?`).get(e.brouillon_id);
-                if (reste.nb === 0) {
-                    db.prepare(`DELETE FROM brouillon_ecritures WHERE id = ?`).run(e.brouillon_id);
-                    db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillon_ecritures', ?, 'DELETE', ?)").run(e.brouillon_id, companyId);
+            await CloudBrouillonLigne.deleteMany({ localId: { $in: ids }, company_id: companyStr }).session(session);
+
+            for (const bId of brouillonIds) {
+                const reste = await CloudBrouillonLigne.countDocuments({ brouillon_id: bId }).session(session);
+                if (reste === 0) {
+                    await CloudBrouillonEcriture.deleteOne({ localId: bId }).session(session);
                 }
-            });
-        })();
+            }
+
+            await session.commitTransaction();
+            session.endSession();
+        } catch (err) {
+            await session.abortTransaction();
+            session.endSession();
+            throw err;
+        }
     }
 
     // 5. Récupérer journaux
     async getJournauxPourBrouillon(exercice_id, companyId) {
-        const db = getDb();
-        const checkAnalytique = db.prepare(`SELECT c.gestion_analytique, (SELECT COUNT(*) FROM plan_analytique WHERE company_id = ? AND is_deleted = 0) as nb_plans FROM companies c WHERE c.id = ?`).get(companyId, companyId);
-        const analytiqueBloque = checkAnalytique?.gestion_analytique === 1 && checkAnalytique.nb_plans === 0;
+        const companyStr = companyId.toString();
+        const nbPlans = await CloudPlanAnalytique.countDocuments({ company_id: companyStr, is_deleted: 0 });
+        const company = await CloudCompany.findOne({ $or: [{ localId: companyStr }, { _id: mongoose.isValidObjectId(companyStr) ? companyStr : null }] }).lean();
+        const analytiqueBloque = company?.gestion_analytique === 1 && nbPlans === 0;
 
-        const data = db.prepare(`
-            SELECT j.*, pc.numero_compte as compte_numero, pc.intitule as compte_libelle,
-            (SELECT GROUP_CONCAT(DISTINCT CAST(strftime('%m', bl.date_ecriture) AS INTEGER) - 1) FROM brouillon_lignes bl WHERE bl.journal_id = j.id AND bl.company_id = j.company_id AND bl.exercice_id = ? AND bl.statut IN ('EN_ATTENTE', 'VALIDE')) as mois_saisis
-            FROM journaux j LEFT JOIN plan_comptable pc ON j.compte_contrepartie_id = pc.id WHERE j.company_id = ?
-        `).all(exercice_id, companyId);
+        const journaux = await CloudJournal.find({ company_id: companyStr }).lean();
+        const data = [];
+
+        for (const j of journaux) {
+            let compte = null;
+            if (j.compte_contrepartie_id) {
+                compte = await CloudPlanComptable.findOne({ 
+                    $or: [{ localId: j.compte_contrepartie_id }, { _id: mongoose.isValidObjectId(j.compte_contrepartie_id) ? j.compte_contrepartie_id : null }] 
+                }).lean();
+            }
+
+            data.push({
+                ...j,
+                compte_numero: compte?.numero_compte || '',
+                compte_libelle: compte?.intitule || ''
+            });
+        }
 
         return { data, analytique_alerte: analytiqueBloque };
     }
 
     // 6. Validation finale vers Grand Livre
-    async validerPieceBrouillon({ piece_provisoire, journal_id, companyId, userName }) {
-        const db = getDb();
-        
+    async validerPieceBrouillon({ piece_provisoire, journal_id, companyId, userName = 'user' }) {
+        const companyStr = companyId.toString();
         if (!journal_id) throw new Error("Le journal_id est requis pour valider cette pièce.");
 
-        return db.transaction(() => {
-            const lignesBrouillon = db.prepare(`
-                SELECT * FROM brouillon_lignes 
-                WHERE piece_provisoire = ? 
-                  AND journal_id = ? 
-                  AND company_id = ? 
-                  AND statut = 'EN_ATTENTE'
-            `).all(piece_provisoire, journal_id, companyId);
+        const session = await mongoose.startSession();
+        session.startTransaction();
+
+        try {
+            const lignesBrouillon = await CloudBrouillonLigne.find({
+                piece_provisoire,
+                journal_id,
+                company_id: companyStr,
+                statut: 'EN_ATTENTE'
+            }).session(session);
 
             if (lignesBrouillon.length === 0) {
                 throw new Error("Cette pièce est déjà validée ou n'existe plus dans ce journal.");
@@ -247,157 +407,137 @@ class JournalEcritureBrouillonService {
 
             const first = lignesBrouillon[0];
 
-            const existeDeja = db.prepare(`
-                SELECT id FROM ecritures 
-                WHERE piece = ? AND journal_id = ? AND exercice_id = ? AND company_id = ?
-            `).get(piece_provisoire, journal_id, first.exercice_id, companyId);
+            const existeDeja = await CloudEcriture.findOne({
+                piece: piece_provisoire,
+                journal_id,
+                exercice_id: first.exercice_id,
+                company_id: companyStr
+            }).session(session);
 
-            if (existeDeja) throw new Error(`La pièce ${piece_provisoire} existe déjà au Grand Livre pour ce journal.`);
+            if (existeDeja) throw new Error(`La pièce ${piece_provisoire} existe déjà au Grand Livre.`);
 
-            const journal = db.prepare("SELECT * FROM journaux WHERE id = ? AND company_id = ?").get(journal_id, companyId);
+            const journal = await CloudJournal.findOne({ 
+                $or: [{ localId: journal_id }, { _id: mongoose.isValidObjectId(journal_id) ? journal_id : null }], 
+                company_id: companyStr 
+            }).session(session);
+
             if (journal?.mode_numerotation === 'AUTO') {
-                db.prepare("UPDATE journaux SET compteur_piece = compteur_piece + 1 WHERE id = ?").run(journal_id);
+                await CloudJournal.updateOne({ _id: journal._id }, { $inc: { compteur_piece: 1 } }).session(session);
             }
 
             const ecritureIdReel = `ECR-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
-            db.prepare(`
-                INSERT INTO ecritures (id, company_id, journal_id, exercice_id, date_ecriture, piece, reference, ref_brouillon, libelle, user_saisie, sync_status) 
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-            `).run(
-                ecritureIdReel, 
-                companyId, 
-                journal_id, 
-                first.exercice_id, 
-                first.date_ecriture, 
-                piece_provisoire, 
-                first.reference, 
-                piece_provisoire, 
-                first.libelle, 
-                userName
-            );
-            
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('ecritures', ?, 'INSERT', ?)").run(ecritureIdReel, companyId);
+            await CloudEcriture.create([{
+                localId: ecritureIdReel,
+                company_id: companyStr,
+                journal_id,
+                exercice_id: first.exercice_id,
+                date_ecriture: first.date_ecriture,
+                piece: piece_provisoire,
+                reference: first.reference,
+                ref_brouillon: piece_provisoire,
+                libelle: first.libelle,
+                user_saisie: userName,
+                sync_status: 'synced'
+            }], { session });
 
             for (const lb of lignesBrouillon) {
                 const ligneIdReelle = `LIG-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
                 
-                db.prepare(`
-                    INSERT INTO lignes_ecritures (
-                        id, company_id, ecriture_id, journal_id, exercice_id, 
-                        date_ecriture, date_echeance, piece, facture, reference, 
-                        compte_id, num_compte, num_tiers, libelle, debit, credit, sync_status
-                    ) 
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-                `).run(
-                    ligneIdReelle, 
-                    companyId, 
-                    ecritureIdReel, 
-                    journal_id, 
-                    lb.exercice_id, 
-                    lb.date_ecriture, 
-                    lb.date_echeance, 
-                    piece_provisoire, 
-                    lb.facture, 
-                    lb.reference, 
-                    lb.compte_id, 
-                    lb.num_compte, 
-                    lb.num_tiers, 
-                    lb.libelle, 
-                    lb.debit, 
-                    lb.credit
-                );
-                
-                db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('lignes_ecritures', ?, 'INSERT', ?)").run(ligneIdReelle, companyId);
+                await CloudLigneEcriture.create([{
+                    localId: ligneIdReelle,
+                    company_id: companyStr,
+                    ecriture_id: ecritureIdReel,
+                    journal_id,
+                    exercice_id: lb.exercice_id,
+                    date_ecriture: lb.date_ecriture,
+                    date_echeance: lb.date_echeance,
+                    piece: piece_provisoire,
+                    facture: lb.facture,
+                    reference: lb.reference,
+                    compte_id: lb.compte_id,
+                    num_compte: lb.num_compte,
+                    num_tiers: lb.num_tiers,
+                    libelle: lb.libelle,
+                    debit: lb.debit,
+                    credit: lb.credit,
+                    sync_status: 'synced'
+                }], { session });
 
-                const anaBrouillon = db.prepare(`SELECT * FROM brouillon_lignes_analytiques WHERE ligne_brouillon_id = ?`).all(lb.id);
-                anaBrouillon.forEach((ana, idx) => {
+                const anaBrouillon = await CloudBrouillonLigneAnalytique.find({ ligne_brouillon_id: lb.localId || lb._id.toString() }).session(session);
+                for (let idx = 0; idx < anaBrouillon.length; idx++) {
+                    const ana = anaBrouillon[idx];
                     const anaIdReel = `LANA-${Date.now()}-${idx}-${Math.random().toString(36).substr(2, 5)}`;
-                    db.prepare(`
-                        INSERT INTO lignes_analytiques (id, company_id, ligne_ecriture_id, plan_analytique_id, departement_id, num_compte, montant, sync_status) 
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-                    `).run(anaIdReel, companyId, ligneIdReelle, ana.plan_analytique_id, ana.departement_id, lb.num_compte, ana.montant);
-                    
-                    db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('lignes_analytiques', ?, 'INSERT', ?)").run(anaIdReel, companyId);
-                });
+                    await CloudLigneAnalytique.create([{
+                        localId: anaIdReel,
+                        company_id: companyStr,
+                        ligne_ecriture_id: ligneIdReelle,
+                        plan_analytique_id: ana.plan_analytique_id,
+                        departement_id: ana.departement_id,
+                        num_compte: lb.num_compte,
+                        montant: ana.montant,
+                        sync_status: 'synced'
+                    }], { session });
+                }
             }
 
-            db.prepare(`
-                UPDATE brouillon_lignes 
-                SET statut = 'VALIDE', observation = ?, sync_status = 'pending' 
-                WHERE piece_provisoire = ? AND journal_id = ? AND company_id = ?
-            `).run(`Transféré le ${new Date().toISOString()}`, piece_provisoire, journal_id, companyId);
-            
-            db.prepare(`
-                UPDATE brouillon_ecritures 
-                SET statut = 'VALIDE', sync_status = 'pending' 
-                WHERE piece_provisoire = ? AND journal_id = ? AND company_id = ?
-            `).run(piece_provisoire, journal_id, companyId);
+            await CloudBrouillonLigne.updateMany(
+                { piece_provisoire, journal_id, company_id: companyStr },
+                { $set: { statut: 'VALIDE', observation: `Transféré le ${new Date().toISOString()}` } }
+            ).session(session);
 
-            const updatedLignes = db.prepare(`SELECT id FROM brouillon_lignes WHERE piece_provisoire = ? AND journal_id = ? AND company_id = ?`).all(piece_provisoire, journal_id, companyId);
-            updatedLignes.forEach(l => {
-                db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillon_lignes', ?, 'UPDATE', ?)").run(l.id, companyId);
-            });
-
-            const enteteBrouillon = db.prepare(`SELECT id FROM brouillon_ecritures WHERE piece_provisoire = ? AND journal_id = ? AND company_id = ?`).get(piece_provisoire, journal_id, companyId);
-            if (enteteBrouillon) {
-                db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillon_ecritures', ?, 'UPDATE', ?)").run(enteteBrouillon.id, companyId);
-            }
+            await CloudBrouillonEcriture.updateMany(
+                { piece_provisoire, journal_id, company_id: companyStr },
+                { $set: { statut: 'VALIDE' } }
+            ).session(session);
 
             if (lignesBrouillon.some(l => l.libelle?.includes('EXTOURNE'))) {
-                db.prepare(`
-                    UPDATE brouillard_lignes_treso 
-                    SET statut = 'REJETE', v1_statut = 0, motif_annulation = 'Annulation confirmée par extourne' 
-                    WHERE piece_comptable = ? AND journal_id = ? AND company_id = ? AND v1_statut = 9
-                `).run(piece_provisoire.replace('BR-', ''), journal_id, companyId);
+                await CloudBrouillardLignesTreso.updateMany(
+                    { piece_comptable: piece_provisoire.replace('BR-', ''), journal_id, company_id: companyStr, v1_statut: 9 },
+                    { $set: { statut: 'REJETE', v1_statut: 0, motif_annulation: 'Annulation confirmée par extourne' } }
+                ).session(session);
             }
-        });
+
+            await session.commitTransaction();
+            session.endSession();
+        } catch (err) {
+            await session.abortTransaction();
+            session.endSession();
+            throw err;
+        }
     }
 
     // 7. Rejet et Libération Trésorerie
     async rejeterPieceBrouillon({ piece_provisoire, journal_id, observation, companyId }) {
-        const db = getDb();
-
+        const companyStr = companyId.toString();
         if (!journal_id) throw new Error("Le journal_id est requis pour rejeter cette pièce.");
 
-        return db.transaction(() => {
-            db.prepare(`
-                UPDATE brouillon_lignes 
-                SET statut = 'REJETE', observation = ?, sync_status = 'pending' 
-                WHERE piece_provisoire = ? 
-                  AND journal_id = ? 
-                  AND company_id = ?
-            `).run(observation, piece_provisoire, journal_id, companyId);
+        const session = await mongoose.startSession();
+        session.startTransaction();
 
-            db.prepare(`
-                UPDATE brouillon_ecritures 
-                SET statut = 'REJETE', sync_status = 'pending' 
-                WHERE piece_provisoire = ? 
-                  AND journal_id = ? 
-                  AND company_id = ?
-            `).run(piece_provisoire, journal_id, companyId);
+        try {
+            await CloudBrouillonLigne.updateMany(
+                { piece_provisoire, journal_id, company_id: companyStr },
+                { $set: { statut: 'REJETE', observation } }
+            ).session(session);
 
-            // 🔄 Synchronisation Cloud des modifications de statut
-            const updatedLignes = db.prepare(`SELECT id FROM brouillon_lignes WHERE piece_provisoire = ? AND journal_id = ? AND company_id = ?`).all(piece_provisoire, journal_id, companyId);
-            updatedLignes.forEach(l => {
-                db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillon_lignes', ?, 'UPDATE', ?)").run(l.id, companyId);
-            });
-
-            const enteteBrouillon = db.prepare(`SELECT id FROM brouillon_ecritures WHERE piece_provisoire = ? AND journal_id = ? AND company_id = ?`).get(piece_provisoire, journal_id, companyId);
-            if (enteteBrouillon) {
-                db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillon_ecritures', ?, 'UPDATE', ?)").run(enteteBrouillon.id, companyId);
-            }
+            await CloudBrouillonEcriture.updateMany(
+                { piece_provisoire, journal_id, company_id: companyStr },
+                { $set: { statut: 'REJETE' } }
+            ).session(session);
 
             const refOriginale = piece_provisoire.replace('BR-', '');
+            await CloudBrouillardLignesTreso.updateMany(
+                { piece_comptable: refOriginale, journal_id, company_id: companyStr },
+                { $set: { comptabilise: 0, brouillon_ecriture_id: null } }
+            ).session(session);
 
-            db.prepare(`
-                UPDATE brouillard_lignes_treso 
-                SET comptabilise = 0, 
-                    brouillon_ecriture_id = NULL 
-                WHERE piece_comptable = ? 
-                  AND journal_id = ? 
-                  AND company_id = ?
-            `).run(refOriginale, journal_id, companyId);
-        });
+            await session.commitTransaction();
+            session.endSession();
+        } catch (err) {
+            await session.abortTransaction();
+            session.endSession();
+            throw err;
+        }
     }
 }
 

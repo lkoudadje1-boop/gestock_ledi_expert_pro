@@ -1,4 +1,4 @@
-// backend/services/utils.service.js
+// backend/utils/helpers.js
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
 
@@ -13,7 +13,7 @@ function generateUniqueCode(length = 8) {
 }
 
 /**
- * 🔐 Sécurité : Hachage du mot de passe (Asynchrone)
+ * 🔐 Sécurité : Hachage du mot de passe
  */
 async function hashPassword(password) {
   const saltRounds = 10;
@@ -21,26 +21,27 @@ async function hashPassword(password) {
 }
 
 /**
- * 🔑 Sécurité : Comparaison pour l'authentification (Asynchrone)
+ * 🔑 Sécurité : Comparaison pour l'authentification
  */
 async function comparePassword(plainPassword, hashedPassword) {
   return await bcrypt.compare(plainPassword, hashedPassword);
 }
 
 /**
- * 📦 Générateur d'ID Article
- * Format : ART- + 6 chiffres uniques basés sur le timestamp
+ * 📦 Générateur d'ID Article (Anti-collision amélioré pour le Cloud)
+ * Format : ART- + timestamp + random
  */
 function genererIdArticle() {
-  const ts = Date.now().toString().slice(-6);
-  return `ART-${ts}`;
+  const ts = Date.now().toString().slice(-4);
+  const random = Math.floor(Math.random() * 1000).toString().padStart(2, '0');
+  return `ART-${ts}${random}`;
 }
 
 /**
  * 📊 Formateur de prix
  */
 function formatCurrency(value) {
-  return Number(parseFloat(value).toFixed(2));
+  return Number(parseFloat(value || 0).toFixed(2));
 }
 
 module.exports = {

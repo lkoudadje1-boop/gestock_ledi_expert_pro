@@ -1,3 +1,4 @@
+// backend/controllers/settingsController.js
 const { getAppThemeContext, verifyAndDecryptLicense } = require('../utils/ajouterlike');
 
 exports.getUiConfiguration = async (req, res) => {

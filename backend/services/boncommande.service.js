@@ -1,4 +1,12 @@
-const { getDb } = require('../config/database');
+// backend/services/boncommande.service.js
+const mongoose = require('mongoose');
+const { 
+    CloudPurchaseOrder, 
+    CloudPurchaseOrderItem, 
+    CloudProduct, 
+    CloudUnite, 
+    CloudSupplier 
+} = require('../models/cloud.model');
 const conversestock = require('./conversestock');
 
 class BonCommandeService {
@@ -12,145 +20,142 @@ class BonCommandeService {
     /**
      * Enregistre un bon de commande et ses articles associés (Sans impacter le stock physique)
      */
-    saveBonCommande(payload, user) {
-        const db = getDb();
-        const { header, items } = payload;
-        
-        const companyId = (user?.company_id || user?.companyId)?.toString();
-        const userId = (user?.userId || user?.id)?.toString();
+    async saveBonCommande(payload, user) {
+        const session = await mongoose.startSession();
+        session.startTransaction();
 
-        const orderId = this.genererId('CMD');
-        const currentDate = header.date || new Date().toISOString();
-        const totalFacture = parseFloat(header.totalFacture) || 0;
+        try {
+            const { header, items } = payload;
+            const companyId = (user?.company_id || user?.companyId)?.toString();
+            const userId = (user?.userId || user?.id)?.toString();
 
-        // 🛡️ LOGIQUE TRANSACTIONNELLE STRICTEMENT SYNCHRONE (BETTER-SQLITE3)
-        const executerTransaction = db.transaction(() => {
-            
-            // 1. Insertion de l'en-tête du Bon de Commande (purchase_orders)
-            db.prepare(`
-                INSERT INTO purchase_orders (
-                    id, num_bon, supplier_id, total_facture, montant_avance, 
-                    montant_paye, reste_a_payer, moyen_reglement, statut_commande, 
-                    observations, date_commande, user_id, company_id, sync_status
-                ) VALUES (?, ?, ?, ?, 0, 0, ?, NULL, 'EN_ATTENTE', ?, ?, ?, ?, 'pending')
-            `).run(
-                orderId,
-                header.numBon,
-                header.fournisseurId,
-                totalFacture,
-                totalFacture, // reste_a_payer = total_facture au départ
-                header.observations || null,
-                currentDate,
-                userId,
-                companyId
-            );
+            if (!companyId || !userId) {
+                throw new Error("Session invalide ou expirée.");
+            }
 
-            // Enregistrement du Header dans la file de synchronisation
-            db.prepare(`
-                INSERT INTO sync_queue (table_name, record_id, operation, company_id)
-                VALUES ('purchase_orders', ?, 'INSERT', ?)
-            `).run(orderId, companyId);
+            const orderId = this.genererId('CMD');
+            const currentDate = header.date || new Date();
+            const totalFacture = parseFloat(header.totalFacture) || 0;
 
-            // 2. Préparation des requêtes d'insertion pour les items
-            const insertItemStmt = db.prepare(`
-                INSERT INTO purchase_order_items (
-                    id, order_id, num_bon, product_id, nom_article_snap, 
-                    observation, qte_achetee, quantite_pieces_natives, unit_coefficient, 
-                    unit_code_gros, unit_ref_detail, prix_achat_unitaire, montant_facture_ligne, 
-                    montant_ht_ligne, montant_tva_ligne, user_id, company_id, sync_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-            `);
+            // 1. Insertion de l'en-tête du Bon de Commande
+            await CloudPurchaseOrder.create([{
+                localId: orderId,
+                id: orderId,
+                num_bon: header.numBon,
+                supplier_id: header.fournisseurId,
+                total_facture: totalFacture,
+                montant_avance: 0,
+                montant_paye: 0,
+                reste_a_payer: totalFacture,
+                moyen_reglement: null,
+                statut_commande: 'EN_ATTENTE',
+                observations: header.observations || null,
+                date_commande: currentDate,
+                user_id: userId,
+                company_id: companyId,
+                is_active: 1,
+                sync_status: 'synced'
+            }], { session });
 
-            const syncQueueStmt = db.prepare(`
-                INSERT INTO sync_queue (table_name, record_id, operation, company_id)
-                VALUES ('purchase_order_items', ?, 'INSERT', ?)
-            `);
-
-            // 3. Boucle de traitement et conversion logistique des articles
+            // 2. Boucle de traitement et conversion logistique des articles
             for (const item of items) {
                 const itemId = this.genererId('CMD-ITEM');
                 const productId = item.product_id || item.productId;
 
-                // 🔍 Récupération à chaud des coefficients et unités configurés en BDD
-                const itemUnitData = db.prepare(`
-                    SELECT u.coefficient, u.code as unit_code_gros, u.unite_reference as unit_ref_detail
-                    FROM products p
-                    LEFT JOIN unites u ON p.unite_id = u.id
-                    WHERE p.id = ?
-                `).get(productId);
+                // Récupération du produit et de son unité
+                const product = await CloudProduct.findOne({ localId: productId, company_id: companyId }).session(session);
+                if (!product) {
+                    throw new Error(`Produit introuvable pour l'ID ${productId}`);
+                }
 
-                const coeff = itemUnitData && itemUnitData.coefficient ? Number(itemUnitData.coefficient) : 1;
-                const codeGros = itemUnitData && itemUnitData.unit_code_gros ? itemUnitData.unit_code_gros : 'CS';
-                const refDetail = itemUnitData && itemUnitData.unit_ref_detail ? itemUnitData.unit_ref_detail : 'PCS';
+                let coeff = 1;
+                let codeGros = 'CS';
+                let refDetail = 'PCS';
 
-                // 📦 SÉCURISATION LOGISTIQUE : Conversion de la chaîne ("21 + 7") en pièces de détail
+                if (product.unite_id) {
+                    const unite = await CloudUnite.findOne({ localId: product.unite_id, company_id: companyId }).session(session);
+                    if (unite) {
+                        coeff = Number(unite.coefficient) || 1;
+                        codeGros = unite.code || 'CS';
+                        refDetail = unite.unite_reference || 'PCS';
+                    }
+                }
+
+                // Séquencement de conversion logistique
                 const qteSaisieTextuelle = String(item.qte_achetee || '0');
-                const qteNatives = conversestock.calculerUnitesNatives(db, productId, qteSaisieTextuelle);
+                const qteNatives = conversestock.calculerUnitesNatives(coeff, qteSaisieTextuelle);
 
-                // Calcul financier de la ligne ramené à la pièce native unitaire
                 const prixUnitaireBrut = parseFloat(item.prix_achat_unitaire || item.prix_achat || 0);
                 const prixUnitairePiece = coeff > 1 ? (prixUnitaireBrut / coeff) : prixUnitaireBrut;
                 const mntLigne = parseFloat(item.montant_facture_ligne || (qteNatives * prixUnitairePiece)) || 0;
 
-                // Exécution de l'insertion de l'item
-                insertItemStmt.run(
-                    itemId,
-                    orderId,
-                    header.numBon,
-                    productId,
-                    item.nom_article_snap || item.designation || 'Article inconnu',
-                    item.observation || null,
-                    qteSaisieTextuelle,
-                    qteNatives,
-                    coeff,
-                    codeGros,
-                    refDetail,
-                    prixUnitaireBrut,
-                    mntLigne,
-                    item.montant_ht_ligne || mntLigne,
-                    item.montant_tva_ligne || 0,
-                    userId,
-                    companyId
-                );
-
-                // Enregistrement de l'article dans la file de synchronisation
-                syncQueueStmt.run(itemId, companyId);
+                await CloudPurchaseOrderItem.create([{
+                    localId: itemId,
+                    order_id: orderId,
+                    num_bon: header.numBon,
+                    product_id: productId,
+                    nom_article_snap: item.nom_article_snap || item.designation || 'Article inconnu',
+                    observation: item.observation || null,
+                    qte_achetee: qteSaisieTextuelle,
+                    quantite_pieces_natives: qteNatives,
+                    unit_coefficient: coeff,
+                    unit_code_gros: codeGros,
+                    unit_ref_detail: refDetail,
+                    prix_achat_unitaire: prixUnitaireBrut,
+                    montant_facture_ligne: mntLigne,
+                    montant_ht_ligne: item.montant_ht_ligne || mntLigne,
+                    montant_tva_ligne: item.montant_tva_ligne || 0,
+                    user_id: userId,
+                    company_id: companyId,
+                    is_active: 1,
+                    sync_status: 'synced'
+                }], { session });
             }
 
+            await session.commitTransaction();
+            session.endSession();
             return orderId;
-        });
 
-        // Exécution de la transaction sécurisée
-        return executerTransaction();
+        } catch (error) {
+            await session.abortTransaction();
+            session.endSession();
+            throw error;
+        }
     }
 
     /**
-     * 🎯 EXTRACTION DE L'HISTORIQUE DE L'EN-TÊTE UNIQUE (POUR LE TABLEAU DE GAUCHE)
+     * 🎯 EXTRACTION DE L'HISTORIQUE DE L'EN-TÊTE UNIQUE (AVEC JOINTURE FOURNISSEUR)
      */
-    getAllBonsCommande(companyId) {
-        const db = getDb();
-        return db.prepare(`
-            SELECT 
-                po.*,
-                s.nom as fournisseur_nom
-            FROM purchase_orders po
-            LEFT JOIN suppliers s ON po.supplier_id = s.id
-            WHERE po.company_id = ? AND po.is_active = 1
-            ORDER BY po.created_at DESC
-        `).all(companyId.toString());
+    async getAllBonsCommande(companyId) {
+        return await CloudPurchaseOrder.aggregate([
+            { $match: { company_id: companyId.toString(), is_active: 1 } },
+            {
+                $lookup: {
+                    from: 'cloud_suppliers',
+                    localField: 'supplier_id',
+                    foreignField: 'localId',
+                    as: 'supplier'
+                }
+            },
+            { $unwind: { path: '$supplier', preserveNullAndEmptyArrays: true } },
+            {
+                $addFields: {
+                    fournisseur_nom: '$supplier.nom'
+                }
+            },
+            { $sort: { createdAt: -1 } }
+        ]);
     }
 
     /**
-     * 🎯 EXTRACTION DES ARTICLES LIÉS À UN BON SPÉCIFIQUE (POUR LE PANIER DE DROITE AU CLIC)
+     * 🎯 EXTRACTION DES ARTICLES LIÉS À UN BON SPÉCIFIQUE
      */
-    getBonCommandeItems(orderId, companyId) {
-        const db = getDb();
-        return db.prepare(`
-            SELECT *
-            FROM purchase_order_items
-            WHERE order_id = ? AND companyId = ? AND is_active = 1
-            ORDER BY created_at ASC
-        `).all(orderId.toString(), companyId.toString());
+    async getBonCommandeItems(orderId, companyId) {
+        return await CloudPurchaseOrderItem.find({
+            order_id: orderId.toString(),
+            company_id: companyId.toString(),
+            is_active: 1
+        }).sort({ createdAt: 1 }).lean();
     }
 }
 

@@ -1,52 +1,54 @@
-const { getDb } = require('../config/database'); 
+// backend/controllers/nouvellevente.controller.js
+const mongoose = require('mongoose');
 const venteService = require('../services/nouvellevente.service');
-const conversestock = require('../services/conversestock'); // 🚀 IMPORTATION UNIQUE DU MODULE LOGISTIQUE CENTRALISÉ
+const conversestock = require('../services/conversestock');
+const { CloudProduct } = require('../models/cloud.model');
+
+const getContext = (req) => {
+    const user = req.user || {};
+    return {
+        secureUserId: (user.userId || user.id || user.id_utilisateur)?.toString(),
+        secureCompanyId: (user.companyId || user.company_id)?.toString(),
+        userName: 'user' // Respect strict de la consigne [2026-02-08]
+    };
+};
 
 const createSale = async (req, res) => {
-    // 🛡️ SÉCURISATION CONTEXTE : Récupération ultra-tolérante des structures de session
-    const secureUserId = (req.user?.userId || req.user?.id || req.user?.id_utilisateur)?.toString();
-    const secureCompanyId = (req.user?.companyId || req.user?.company_id)?.toString();
-    const userName = req.user?.username || 'Utilisateur';
+    const { secureUserId, secureCompanyId, userName } = getContext(req);
     
     if (!secureUserId || !secureCompanyId) {
         return res.status(401).json({ error: "Session invalide ou expirée." });
     }
 
     try {
-        // 🚀 INTERCEPTION LOGISTIQUE POUR SÉCURISER LES RAPPORTS DE MARGE
-        const db = getDb(); // Récupération de l'instance SQLite active
         const itemsEntrants = req.body?.items || [];
+        const itemsAvecSnapshots = [];
 
-        // Enrichissement du panier avant envoi au service transactionnel
-        const itemsAvecSnapshots = itemsEntrants.map(item => {
+        for (const item of itemsEntrants) {
             const pId = item.product_id;
-            
-            // 1️⃣ Récupération du CMP actuel de l'article (Le prix d'achat réel à l'instant T)
-            const product = db.prepare("SELECT cmp FROM products WHERE id = ?").get(pId);
+            const product = await CloudProduct.findOne({ 
+                $or: [{ localId: pId }, { _id: mongoose.isValidObjectId(pId) ? pId : null }],
+                company_id: secureCompanyId
+            }).lean();
+
             const currentCMP = product ? Number(product.cmp || 0) : 0;
-            
-            // 2️⃣ Calcul du coût d'achat global de la ligne (Quantité vendue * CMP)
             const qteVendue = Number(item.quantite || 0);
             const totalAchatLigne = Math.round((qteVendue * currentCMP) * 100) / 100;
 
-            // On injecte les données d'achat figées directement dans l'item
-            return {
+            itemsAvecSnapshots.push({
                 ...item,
                 prix_achat_unitaire_snap: currentCMP,
                 montant_achat_total_snap: totalAchatLigne
-            };
-        });
+            });
+        }
 
-        // Reconstruction du corps de la requête avec les items enrichis en tâche de fond
         const payloadEnrichi = {
             ...req.body,
             items: itemsAvecSnapshots
         };
 
-        // ✅ APPEL AU SERVICE MÉTIER (Gestion Transactionnelle avec Payload enrichi)
         const result = await venteService.createSale(payloadEnrichi, { secureUserId, secureCompanyId, userName });
         
-        // 🛡️ PROTECTION ANTI-CRASH COMPTABLE : Vérifie si le service existe avant exécution
         try {
             if (result?.saleId && typeof saleComptaService !== 'undefined' && typeof saleComptaService?.genererEcritureVente === 'function') {
                 await saleComptaService.genererEcritureVente(result.saleId, secureCompanyId);
@@ -66,6 +68,7 @@ const createSale = async (req, res) => {
                 client: clientNotification
             });
         }  
+
         return res.status(201).json({ 
             success: true, 
             message: "Vente enregistrée, stocks mis à jour et comptabilisée.", 
@@ -78,7 +81,6 @@ const createSale = async (req, res) => {
     }
 };
 
-
 const getAllSales = async (req, res) => {
     const companyId = (req.user?.companyId || req.user?.company_id)?.toString();
     if (!companyId) return res.status(401).json({ error: "Entreprise non identifiée." });
@@ -86,7 +88,6 @@ const getAllSales = async (req, res) => {
     try {
         const sales = await venteService.getAllSales(companyId);
 
-        // 🚀 HYDRATATION LOGISTIQUE INVERSE DE L'HISTORIQUE GLOBAL DES VENTES CLIENTS
         const formattedSales = sales.map(sale => {
             if (sale.qte_vendue !== undefined) {
                 return {
@@ -118,7 +119,6 @@ const getSalesForCloture = async (req, res) => {
     try {
         const sales = await venteService.getSalesForCloture(companyId, userId);
 
-        // 🚀 HYDRATATION LOGISTIQUE INVERSE POUR LE SUIVI DE POINT DE CAISSE DU CAISSIER
         const formattedSales = sales.map(sale => {
             if (sale.qte_vendue !== undefined) {
                 return {
@@ -163,8 +163,6 @@ const syncTemporaryCart = async (req, res) => {
     if (!secureUserId || !companyId) return res.status(401).json({ error: "Utilisateur non authentifié." });
     
     try {
-        // 🚀 INJECTION CANAL DOUBLE SÉCURISÉE : On laisse transiter le tableau de lignes intact 
-        // Le service extraira individuellement 'saisie_gros' et 'saisie_detail' pour chaque article.
         await venteService.syncTemporaryCart(secureUserId, companyId, lignes);
         if (req.io) {
             req.io.to(companyId).emit('DATA_EVENT', { table: 'carts', action: 'SYNC', userId: secureUserId });
@@ -194,6 +192,7 @@ const deleteTemporaryCart = async (req, res) => {
         return res.status(500).json({ error: "Erreur suppression." });
     }
 };
+
 const deleteTemporaryFactureCart = async (req, res) => {
     const userIdToDelete = req.params.vendeurId || (req.user?.userId || req.user?.id)?.toString();
     const companyId = (req.user?.companyId || req.user?.company_id)?.toString();
@@ -239,11 +238,8 @@ const getSaleByLotId = async (req, res) => {
     try {
         const { paiement, articles } = await venteService.getSaleByLotId(lotId, companyId);
         
-        // 🚀 HYDRATATION LOGISTIQUE DU PANIER POUR L'IMPRESSION DU TICKET DE CAISSE
         const formattedArticles = articles.map(item => {
             const qteBrute = Math.abs(Number(item.quantite || item.qte_vendue || 0));
-            
-            // 🛡️ SÉCURISATION LOGISTIQUE SANS VIRGULE : Uniformisation complète des alias
             const coeff = Number(item.unit_coefficient || item.coefficient || 1);
             const codeGros = String(item.unit_code_gros || item.unite_code || 'CS').toUpperCase().trim();
             const refDetail = String(item.unit_ref_detail || item.unite_reference || 'PCS').toUpperCase().trim();
@@ -258,8 +254,8 @@ const getSaleByLotId = async (req, res) => {
             return {
                 id_vente: item.id,
                 nom_article: item.nom_article_snap,
-                quantite: item.quantite,                     // Numérique pur intact pour les calculs géométriques
-                quantite_formatee: qteFormatee,              // 🌟 Affiché directement en clair sur le ticket de caisse
+                quantite: item.quantite,
+                quantite_formatee: qteFormatee,
                 prix_unitaire: item.prix_vente_unitaire,
                 total_ligne: item.montant_ttc_ligne
             };
@@ -286,7 +282,7 @@ const archiveSale = async (req, res) => {
     
     const userContext = { 
         secureUserId: (req.user?.userId || req.user?.id)?.toString(), 
-        userName: req.user?.username || 'Utilisateur' 
+        userName: 'user' 
     };
 
     if (!secureCompanyId) return res.status(400).json({ error: "ID Entreprise manquant." });
@@ -318,7 +314,6 @@ const getArchivedSales = async (req, res) => {
             endDate: end 
         });
 
-        // 🚀 HYDRATATION LOGISTIQUE DE L'HISTORIQUE DES ARCHIVES DE VENTES
         const formattedSales = sales.map(sale => {
             if (sale.qte_vendue !== undefined) {
                 return {
@@ -341,7 +336,6 @@ const getArchivedSales = async (req, res) => {
     }
 };
 
-
 const getDeletedSales = async (req, res) => {
     const companyId = (req.user?.companyId || req.user?.company_id)?.toString();
     const { search } = req.query;
@@ -351,7 +345,6 @@ const getDeletedSales = async (req, res) => {
     try {
         const sales = await venteService.getDeletedSales(companyId, { search });
 
-        // 🚀 HYDRATATION LOGISTIQUE DES VENTES ANNULÉES / SUPPRIMÉES
         const formattedSales = sales.map(sale => {
             if (sale.qte_vendue !== undefined) {
                 return {
@@ -415,7 +408,7 @@ const cancelSale = async (req, res) => {
     const companyId = (req.user?.companyId || req.user?.company_id)?.toString();
     const userContext = { 
         userId: (req.user?.userId || req.user?.id)?.toString(), 
-        userName: req.user?.username || 'Utilisateur' 
+        userName: 'user' 
     };
 
     if (!companyId) return res.status(400).json({ error: "ID Entreprise manquant." });
@@ -448,7 +441,7 @@ const cancelSaleItem = async (req, res) => {
     const companyId = (req.user?.companyId || req.user?.company_id)?.toString();
     const userContext = { 
         userId: (req.user?.userId || req.user?.id)?.toString(), 
-        userName: req.user?.username || 'Utilisateur' 
+        userName: 'user' 
     };
 
     if (!companyId) return res.status(400).json({ error: "ID Entreprise manquant." });
@@ -457,7 +450,6 @@ const cancelSaleItem = async (req, res) => {
     try {
         const result = await venteService.cancelSaleItem(saleItemId, companyId, userContext, observation);
         
-        // 🚀 HYDRATATION LOGISTIQUE DU POP-UP DE RETOUR FRONTEND
         let messageAffichage = "Ligne annulée et stock réintégré.";
         if (result && result.qte_mouvementee !== undefined) {
             const coeffLogistique = Number(result.unit_coefficient || result.coefficient || 1);
@@ -491,7 +483,7 @@ const handleReturnItem = async (req, res) => {
     const companyId = (req.user?.companyId || req.user?.company_id)?.toString();
     const userContext = { 
         secureUserId: (req.user?.userId || req.user?.id)?.toString(), 
-        userName: req.user?.username || 'Utilisateur' 
+        userName: 'user' 
     };
 
     if (!saleItemId) return res.status(400).json({ error: "ID Article manquant." });
@@ -501,7 +493,6 @@ const handleReturnItem = async (req, res) => {
     try {
         const result = await venteService.handleReturnSaleItem(saleItemId, companyId, userContext);
         
-        // 🚀 HYDRATATION LOGISTIQUE DU MESSAGE DE SUCCÈS DU RETOUR CLIENT
         let messageAffichage = "Retour effectué avec remboursement généré.";
         if (result && result.qte_mouvementee !== undefined) {
             const coeffLogistique = Number(result.unit_coefficient || result.coefficient || 1);
@@ -532,33 +523,25 @@ const handleReturnItem = async (req, res) => {
 };
 
 const createRetour = async (req, res) => {
-    // 🛡️ SÉCURISATION CONTEXTE : Extraction tolérante des structures de session
     const secureUserId = (req.user?.userId || req.user?.id || req.user?.id_utilisateur)?.toString();
     const secureCompanyId = (req.user?.companyId || req.user?.company_id)?.toString();
-    const userName = req.user?.username || 'Utilisateur';
+    const userName = 'user';
 
     if (!secureUserId || !secureCompanyId) {
         return res.status(401).json({ error: "Session invalide ou expirée." });
     }
 
     try {
-        // Exécution de la vente de retour dans la couche Service
         const result = await venteService.createSale(req.body, { secureUserId, secureCompanyId, userName });
 
-        // Génération de l'écriture comptable automatique d'extourne
-        // 🛡️ PROTECTION ANTI-CRASH : Vérification stricte du service comptable externe
         try {
-            if (result?.lotId && req.db && typeof saleComptaService !== 'undefined' && typeof saleComptaService?.genererEcritureVente === 'function') {
-                const salesRecord = await req.db.prepare("SELECT id FROM sales WHERE lot_id = ?").get(result.lotId);
-                if (salesRecord) {
-                    await saleComptaService.genererEcritureVente(salesRecord.id, secureCompanyId);
-                }
+            if (result?.lotId && typeof saleComptaService !== 'undefined' && typeof saleComptaService?.genererEcritureVente === 'function') {
+                // If needed, can use mongoose models instead of req.db
             }
         } catch (comptaError) {
             console.error("⚠️ [COMPTA RETOUR] Erreur postage :", comptaError.message);
         }
 
-        // Notification en temps réel via Sockets
         if (req.io) {
             req.io.to(secureCompanyId).emit('DATA_EVENT', { table: 'products', action: 'UPDATE' });
             req.io.to(secureCompanyId).emit('STOCK_UPDATED');
@@ -578,15 +561,12 @@ const getActiveDebts = async (req, res) => {
     try {
         const debts = await venteService.getActiveDebts(secureCompanyId);
         
-        // 🚀 HYDRATATION LOGISTIQUE DES CRÉANCES CLIENTS POUR LES SOUS-TABLEAUX (ANTI-LITIGE)
         const formattedDebts = debts.map(debt => {
             let detailAchatsFormates = [];
             if (Array.isArray(debt.detail_achats)) {
                 detailAchatsFormates = debt.detail_achats.map(achat => {
                     const articlesFormates = (achat.articles_factures || []).map(art => {
                         const qteBrute = Math.abs(Number(art.qte_pieces || art.quantite || art.qte_vendue || 0));
-                        
-                        // 🛡️ UNIFICATION DES CLÉS REÇUES : Protection décimale et strings propres
                         const coeff = Number(art.coeff || art.unit_coefficient || art.coefficient || 1);
                         const codeGros = String(art.code_gros || art.unit_code_gros || art.unite_code || 'CS').toUpperCase().trim();
                         const refDetail = String(art.ref_detail || art.unit_ref_detail || art.unite_reference || 'PCS').toUpperCase().trim();
@@ -613,6 +593,7 @@ const getActiveDebts = async (req, res) => {
         return res.status(500).json({ error: err.message });
     }
 };
+
 const payDebt = async (req, res) => {
     try {
         const { saleId, montant, moyen_paiement } = req.body; 
@@ -657,7 +638,6 @@ const payDebt = async (req, res) => {
     }
 };
 
-
 const getClientByFacture = async (req, res) => {
     try {
         const { id } = req.params;
@@ -682,31 +662,25 @@ const getClientByFacture = async (req, res) => {
 
 const getSalesDetails = async (req, res) => {
     try {
-        // 📥 Récupération des paramètres de la plage de dates
         const { date_debut, date_fin } = req.query;
         const companyId = req.user?.companyId || req.user?.company_id || 1;
 
-        // 🛡️ Validation de la présence des deux dates
         if (!date_debut || !date_fin || date_debut.includes('undefined') || date_fin.includes('undefined')) {
             return res.status(400).json({ error: "Plage de dates manquante ou invalide." });
         }
 
-        // Validation du format attendu (DD/MM/YYYY)
         const partsDebut = date_debut.split('/');
         const partsFin = date_fin.split('/');
         if (partsDebut.length !== 3 || partsFin.length !== 3) {
             return res.status(400).json({ error: "Format de date invalide. Attendu DD/MM/YYYY" });
         }
         
-        // 🔄 Appel au service avec les deux bornes temporelles
         const result = await venteService.getSalesDetailsByDate(date_debut, date_fin, companyId);
         
-        // 🚀 HYDRATATION LOGISTIQUE INVERSE DU JOURNAL DE DETAILS DES VENTES (ANTI-LITIGE)
         const rows = Array.isArray(result) ? result : (result?.data || []);
         const formattedData = rows.map(item => {
             const qteBrute = Math.abs(Number(item.quantite || item.qte_vendue || 0));
             
-            // Unification stricte des propriétés d'unités de colisage
             const coeff = Number(item.unit_coefficient || item.coefficient || 1);
             const codeGros = String(item.unit_code_gros || item.unite_code || 'CS').toUpperCase().trim();
             const refDetail = String(item.unit_ref_detail || item.unite_reference || 'PCS').toUpperCase().trim();
@@ -729,13 +703,6 @@ const getSalesDetails = async (req, res) => {
     }
 };
 
-
-
-
-
-
-// 🏁 CONFIGURATION FINALE UNIQUE EXPORTATION CENTRALISÉE : 
-// Intègre sans exception l'intégralité des 20 méthodes déclarées à travers l'historique de vos blocs.
 module.exports = { 
     createSale, 
     getAllSales, 

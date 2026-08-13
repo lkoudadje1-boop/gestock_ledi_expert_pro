@@ -5,8 +5,4 @@ backend/node_modules/
 dist/
 build/
 backend_dist/
-dist_electron/
-data/*.db
-data/*.db-shm
-data/*.db-wal
 logs/*.log

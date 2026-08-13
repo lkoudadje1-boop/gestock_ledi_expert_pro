@@ -139,9 +139,9 @@ const createProvisionalSale = async (data, userContext) => {
         });
 
         db.prepare(`DELETE FROM temporary_provisional_carts WHERE user_id = ? AND company_id = ?`).run(secureUserId, secureCompanyId);
-        logAction({ userId: secureUserId, userName, actionType: 'INSERTION', tableConcernee: 'provisional_sales', referenceId: finalLotId, description: `Vente provisoire : ${finalLotId} pour ${nomClientFinal}.`, companyId: secureCompanyId });
+        logAction({ userId: secureUserId, userName: 'utilisateur', actionType: 'INSERTION', tableConcernee: 'provisional_sales', referenceId: finalLotId, description: `Vente provisoire : ${finalLotId} pour ${nomClientFinal}.`, companyId: secureCompanyId });
         
-        return { finalLotId, finalStaffName: staff_name || userName, nomClientFinal };
+        return { finalLotId, finalStaffName: staff_name || 'utilisateur', nomClientFinal };
     });
 
     return executerTransaction();
@@ -320,7 +320,7 @@ const validateProvisionalSale = async (lotId, data, userContext) => {
         if (typeof logAction === 'function') {
             logAction({ 
                 userId: secureUserId, 
-                userName, 
+                userName: 'utilisateur', 
                 actionType: is_partial ? 'TRANSFERT_PARTIEL' : 'TRANSFERT', 
                 tableConcernee: 'sales', 
                 referenceId: idVenteDefinitive, 
@@ -346,14 +346,14 @@ const getProvisionalSales = async (companyId) => {
             ps.lot_id, 
             MAX(ps.nom_client_snap) as nom_client_snap, 
             MAX(ps.staff_name_snap) as staff_name_snap, 
-            MAX(ps.table_name_snap) as table_name_snap,      -- Aligné sur le nom en BDD
+            MAX(ps.table_name_snap) as table_name_snap,       -- Aligné sur le nom en BDD
             MAX(ps.table_name_snap) as table_number_snap,   -- Alias de secours pour le Front
             MAX(ps.user_id) as user_id_createur, 
             MAX(u.username) as username_createur, 
             SUM(CAST(COALESCE(ps.montant_ttc_ligne, 0) AS REAL)) as total, 
-            SUM(ps.quantite) as qte_vendue,                  -- Agrégation brute des pièces unitaires de détail pour conversion
+            SUM(ps.quantite) as qte_vendue,                   -- Agrégation brute des pièces unitaires de détail pour conversion
             MAX(IFNULL(un.coefficient, 1)) as unit_coefficient,        
-            MAX(IFNULL(un.code, 'CS')) as unit_code_gros,                 
+            MAX(IFNULL(un.code, 'CS')) as unit_code_gros,                  
             MAX(IFNULL(un.unite_reference, 'PCS')) as unit_ref_detail,      
             MAX(ps.date_vente) as date_tri
         FROM provisional_sales ps
@@ -420,7 +420,7 @@ const getProvisionalSaleDetails = async (lotId, companyId) => {
 
 const rejectProvisionalSale = async (lotId, userContext) => {
     const db = getDb();
-    const { secureUserId: currentUserId, secureCompanyId, userName } = userContext;
+    const { secureUserId: currentUserId, secureCompanyId } = userContext;
 
     if (!lotId) throw new Error("ID du lot manquant.");
 
@@ -493,7 +493,7 @@ const rejectProvisionalSale = async (lotId, userContext) => {
 
         // 4. Audit complet de réintégration
         logAction({ 
-            userId: currentUserId, userName, actionType: 'MODIFICATION', 
+            userId: currentUserId, userName: 'utilisateur', actionType: 'MODIFICATION', 
             tableConcernee: 'provisional_sales', referenceId: lotId, 
             description: `REJET TOTAL : Lot ${lotId}. Stock rendu en magasin (${totalVolumeRejeteTxt.join(', ')}) et paniers serveurs vidés.`, 
             companyId: secureCompanyId 
@@ -524,7 +524,7 @@ const saveTemporaryCart = async (userId, companyId, lignes) => {
         INSERT INTO temporary_provisional_carts (user_id, company_id, lignes, updated_at) 
         VALUES (?, ?, ?, CURRENT_TIMESTAMP) 
         ON CONFLICT(user_id, company_id) 
-        DO UPDATE SET lignes = EXCLUDED.lignes, updated_at = CURRENT_TIMESTAMP
+        UPDATE SET lignes = EXCLUDED.lignes, updated_at = CURRENT_TIMESTAMP
     `).run(userId, companyId, JSON.stringify(lignesArr));
 };
 
@@ -673,11 +673,11 @@ const createCommercialTourProvisional = async (data, userContext) => {
     // 🎯 SÉCURISATION DU NUMÉRO DE LOT
     const finalLotId = (lot_id && String(lot_id).trim() !== "") 
         ? String(lot_id).trim() 
-        : `TOUR-${crypto.randomBytes(4).toString('hex').toUpperCase()}`; 
+        : `TOUR-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
         
     const finalStaffId = staff_id || config?.default_staff_id;
     const finalClientId = config?.default_customer_id || 'DEFAULT_CUST';
-    const finalStaffName = staff_name || userName;
+    const finalStaffName = staff_name || 'utilisateur';
 
     // ✅ 1. TRANSACTION SÉCURISÉE (SYNCHRONE POUR BETTER-SQLITE3)
     const executerTransaction = db.transaction(() => {
@@ -807,7 +807,7 @@ const createCommercialTourProvisional = async (data, userContext) => {
             insertSync.run('provisional_sales', venteId, 'INSERT', secureCompanyId);
         });
 
-        logAction({ userId: secureUserId, userName, actionType: 'INSERTION', tableConcernee: 'provisional_sales', referenceId: finalLotId, description: `Chargement commercial matin avec conversion centralisée : ${finalLotId} pour ${finalStaffName}.`, companyId: secureCompanyId });
+        logAction({ userId: secureUserId, userName: 'utilisateur', actionType: 'INSERTION', tableConcernee: 'provisional_sales', referenceId: finalLotId, description: `Chargement commercial matin avec conversion centralisée : ${finalLotId} pour ${finalStaffName}.`, companyId: secureCompanyId });
         
         return { finalLotId, finalStaffName };
     });
@@ -824,7 +824,7 @@ const validateCommercialTourDefinitif = async (data, userContext) => {
         moyen_paiement = 'ESPÈCES', encaissement = {}, 
         chosen_customer_id = null, chosen_customer_name = null // Injectés pour écraser le générique
     } = data;
-    const { secureUserId, secureCompanyId, userName } = userContext;
+    const { secureUserId, secureCompanyId } = userContext;
     
     // ✅ Utilisation locale de crypto.randomBytes pour garantir l'unicité stricte sans promesse (Synchrone)
     const genererIdLocal = (prefix) => `${prefix}-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
@@ -980,7 +980,7 @@ const validateCommercialTourDefinitif = async (data, userContext) => {
                 ) VALUES (?, ?, ?, ?, ?, ?, NULL, 'VALIDEE', ?, ?, 0, 'PAYE', ?, ?, ?, ?, NULL, 'TOURNÉE', ?, 1, 0, 0, 1, 'pending')
             `).run(
                 idVenteDefinitive, lot_id, finalMethodText, finalCustomerId, finalClientName, dateNow,
-                totalGeneralVente, totalGeneralVente, originalUserId, secureUserId, staff_id, staff_name || userName, secureCompanyId
+                totalGeneralVente, totalGeneralVente, originalUserId, secureUserId, staff_id, staff_name || 'utilisateur', secureCompanyId
             );
             insertSync.run('sales', idVenteDefinitive, 'INSERT', secureCompanyId);
 
@@ -989,27 +989,27 @@ const validateCommercialTourDefinitif = async (data, userContext) => {
                 const saleItemId = genererIdLocal('SITM');
                 
                 stmtItem.run(
-                    saleItemId,                           // 1
-                    lot_id,                               // 2
-                    idVenteDefinitive,                    // 3
-                    finalCustomerId,                      // 4 -> Lié au vrai client finalisé
-                    'VENTE',                              // 5
-                    item.product_id,                      // 6
-                    item.nom_article,                     // 7 -> Nom d'article brut propre
-                    item.qteVenduePieces,                 // 8 -> Vraie quantité en pièces unitaires natives
-                    item.puVentePieces,                   // 9
-                    item.puAchatPiecesSnap,               // 10
-                    item.mtAchatTotalLigneSnap,           // 11
-                    0,                                    // 12
-                    item.mtTTCLigne,                      // 13
-                    0,                                    // 14
-                    item.mtTTCLigne,                      // 15
-                    item.stockAvantReel,                  // 16
-                    item.stockApresReel,                  // 17
-                    originalUserId,                       // 18
-                    secureCompanyId,                      // 19
-                    0,                                    // 20
-                    'pending'                             // 21
+                    saleItemId,                             // 1
+                    lot_id,                                 // 2
+                    idVenteDefinitive,                      // 3
+                    finalCustomerId,                        // 4 -> Lié au vrai client finalisé
+                    'VENTE',                                // 5
+                    item.product_id,                        // 6
+                    item.nom_article,                       // 7 -> Nom d'article brut propre
+                    item.qteVenduePieces,                   // 8 -> Vraie quantité en pièces unitaires natives
+                    item.puVentePieces,                     // 9
+                    item.puAchatPiecesSnap,                 // 10
+                    item.mtAchatTotalLigneSnap,             // 11
+                    0,                                      // 12
+                    item.mtTTCLigne,                        // 13
+                    0,                                      // 14
+                    item.mtTTCLigne,                        // 15
+                    item.stockAvantReel,                    // 16
+                    item.stockApresReel,                    // 17
+                    originalUserId,                         // 18
+                    secureCompanyId,                        // 19
+                    0,                                      // 20
+                    'pending'                               // 21
                 );
 
                 const movementId = genererIdLocal('MOV');
@@ -1019,11 +1019,11 @@ const validateCommercialTourDefinitif = async (data, userContext) => {
                     movementId,                  // 1. id
                     item.product_id,             // 2. product_id
                     idVenteDefinitive,           // 3. reference_id
-                    -item.qteVenduePieces,         // 4. quantite
+                    -item.qteVenduePieces,       // 4. quantite
                     item.stockAvantReel,         // 5. stock_avant
                     item.stockApresReel,         // 6. stock_apres
                     item.puVentePieces,          // 7. prix_operation
-                    Number(item.cmp_global || 0),  // 8. cmp_resultat
+                    Number(item.cmp_global || 0), // 8. cmp_resultat
                     secureUserId,                // 9. user_id
                     secureCompanyId              // 10. company_id
                 );
@@ -1063,7 +1063,7 @@ const validateCommercialTourDefinitif = async (data, userContext) => {
                 secureUserId,          // 16
                 secureUserId,          // 17
                 staff_id,              // 18
-                staff_name || userName, // 19
+                staff_name || 'utilisateur', // 19
                 secureCompanyId,       // 20
                 'pending'              // 21
             );
@@ -1078,7 +1078,7 @@ const validateCommercialTourDefinitif = async (data, userContext) => {
         
         logAction({ 
             userId: secureUserId, 
-            userName, 
+            userName: 'utilisateur', 
             actionType: 'VALIDATION', 
             tableConcernee: 'sales', 
             referenceId: idVenteDefinitive, 
@@ -1111,9 +1111,9 @@ const getCommercialTournees = async (companyId) => {
             MAX(ps.user_id) as user_id_createur, 
             MAX(u.username) as username_createur, 
             SUM(CAST(COALESCE(ps.montant_ttc_ligne, 0) AS REAL)) as total, 
-            SUM(ps.quantite) as qte_vendue,                  
+            SUM(ps.quantite) as qte_vendue,                      
             MAX(IFNULL(un.coefficient, 1)) as unit_coefficient,        
-            MAX(IFNULL(un.code, 'CS')) as unit_code_gros,                 
+            MAX(IFNULL(un.code, 'CS')) as unit_code_gros,                  
             MAX(IFNULL(un.unite_reference, 'PCS')) as unit_ref_detail,      
             MAX(ps.date_vente) as date_tri
         FROM provisional_sales ps
@@ -1180,15 +1180,14 @@ const updateCommercialTourProvisional = async (data, userContext) => {
     const db = getDb();
     const itemsEntrants = data.lignes || data.items || [];
     const { staff_id = null, staff_name = null, lot_id = null } = data;
-    const { secureUserId, secureCompanyId, userName } = userContext;
+    const { secureUserId, secureCompanyId } = userContext;
 
     if (!itemsEntrants || itemsEntrants.length === 0) throw new Error("Le panier de modification est vide.");
     if (!lot_id) throw new Error("ID de lot requis pour la mise à jour.");
 
     const config = db.prepare(`SELECT default_customer_id, default_staff_id FROM companies WHERE id = ?`).get(secureCompanyId);
-    const finalClientId = config?.default_customer_id || 'DEFAULT_CUST';
     const finalStaffId = staff_id || config?.default_staff_id;
-    const finalStaffName = staff_name || userName;
+    const finalStaffName = staff_name || 'utilisateur';
 
     // ✅ Génération d'ID synchrone sécurisée pour better-sqlite3
     const genererIdLocal = (prefix) => `${prefix}-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
@@ -1270,7 +1269,7 @@ const updateCommercialTourProvisional = async (data, userContext) => {
                     montant_ttc_ligne: 0,
                     nom_article_snap: item.nom || item.nom_article_snap,
                     id_vente: item.id_vente || snapshotVenteOrigine?.id_vente || lot_id,
-                    customer_id: item.customer_id || snapshotVenteOrigine?.customer_id || finalClientId,
+                    customer_id: item.customer_id || snapshotVenteOrigine?.customer_id || config?.default_customer_id || 'DEFAULT_CUST',
                     nom_client_snap: item.nom_client_snap || snapshotVenteOrigine?.nom_client_snap || 'COMMERCIAL TOURNÉE'
                 };
             }
@@ -1347,7 +1346,7 @@ const updateCommercialTourProvisional = async (data, userContext) => {
             insertSync.run('provisional_sales', venteId, 'INSERT', secureCompanyId);
         });
 
-        logAction({ userId: secureUserId, userName, actionType: 'MODIFICATION', tableConcernee: 'provisional_sales', referenceId: lot_id, description: `Mise à jour complète sans conflit FK du lot : ${lot_id}.`, companyId: secureCompanyId });
+        logAction({ userId: secureUserId, userName: 'utilisateur', actionType: 'MODIFICATION', tableConcernee: 'provisional_sales', referenceId: lot_id, description: `Mise à jour complète sans conflit FK du lot : ${lot_id}.`, companyId: secureCompanyId });
         
         return { lot_id };
     });
@@ -1358,7 +1357,7 @@ const updateCommercialTourProvisional = async (data, userContext) => {
 
 const deleteFullCommercialTourProvisional = async (lotId, userContext) => {
     const db = getDb();
-    const { secureUserId, secureCompanyId, userName } = userContext;
+    const { secureUserId, secureCompanyId } = userContext;
 
     if (!lotId) throw new Error("ID de lot requis pour la suppression complète.");
     
@@ -1412,7 +1411,7 @@ const deleteFullCommercialTourProvisional = async (lotId, userContext) => {
         // Audit log
         logAction({ 
             userId: secureUserId, 
-            userName, 
+            userName: 'utilisateur', 
             actionType: 'SUPPRESSION', 
             tableConcernee: 'provisional_sales', 
             referenceId: finalLotId, 

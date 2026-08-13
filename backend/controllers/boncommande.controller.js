@@ -1,5 +1,5 @@
+// backend/controllers/boncommande.controller.js
 const orderPayService = require('../services/boncommande.service');
-const conversestock = require('../services/conversestock'); 
 
 /**
  * Enregistre un nouveau bon de commande en attente (Sans impacter le stock physique)
@@ -26,9 +26,9 @@ const saveBonCommande = async (req, res) => {
             header: {
                 numBon: String(header.numBon).trim(),
                 fournisseurId: String(header.fournisseurId),
-                fournisseurName: String(header.fournisseur || ''),
+                fournisseurName: String(header.fournisseur || header.fournisseurName || ''),
                 totalFacture: parseFloat(header.totalFacture || header.total_ttc) || 0,
-                date: header.date,
+                date: header.date || new Date(),
                 observations: header.observations || ''
             },
             items: items
@@ -58,9 +58,6 @@ const saveBonCommande = async (req, res) => {
 /**
  * Récupère l'historique de tous les bons de commandes d'une entreprise
  */
-/**
- * Récupère l'historique de tous les bons de commandes d'une entreprise
- */
 const getAllBonsCommande = async (req, res) => {
     try {
         const companyId = req.user?.company_id || req.user?.companyId;
@@ -68,7 +65,6 @@ const getAllBonsCommande = async (req, res) => {
             return res.status(401).json({ error: "Session invalide ou expirée." });
         }
 
-        // Appel unifié au service SQLite maître (Partie A)
         const rows = await orderPayService.getAllBonsCommande(companyId);
         return res.json(rows);
         
@@ -88,12 +84,11 @@ const getBonCommandeDetails = async (req, res) => {
             return res.status(401).json({ error: "Session invalide ou expirée." });
         }
 
-        const { id } = req.params; // Récupère l'ID transmis dans l'URL (/purchase-orders/:id/items)
+        const { id } = req.params;
         if (!id) {
             return res.status(400).json({ error: "Identifiant du bon de commande manquant." });
         }
 
-        // Extraction à chaud depuis la table purchase_order_items (Partie A)
         const items = await orderPayService.getBonCommandeItems(id, companyId);
         return res.json(items);
 
@@ -103,5 +98,4 @@ const getBonCommandeDetails = async (req, res) => {
     }
 };
 
-// Exposez les modules pour votre fichier de routage Express (routes/...)
 module.exports = { saveBonCommande, getAllBonsCommande, getBonCommandeDetails };

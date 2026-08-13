@@ -1,3 +1,4 @@
+// backend/controllers/Rap_BalanceAgee.controller.js
 const BalanceAgeeService = require('../services/Rap_BalanceAgee.service');
 
 /**
@@ -9,11 +10,14 @@ exports.getBalanceAgee = async (req, res) => {
 
     try {
         // Validation minimale
+        if (!companyId) {
+            return res.status(401).json({ success: false, error: "Session invalide." });
+        }
         if (!exerciceId) {
-            return res.status(400).json({ error: "Exercice non spécifié." });
+            return res.status(400).json({ success: false, error: "Exercice non spécifié." });
         }
 
-        // Appel au service métier
+        // Appel au service métier (entièrement compatible Cloud)
         const data = await BalanceAgeeService.fetchBalanceAgee(req.query, companyId);
 
         res.json({ 
@@ -22,7 +26,7 @@ exports.getBalanceAgee = async (req, res) => {
         });
 
     } catch (err) {
-        console.error("Erreur Backend Balance Âgée:", err.message);
+        console.error("❌ Erreur Backend Balance Âgée:", err.message);
         res.status(500).json({ 
             success: false, 
             error: err.message 

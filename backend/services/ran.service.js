@@ -1,153 +1,285 @@
-const { getDb } = require('../config/database');
-const { logAction } = require('../utils/auditHelper');
+// backend/services/ran.service.js
+const mongoose = require('mongoose');
+const { 
+    CloudExercice, 
+    CloudReportANouveau, 
+    CloudLigneEcriture, 
+    CloudEcriture, 
+    CloudPlanTiers, 
+    CloudAuditLog 
+} = require('../models/cloud.model');
 
 class RanService {
     /**
      * Génère les reports à nouveau et l'exercice N+1
      */
     async genererRAN(data, user) {
-        const db = getDb();
-        const { companyId, id: userId } = user;
-        const userName = user.username || 'Système';
-        const { exerciceACloturerId, compteResultatId, numCompteResultat, journalId, typeCloture } = data;
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            const companyId = user.companyId || user.company_id;
+            const userId = user.userId || user.id;
+            const userName = user.username || 'Système';
+            const { exerciceACloturerId, compteResultatId, numCompteResultat, journalId, typeCloture } = data;
 
-        // Exécution de la transaction principale
-        const result = db.transaction(() => {
             // 1. Charger l'exercice source (N)
-            const exSource = db.prepare("SELECT * FROM exercices WHERE id = ? AND company_id = ?").get(exerciceACloturerId, companyId);
+            const exSource = await CloudExercice.findOne({ localId: exerciceACloturerId, company_id: companyId.toString() }).session(session).lean();
             if (!exSource) throw new Error("Exercice source introuvable.");
 
             // 2. Gérer l'exercice suivant (N+1)
             const anneeN1 = new Date(exSource.date_fin).getFullYear() + 1;
             const libelleN1 = `EXERCICE ${anneeN1}`;
             
-            let exSuivant = db.prepare("SELECT id FROM exercices WHERE libelle = ? AND company_id = ?").get(libelleN1, companyId);
+            let exSuivant = await CloudExercice.findOne({ libelle: libelleN1, company_id: companyId.toString() }).session(session).lean();
             let nouvelExId;
 
-            const stmtSync = db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES (?, ?, ?, ?)`);
-
             if (exSuivant) {
-                nouvelExId = exSuivant.id;
+                nouvelExId = exSuivant.localId;
             } else {
                 nouvelExId = `EXE-N1-${Date.now()}`;
-                db.prepare(`
-                    INSERT INTO exercices (id, company_id, libelle, date_debut, date_fin, statut, sync_status)
-                    VALUES (?, ?, ?, ?, ?, 'OUVERT', 'pending')
-                `).run(nouvelExId, companyId, libelleN1, `${anneeN1}-01-01`, `${anneeN1}-12-31`);
-
-                stmtSync.run('exercices', nouvelExId, 'INSERT', companyId);
+                await CloudExercice.create([{
+                    localId: nouvelExId,
+                    company_id: companyId.toString(),
+                    libelle: libelleN1,
+                    date_debut: `${anneeN1}-01-01`,
+                    date_fin: `${anneeN1}-12-31`,
+                    statut: 'OUVERT',
+                    sync_status: 'synced',
+                    updated_at: new Date()
+                }], { session });
             }
 
-            // 3. NETTOYAGE préalable (avec traçabilité DELETE pour le Cloud)
+            // 3. NETTOYAGE préalable
             const pieceRan = `RAN-${anneeN1}`;
             
-            // Récupération des IDs à supprimer pour la sync_queue
-            const oldRans = db.prepare("SELECT id FROM reports_a_nouveau WHERE exercice_id = ? AND company_id = ?").all(nouvelExId, companyId);
-            oldRans.forEach(r => stmtSync.run('reports_a_nouveau', r.id, 'DELETE', companyId));
-
-            const oldLignes = db.prepare("SELECT id FROM lignes_ecritures WHERE exercice_id = ? AND journal_id = ? AND piece = ?").all(nouvelExId, journalId, pieceRan);
-            oldLignes.forEach(l => stmtSync.run('lignes_ecritures', l.id, 'DELETE', companyId));
-
-            const oldEcritures = db.prepare("SELECT id FROM ecritures WHERE exercice_id = ? AND journal_id = ? AND piece = ?").all(nouvelExId, journalId, pieceRan);
-            oldEcritures.forEach(e => stmtSync.run('ecritures', e.id, 'DELETE', companyId));
-
-            db.prepare("DELETE FROM reports_a_nouveau WHERE exercice_id = ? AND company_id = ?").run(nouvelExId, companyId);
-            db.prepare("DELETE FROM ecritures WHERE exercice_id = ? AND journal_id = ? AND piece = ?").run(nouvelExId, journalId, pieceRan);
-            db.prepare("DELETE FROM lignes_ecritures WHERE exercice_id = ? AND journal_id = ? AND piece = ?").run(nouvelExId, journalId, pieceRan);
+            await CloudReportANouveau.deleteMany({ exercice_id: nouvelExId, company_id: companyId.toString() }).session(session);
+            await CloudEcriture.deleteMany({ exercice_id: nouvelExId, journal_id: journalId, piece: pieceRan, company_id: companyId.toString() }).session(session);
+            await CloudLigneEcriture.deleteMany({ exercice_id: nouvelExId, journal_id: journalId, piece: pieceRan, company_id: companyId.toString() }).session(session);
 
             // 4. CALCUL DES SOLDES (Comptes de bilan uniquement [1-5])
-            const soldes = db.prepare(`
-                SELECT compte_id, num_compte, num_tiers, SUM(debit - credit) as solde_net
-                FROM lignes_ecritures 
-                WHERE exercice_id = ? AND company_id = ? AND is_deleted = 0 AND num_compte GLOB '[1-5]*' 
-                GROUP BY compte_id, num_tiers 
-                HAVING ABS(SUM(debit - credit)) > 0.001
-            `).all(exerciceACloturerId, companyId);
+            // On utilise une agrégation Mongoose pour grouper par compte_id et num_tiers
+            const soldes = await CloudLigneEcriture.aggregate([
+                { 
+                    $match: { 
+                        exercice_id: exerciceACloturerId.toString(), 
+                        company_id: companyId.toString(), 
+                        is_deleted: { $ne: 1 }, 
+                        num_compte: { $regex: /^[1-5]/ } 
+                    } 
+                },
+                {
+                    $group: {
+                        _id: { compte_id: '$compte_id', num_tiers: '$num_tiers' },
+                        num_compte: { $first: '$num_compte' },
+                        solde_net: { $sum: { $subtract: ['$debit', '$credit'] } }
+                    }
+                },
+                {
+                    $match: {
+                        $expr: { $gt: [{ $abs: '$solde_net' }, 0.001] }
+                    }
+                }
+            ]).session(session);
 
             // 5. CRÉATION DE L'ÉCRITURE DE REPORT
             const ecritureId = `ECR-RAN-${Date.now()}`;
-            db.prepare(`
-                INSERT INTO ecritures (id, company_id, journal_id, exercice_id, date_ecriture, piece, libelle, user_saisie, sync_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-            `).run(ecritureId, companyId, journalId, nouvelExId, `${anneeN1}-01-01`, pieceRan, `REPORT A NOUVEAU ${typeCloture}`, userName);
+            await CloudEcriture.create([{
+                localId: ecritureId,
+                company_id: companyId.toString(),
+                journal_id: journalId,
+                exercice_id: nouvelExId,
+                date_ecriture: new Date(`${anneeN1}-01-01`),
+                piece: pieceRan,
+                libelle: `REPORT A NOUVEAU ${typeCloture}`,
+                user_saisie: userName,
+                sync_status: 'synced',
+                updated_at: new Date()
+            }], { session });
 
-            stmtSync.run('ecritures', ecritureId, 'INSERT', companyId);
-
-            // 6. INSERTION DES LIGNES DÉTAILLÉES
-            const stmtLigne = db.prepare(`
-                INSERT INTO lignes_ecritures (id, company_id, ecriture_id, journal_id, exercice_id, date_ecriture, piece, compte_id, num_compte, num_tiers, libelle, debit, credit, sync_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-            `);
-
-            const stmtTableRan = db.prepare(`
-                INSERT INTO reports_a_nouveau (id, company_id, exercice_id, compte_id, num_compte, num_tiers, montant_debit, montant_credit, type_report, user_name, sync_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-            `);
-
+            // 6. INSERTION DES LIGNES DÉTAILLÉES ET TABLES RAN
             let tDeb = 0, tCre = 0;
+            const lignesToInsert = [];
+            const ransToInsert = [];
+
             soldes.forEach((s, i) => {
                 const lid = `LIG-RAN-${Date.now()}-${i}`;
                 const d = s.solde_net > 0 ? s.solde_net : 0;
                 const c = s.solde_net < 0 ? Math.abs(s.solde_net) : 0;
                 tDeb += d; tCre += c;
                 
-                stmtLigne.run(lid, companyId, ecritureId, journalId, nouvelExId, `${anneeN1}-01-01`, pieceRan, s.compte_id, s.num_compte, s.num_tiers, "SOLDE INITIAL", d, c);
-                stmtTableRan.run(lid, companyId, nouvelExId, s.compte_id, s.num_compte, s.num_tiers, d, c, typeCloture, userName);
+                const compteIdVal = s._id.compte_id;
+                const numTiersVal = s._id.num_tiers;
 
-                stmtSync.run('lignes_ecritures', lid, 'INSERT', companyId);
-                stmtSync.run('reports_a_nouveau', lid, 'INSERT', companyId);
+                lignesToInsert.push({
+                    localId: lid,
+                    company_id: companyId.toString(),
+                    ecriture_id: ecritureId,
+                    journal_id: journalId,
+                    exercice_id: nouvelExId,
+                    date_ecriture: new Date(`${anneeN1}-01-01`),
+                    piece: pieceRan,
+                    compte_id: compteIdVal,
+                    num_compte: s.num_compte,
+                    num_tiers: numTiersVal,
+                    libelle: "SOLDE INITIAL",
+                    debit: d,
+                    credit: c,
+                    sync_status: 'synced',
+                    updated_at: new Date()
+                });
+
+                ransToInsert.push({
+                    localId: lid,
+                    company_id: companyId.toString(),
+                    exercice_id: nouvelExId,
+                    compte_id: compteIdVal,
+                    num_compte: s.num_compte,
+                    num_tiers: numTiersVal,
+                    montant_debit: d,
+                    montant_credit: c,
+                    type_report: typeCloture,
+                    user_name: userName,
+                    sync_status: 'synced',
+                    updated_at: new Date()
+                });
             });
 
-            // 7. ÉQUILIBRE PAR LE RÉSULTAT (Report à nouveau du bénéfice ou de la perte)
+            // 7. ÉQUILIBRE PAR LE RÉSULTAT
             const diff = tDeb - tCre;
             if (Math.abs(diff) > 0.01) {
                 const rid = `LIG-RES-${Date.now()}`;
                 const rd = diff < 0 ? Math.abs(diff) : 0;
                 const rc = diff > 0 ? diff : 0;
-                stmtLigne.run(rid, companyId, ecritureId, journalId, nouvelExId, `${anneeN1}-01-01`, pieceRan, compteResultatId, numCompteResultat, null, "RÉSULTAT NET REPORTÉ", rd, rc);
-                stmtTableRan.run(rid, companyId, nouvelExId, compteResultatId, numCompteResultat, null, rd, rc, typeCloture, userName);
 
-                stmtSync.run('lignes_ecritures', rid, 'INSERT', companyId);
-                stmtSync.run('reports_a_nouveau', rid, 'INSERT', companyId);
+                lignesToInsert.push({
+                    localId: rid,
+                    company_id: companyId.toString(),
+                    ecriture_id: ecritureId,
+                    journal_id: journalId,
+                    exercice_id: nouvelExId,
+                    date_ecriture: new Date(`${anneeN1}-01-01`),
+                    piece: pieceRan,
+                    compte_id: compteResultatId,
+                    num_compte: numCompteResultat,
+                    num_tiers: null,
+                    libelle: "RÉSULTAT NET REPORTÉ",
+                    debit: rd,
+                    credit: rc,
+                    sync_status: 'synced',
+                    updated_at: new Date()
+                });
+
+                ransToInsert.push({
+                    localId: rid,
+                    company_id: companyId.toString(),
+                    exercice_id: nouvelExId,
+                    compte_id: compteResultatId,
+                    num_compte: numCompteResultat,
+                    num_tiers: null,
+                    montant_debit: rd,
+                    montant_credit: rc,
+                    type_report: typeCloture,
+                    user_name: userName,
+                    sync_status: 'synced',
+                    updated_at: new Date()
+                });
+            }
+
+            if (lignesToInsert.length > 0) {
+                await CloudLigneEcriture.insertMany(lignesToInsert, { session });
+            }
+            if (ransToInsert.length > 0) {
+                await CloudReportANouveau.insertMany(ransToInsert, { session });
             }
 
             // 8. MISE À JOUR DU STATUT DE L'EXERCICE CLÔTURÉ
             const nouveauStatut = (typeCloture === 'DEFINITIF') ? 'CLOTURE' : 'PRE_CLOTURE';
-            db.prepare("UPDATE exercices SET statut = ?, sync_status = 'pending' WHERE id = ?").run(nouveauStatut, exerciceACloturerId);
-            stmtSync.run('exercices', exerciceACloturerId, 'UPDATE', companyId);
+            await CloudExercice.updateOne(
+                { localId: exerciceACloturerId, company_id: companyId.toString() },
+                { $set: { statut: nouveauStatut, sync_status: 'synced', updated_at: new Date() } },
+                { session }
+            );
 
-            return { success: true, exSourceLibelle: exSource.libelle, nouveauStatut };
-        })();
+            // 9. JOURNAL D'AUDIT
+            const logId = `LOG-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+            await CloudAuditLog.create([{
+                localId: logId,
+                user_id: userId,
+                user_name: userName,
+                action_type: 'GENERATE_RAN',
+                table_concernee: 'exercices',
+                reference_id: exerciceACloturerId,
+                description: `Génération des reports à nouveau (${typeCloture}) pour l'${exSource.libelle}. Passage au statut: ${nouveauStatut}`,
+                date_action: new Date(),
+                company_id: companyId.toString(),
+                sync_status: 'synced'
+            }], { session });
 
-        // 💡 Journal d'audit déclenché après succès du traitement des RAN
-        logAction({
-            userId,
-            userName,
-            actionType: 'GENERATE_RAN',
-            tableConcernee: 'exercices',
-            referenceId: exerciceACloturerId,
-            description: `Génération des reports à nouveau (${typeCloture}) pour l'${result.exSourceLibelle}. Passage au statut: ${result.nouveauStatut}`,
-            companyId
-        });
+            await session.commitTransaction();
+            session.endSession();
 
-        return { success: true };
+            return { success: true };
+        } catch (error) {
+            await session.abortTransaction();
+            session.endSession();
+            throw error;
+        }
     }
 
-    getBilanTiersData(exerciceId, companyId) {
-        const db = getDb();
-        const rows = db.prepare(`
-            SELECT 
-                l.num_compte as numero_compte,
-                l.num_tiers,
-                (SELECT nom FROM plan_tiers WHERE numero_tiers = l.num_tiers AND company_id = ?) as intitule_tiers,
-                SUM(l.debit) as total_debit,
-                SUM(l.credit) as total_credit
-            FROM lignes_ecritures l
-            WHERE l.exercice_id = ? AND l.company_id = ? AND l.is_deleted = 0 AND l.num_compte GLOB '[1-5]*'
-            GROUP BY l.num_compte, l.num_tiers
-            HAVING (SUM(l.debit) - SUM(l.credit)) != 0
-            ORDER BY l.num_compte ASC, l.num_tiers ASC
-        `).all(companyId, exerciceId, companyId);
+    async getBilanTiersData(exerciceId, companyId) {
+        // Agrégation Mongoose pour simuler la requête de bilan par tiers
+        const rows = await CloudLigneEcriture.aggregate([
+            {
+                $match: {
+                    exercice_id: exerciceId.toString(),
+                    company_id: companyId.toString(),
+                    is_deleted: { $ne: 1 },
+                    num_compte: { $regex: /^[1-5]/ }
+                }
+            },
+            {
+                $group: {
+                    _id: { numero_compte: '$num_compte', num_tiers: '$num_tiers' },
+                    total_debit: { $sum: '$debit' },
+                    total_credit: { $sum: '$credit' }
+                }
+            },
+            {
+                $match: {
+                    $expr: { $ne: [{ $subtract: ['$total_debit', '$total_credit'] }, 0] }
+                }
+            },
+            {
+                $lookup: {
+                    from: 'cloud_plan_tiers',
+                    let: { tierNum: '$_id.num_tiers', cid: companyId.toString() },
+                    pipeline: [
+                        {
+                            $match: {
+                                $expr: {
+                                    $and: [
+                                        { $eq: ['$numero_tiers', '$$tierNum'] },
+                                        { $eq: ['$company_id', '$$cid'] }
+                                    ]
+                                }
+                            }
+                        }
+                    ],
+                    as: 'tier'
+                }
+            },
+            { $unwind: { path: '$tier', preserveNullAndEmptyArrays: true } },
+            {
+                $project: {
+                    numero_compte: '$_id.numero_compte',
+                    num_tiers: { $ifNull: ['$_id.num_tiers', ''] },
+                    intitule_tiers: { $ifNull: ['$tier.nom', 'REPORT A NOUVEAU'] },
+                    total_debit: 1,
+                    total_credit: 1
+                }
+            },
+            { $sort: { numero_compte: 1, num_tiers: 1 } }
+        ]);
 
         return rows.map(row => {
             const solde = row.total_debit - row.total_credit;

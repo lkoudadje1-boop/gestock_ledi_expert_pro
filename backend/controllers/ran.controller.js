@@ -1,5 +1,6 @@
+// backend/controllers/ran.controller.js
 const RanService = require('../services/ran.service');
-const { getDb } = require('../config/database');
+const { CloudReportANouveau } = require('../models/cloud.model');
 
 // Utilitaire de contexte harmonisé
 const getContext = (req) => {
@@ -43,7 +44,7 @@ exports.genererRAN = async (req, res) => {
                 message: "Les Reports à Nouveau ont été générés." 
             });
             
-            // Optionnel : Rafraîchir aussi la liste des exercices car leur état peut changer
+            // Rafraîchir aussi la liste des exercices car leur état peut changer
             req.io.to(room).emit('REFRESH_EXERCICES');
         }
 
@@ -55,22 +56,41 @@ exports.genererRAN = async (req, res) => {
 };
 
 // --- OBTENIR LES RAPPORTS GÉNÉRÉS ---
-exports.getReportsByExercice = (req, res) => {
-    const db = getDb();
+exports.getReportsByExercice = async (req, res) => {
     const { companyId } = getContext(req);
     const { exerciceId } = req.params;
 
     try {
-        const data = db.prepare(`
-            SELECT r.*, p.intitule as intitule_compte
-            FROM reports_a_nouveau r
-            JOIN plan_comptable p ON r.compte_id = p.id
-            WHERE r.exercice_id = ? AND r.company_id = ?
-            ORDER BY r.num_compte ASC, r.num_tiers ASC
-        `).all(exerciceId, companyId);
+        if (!companyId) return res.status(401).json({ success: false, error: "Session invalide." });
+
+        const data = await CloudReportANouveau.aggregate([
+            { 
+                $match: { 
+                    exercice_id: exerciceId.toString(), 
+                    company_id: companyId.toString() 
+                } 
+            },
+            {
+                $lookup: {
+                    from: 'cloud_plan_comptable',
+                    localField: 'compte_id',
+                    foreignField: 'localId',
+                    as: 'comptable'
+                }
+            },
+            { $unwind: { path: '$comptable', preserveNullAndEmptyArrays: true } },
+            {
+                $addFields: {
+                    intitule_compte: '$comptable.intitule'
+                }
+            },
+            { $sort: { num_compte: 1, num_tiers: 1 } }
+        ]);
+
         res.json({ success: true, data });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error("❌ Erreur getReportsByExercice:", err.message);
+        res.status(500).json({ success: false, error: err.message });
     }
 };
 
@@ -79,9 +99,12 @@ exports.getBilanDetailleTiers = async (req, res) => {
     const { companyId } = getContext(req);
     const { exerciceId } = req.query;
     try {
-        const data = RanService.getBilanTiersData(exerciceId, companyId);
+        if (!companyId) return res.status(401).json({ success: false, error: "Session invalide." });
+
+        const data = await RanService.getBilanTiersData(exerciceId, companyId);
         res.json({ success: true, data });
     } catch (err) {
+        console.error("❌ Erreur getBilanDetailleTiers:", err.message);
         res.status(500).json({ success: false, error: err.message });
     }
 };

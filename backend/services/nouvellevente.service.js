@@ -1,11 +1,18 @@
-const { getDb } = require('../config/database');
+// backend/services/nouvellevente.service.js
+const mongoose = require('mongoose');
+const { 
+    CloudSale, CloudSaleItem, CloudProduct, 
+    CloudUnite, CloudPayment, CloudStockMovement, 
+    CloudCompany, CloudAuditLog 
+} = require('../models/cloud.model');
 const { logAction } = require('../utils/auditHelper');
-const conversestock = require('./conversestock'); // 🚀 IMPORTATION DU VERROU CENTRAL ANTI-LITIGE
+const conversestock = require('./conversestock');
+
 function genererIdVente() {
     return `VTE-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 100)}`;
 }
+
 const createSale = async (data, userContext) => {
-    const db = getDb();
     const { 
         lignes = [], 
         encaissement = {}, 
@@ -14,17 +21,20 @@ const createSale = async (data, userContext) => {
         caissier_id = null 
     } = data;
     const { secureUserId, secureCompanyId, userName } = userContext;
+    const companyStr = secureCompanyId.toString();
+
     if (lignes.length === 0) throw new Error("Le panier est vide.");
+
     const totalVente = lignes.reduce((sum, item) => sum + parseFloat(item.montant_ttc_ligne || 0), 0);
-    let modeReglement = encaissement.moyen_paiement; // Pour la table payments et sales
+    let modeReglement = encaissement.moyen_paiement; 
     let montantRecu = parseFloat(encaissement.total || 0);
+
     if (modeReglement === 'CREDIT') {
         montantRecu = 0;
-    } else if (modeReglement === 'ACOMPTE' && montantRecu >= totalVente) {
-        // Optionnel : ajustement si l'acompte couvre tout
     } else if (modeReglement === 'ACOMPTE' && montantRecu <= 0) {
         modeReglement = 'CREDIT';
     }
+
     const resteAPayer = Math.max(0, totalVente - montantRecu);
     let paymentStatus = 'SOLDE'; 
     if (montantRecu <= 0) {
@@ -32,111 +42,153 @@ const createSale = async (data, userContext) => {
     } else if (resteAPayer > 0.1) {
         paymentStatus = 'PARTIEL';
     }
+
     const saleId = genererIdVente(); 
-    const dateVente = new Date().toISOString();
+    const dateVente = new Date();
     const lotId = (lignes[0] && lignes[0].id_lot) ? lignes[0].id_lot : `LOT-V-${Date.now().toString().slice(-6)}`;
-    const transaction = db.transaction(() => {
-        const config = db.prepare('SELECT default_customer_id, default_staff_id FROM companies WHERE id = ?').get(secureCompanyId);
-        const finalClientId = encaissement.customer_id || config?.default_customer_id;
+
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const company = await CloudCompany.findOne({ 
+            $or: [{ localId: companyStr }, { _id: mongoose.isValidObjectId(companyStr) ? companyStr : null }] 
+        }).session(session).lean();
+
+        const finalClientId = encaissement.customer_id || company?.default_customer_id;
         const nomClientFinal = encaissement.nom_client || 'CLIENT AU COMPTANT';
-        db.prepare(`
-            INSERT INTO sales (
-                id, lot_id, customer_id, nom_client_snap, montant_total, 
-                montant_paye, reste_a_payer, payment_status, mode_reglement,
-                user_id, caissier_id, staff_id, staff_name_snap, company_id, 
-                statut_vente, date_vente, is_comptabilise, sync_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'VALIDEE', ?, 0, 'pending')
-        `).run(
-            saleId, lotId, finalClientId, nomClientFinal, totalVente,
-            montantRecu, resteAPayer, paymentStatus, modeReglement, 
-            secureUserId, (caissier_id || secureUserId), 
-            (staff_id || config?.default_staff_id), (staff_name || userName), 
-            secureCompanyId, dateVente
-        );
-        db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('sales', ?, 'INSERT', ?)").run(saleId, secureCompanyId);
-        
-        // 🚀 ALIGNEMENT STRUCTURAL : Ajout des deux colonnes snapshots d'achat pour optimiser les rapports
-        const stmtItem = db.prepare(`
-            INSERT INTO sale_items (id, lot_id, id_vente, customer_id, product_id, nom_article_snap, 
-                quantite, prix_vente_unitaire, prix_achat_unitaire_snap, montant_achat_total_snap,
-                remise_montant, montant_ht, taxe_montant, montant_ttc_ligne, 
-                stock_avant_vente, stock_apres_vente, user_id, company_id, sync_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-        `);
-        for (const item of lignes) {
-            // ✅ AJOUT RECUPERATION DU CMP : On extrait p.cmp qui servira à l'évaluation de la marge historique
-            const product = db.prepare(`
-                SELECT p.stock_actuel, p.cmp, p.nom, u.coefficient, u.code, u.unite_reference 
-                FROM products p 
-                LEFT JOIN unites u ON p.unite_id = u.id
-                WHERE p.id = ? AND p.company_id = ?
-            `).get(item.product_id, secureCompanyId);
+
+        await CloudSale.create([{
+            localId: saleId,
+            lot_id: lotId,
+            customer_id: finalClientId,
+            nom_client_snap: nomClientFinal,
+            montant_total: totalVente,
+            montant_paye: montantRecu,
+            reste_a_payer: resteAPayer,
+            payment_status: paymentStatus,
+            mode_reglement: modeReglement,
+            user_id: secureUserId,
+            caissier_id: caissier_id || secureUserId,
+            staff_id: staff_id || company?.default_staff_id,
+            staff_name_snap: staff_name || userName,
+            company_id: companyStr,
+            statut_vente: 'VALIDEE',
+            date_vente: dateVente,
+            is_comptabilise: 0,
+            sync_status: 'synced'
+        }], { session });
+
+        for (let index = 0; index < lignes.length; index++) {
+            const item = lignes[index];
+            const pId = item.product_id;
+
+            const product = await CloudProduct.findOne({ 
+                $or: [{ localId: pId }, { _id: mongoose.isValidObjectId(pId) ? pId : null }], 
+                company_id: companyStr 
+            }).session(session).lean();
+
             if (!product) throw new Error(`Produit introuvable : ${item.nom_article_snap}`);
-            const qtePiecesVente = conversestock.calculerUnitesNatives(db, item.product_id, item.quantite);
+
+            let unitCoefficient = 1;
+            let unitCodeGros = 'CS';
+            let unitRefDetail = 'PCS';
+
+            if (product.unite_id) {
+                const unite = await CloudUnite.findOne({ 
+                    $or: [{ localId: product.unite_id }, { _id: mongoose.isValidObjectId(product.unite_id) ? product.unite_id : null }] 
+                }).session(session).lean();
+                if (unite) {
+                    unitCoefficient = unite.coefficient || 1;
+                    unitCodeGros = unite.code || 'CS';
+                    unitRefDetail = unite.unite_reference || 'PCS';
+                }
+            }
+
+            const qtePiecesVente = conversestock.calculerUnitesNativesSimples(item.quantite, unitCoefficient);
             if (qtePiecesVente <= 0) {
                 throw new Error(`La quantité de vente saisie pour l'article "${product.nom}" est invalide ou nulle.`);
             }
+
             const stockAvant = Number(product.stock_actuel || 0);
             const stockApres = stockAvant - qtePiecesVente;
+
             if (stockApres < 0) {
-                const stockDispoFormate = conversestock.formaterStockPourAffichage(
-                    stockAvant, product.coefficient, product.code, product.unite_reference
-                );
-                const qteDemandeeFormatee = conversestock.formaterStockPourAffichage(
-                    qtePiecesVente, product.coefficient, product.code, product.unite_reference
-                );
+                const stockDispoFormate = conversestock.formaterStockPourAffichage(stockAvant, unitCoefficient, unitCodeGros, unitRefDetail);
+                const qteDemandeeFormatee = conversestock.formaterStockPourAffichage(qtePiecesVente, unitCoefficient, unitCodeGros, unitRefDetail);
                 throw new Error(`Stock insuffisant pour l'article "${product.nom}". Disponible: ${stockDispoFormate}, Demandé: ${qteDemandeeFormatee}.`);
             }
+
             const mtTTCLigne = parseFloat(item.montant_ttc_ligne || 0);
             const puVentePieces = mtTTCLigne / qtePiecesVente;
             
-            // 🧮 LOGIQUE FINANCIÈRE SÉCURISÉE DU SNAPSHOT DE MARGE :
-            // 1. On ramène le CMP (au casier) de la fiche article au coût de revient d'une seule bouteille unitaire
-            const coeffLogistique = Number(product.coefficient || 1);
-            const puAchatPiecesSnap = Number(product.cmp || 0) / coeffLogistique;
-            
-            // 2. Coût d'achat global de la ligne (Quantité de bouteilles vendues * Prix d'achat d'une bouteille)
+            const puAchatPiecesSnap = Number(product.cmp || 0) / unitCoefficient;
             const mtAchatTotalLigneSnap = Math.round((qtePiecesVente * puAchatPiecesSnap) * 100) / 100;
 
-            const itemId = `LIT-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 100)}`;
-            
-            // Exécution de l'insertion avec alimentation immédiate des deux snapshots
-            stmtItem.run(
-                itemId, lotId, saleId, finalClientId, item.product_id, item.nom_article_snap || product.nom, 
-                qtePiecesVente, puVentePieces, 
-                puAchatPiecesSnap,      // prix_achat_unitaire_snap (Coût bouteille)
-                mtAchatTotalLigneSnap,   // montant_achat_total_snap ⚡ Évite les calculs lourds SUM(qte * prix)
-                item.remise_montant || 0, 
-                (item.montant_ht || (qtePiecesVente * puVentePieces)),
-                item.taxe_montant || 0, mtTTCLigne, stockAvant, stockApres, secureUserId, secureCompanyId
-            );
-            db.prepare("UPDATE products SET stock_actuel = ?, sync_status = 'pending' WHERE id = ? AND company_id = ?")
-              .run(stockApres, item.product_id, secureCompanyId);
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('sale_items', ?, 'INSERT', ?)").run(itemId, secureCompanyId);
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('products', ?, 'UPDATE', ?)").run(item.product_id, secureCompanyId);
+            const itemId = `LIT-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 100)}${index}`;
+
+            await CloudSaleItem.create([{
+                localId: itemId,
+                lot_id: lotId,
+                id_vente: saleId,
+                customer_id: finalClientId,
+                product_id: pId,
+                nom_article_snap: item.nom_article_snap || product.nom,
+                quantite: qtePiecesVente,
+                prix_vente_unitaire: puVentePieces,
+                prix_achat_unitaire_snap: puAchatPiecesSnap,
+                montant_achat_total_snap: mtAchatTotalLigneSnap,
+                remise_montant: item.remise_montant || 0,
+                montant_ht: item.montant_ht || (qtePiecesVente * puVentePieces),
+                taxe_montant: item.taxe_montant || 0,
+                montant_ttc_ligne: mtTTCLigne,
+                stock_avant_vente: stockAvant,
+                stock_apres_vente: stockApres,
+                user_id: secureUserId,
+                company_id: companyStr,
+                sync_status: 'synced'
+            }], { session });
+
+            await CloudProduct.updateOne(
+                { _id: product._id },
+                { $set: { stock_actuel: stockApres, updated_at: new Date() } }
+            ).session(session);
         }
+
         if (montantRecu > 0) {
             const paymentId = `PAY-${Date.now().toString().slice(-7)}`;
-            db.prepare(`
-                INSERT INTO payments (
-                    id, lot_id, sale_id, customer_id, client_name, montant, 
-                    recu, rendu, moyen_paiement, company_id, 
-                    user_id, caissier_id, statut, type_paiement, sync_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'VALIDEE', ?, 'pending')
-            `).run(
-                paymentId, lotId, saleId, finalClientId, nomClientFinal, 
-                montantRecu, montantRecu, 0, modeReglement, secureCompanyId, 
-                secureUserId, secureUserId, 
-                paymentStatus === 'PARTIEL' ? 'ACOMPTE' : 'COMPTANT'
-            );
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('payments', ?, 'INSERT', ?)").run(paymentId, secureCompanyId);
+            await CloudPayment.create([{
+                localId: paymentId,
+                lot_id: lotId,
+                sale_id: saleId,
+                customer_id: finalClientId,
+                client_name: nomClientFinal,
+                montant: montantRecu,
+                recu: montantRecu,
+                rendu: 0,
+                moyen_paiement: modeReglement,
+                company_id: companyStr,
+                user_id: secureUserId,
+                caissier_id: secureUserId,
+                statut: 'VALIDEE',
+                type_paiement: paymentStatus === 'PARTIEL' ? 'ACOMPTE' : 'COMPTANT',
+                sync_status: 'synced'
+            }], { session });
         }
-        
-        db.prepare("INSERT INTO compta_queue (table_source, record_id, company_id, status) VALUES ('sales', ?, ?, 'pending')")
-          .run(saleId, secureCompanyId);
-          
-        db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('compta_queue', ?, 'INSERT', ?)").run(saleId, secureCompanyId);
-        
+
+        await logAction({
+            userId: secureUserId, 
+            userName: userName || 'user', 
+            actionType: 'CREATE',
+            tableConcernee: 'sales',
+            referenceId: saleId, 
+            description: `Vente POS validée. N° ${saleId} pour ${nomClientFinal}. Total : ${Number(totalVente).toFixed(2)} F.`,
+            companyId: companyStr
+        });
+
+        await session.commitTransaction();
+        session.endSession();
+
         return { 
             saleId, 
             lotId, 
@@ -145,796 +197,847 @@ const createSale = async (data, userContext) => {
             reste: resteAPayer, 
             clientNameSnapshot: nomClientFinal
         };
-    });
-
-    const result = transaction();
-    db.prepare('DELETE FROM temporary_carts WHERE user_id = ? AND company_id = ?').run(secureUserId, secureCompanyId);
-    
-    logAction({ 
-        userId: secureUserId, 
-        userName: userName || 'Système', 
-        actionType: 'CREATE',
-        tableConcernee: 'sales',
-        referenceId: saleId, 
-        description: `Vente POS validée. N° ${saleId} pour ${result.clientNameSnapshot}. Total : ${Number(result.totalVente).toFixed(2)} F (Règlement: ${modeReglement || 'NON SPÉCIFIÉ'}, Reçu: ${Number(result.totalRecu).toFixed(2)} F).`,
-        companyId: secureCompanyId
-    });
-    
-    return result;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
-
 const getAllSales = async (companyId) => {
-    const db = getDb();
-    
-    // 1. Extraction brute des données incluant explicitement le filtre de clôture (0 et 1)
-    const rows = db.prepare(`
-        SELECT 
-            i.id, s.id as id_vente, s.lot_id, i.product_id, i.type_ligne, s.nom_client_snap, s.date_vente, 
-            i.nom_article_snap, 
-            i.quantite as qte_vendue, 
-            u_mesure.coefficient as unit_coefficient,
-            u_mesure.code as unit_code_gros, 
-            u_mesure.unite_reference as unit_ref_detail, 
-            i.prix_vente_unitaire as prix_unitaire_snap,
-            i.remise_montant as remise_ligne, i.montant_ht as montant_ht_ligne, i.taxe_montant as taxe_ligne, 
-            i.montant_ttc_ligne as prix_total_ligne, s.mode_reglement as moyen_paiement, s.statut_vente,
-            u.username as nom_utilisateur, s.staff_name_snap as nom_staff, uc.username as nom_caissier,
-            i.is_active,
-            i.is_cloture -- 💡 Retourné pour que le frontend sache si la ligne est clôturée
-        FROM sale_items i
-        JOIN sales s ON i.id_vente = s.id
-        LEFT JOIN products p ON i.product_id = p.id
-        LEFT JOIN unites u_mesure ON p.unite_id = u_mesure.id 
-        LEFT JOIN users u ON s.user_id = u.id
-        LEFT JOIN users uc ON s.caissier_id = uc.id
-        WHERE s.company_id = ? 
-          AND s.statut_vente != 'ARCHIVEE'
-          AND s.is_archived = 0 
-          AND s.is_active = 1 
-          AND s.statut_vente != 'ANNULEE'
-          AND (i.is_cloture = 0 OR i.is_cloture = 1) -- 💡 Prend en compte les deux états
-        ORDER BY s.date_vente DESC
-    `).all(companyId.toString());
+    const companyStr = companyId.toString();
+    const items = await CloudSaleItem.find({ company_id: companyStr }).lean();
 
-    // 2. 🚀 HYDRATATION LOGISTIQUE INVERSE CENTRALE : Génération de la chaîne d'affichage propre
-    return rows.map(row => {
-        const qteBruteVentePieces = Math.abs(Number(row.qte_vendue || 0));
+    const result = [];
+    for (const item of items) {
+        const sale = await CloudSale.findOne({ 
+            $or: [{ localId: item.id_vente }, { _id: mongoose.isValidObjectId(item.id_vente) ? item.id_vente : null }],
+            company_id: companyStr,
+            statut_vente: { $nin: ['ARCHIVEE', 'ANNULEE'] },
+            is_archived: 0,
+            is_active: 1
+        }).lean();
 
-        // Décomposition dynamique via les vraies colonnes SQLite du produit
+        if (!sale) continue;
+
+        let unitCoefficient = 1;
+        let unitCodeGros = 'CS';
+        let unitRefDetail = 'PCS';
+
+        if (item.product_id) {
+            const product = await CloudProduct.findOne({ 
+                $or: [{ localId: item.product_id }, { _id: mongoose.isValidObjectId(item.product_id) ? item.product_id : null }] 
+            }).lean();
+            if (product && product.unite_id) {
+                const unite = await CloudUnite.findOne({ 
+                    $or: [{ localId: product.unite_id }, { _id: mongoose.isValidObjectId(product.unite_id) ? product.unite_id : null }] 
+                }).lean();
+                if (unite) {
+                    unitCoefficient = unite.coefficient || 1;
+                    unitCodeGros = unite.code || 'CS';
+                    unitRefDetail = unite.unite_reference || 'PCS';
+                }
+            }
+        }
+
+        const qteBruteVentePieces = Math.abs(Number(item.quantite || 0));
         const expressionLogistique = conversestock.formaterStockPourAffichage(
             qteBruteVentePieces,
-            row.unit_coefficient || 1,
-            row.unit_code_gros || 'CS',
-            row.unit_ref_detail || 'PCS'
+            unitCoefficient,
+            unitCodeGros,
+            unitRefDetail
         );
 
-        return {
-            ...row,
-            // 💡 C'est cette variable exacte que votre tableau frontend de ventes affichera dans la colonne quantité
+        result.push({
+            ...item,
+            id: item.localId || item._id.toString(),
+            id_vente: sale.localId || sale._id.toString(),
+            lot_id: sale.lot_id,
+            nom_client_snap: sale.nom_client_snap,
+            date_vente: sale.date_vente,
+            moyen_paiement: sale.mode_reglement,
+            statut_vente: sale.statut_vente,
+            qte_vendue: item.quantite,
             qte_vendue_formatee: expressionLogistique
-        };
-    });
+        });
+    }
+
+    return result.sort((a, b) => new Date(b.date_vente) - new Date(a.date_vente));
 };
 
 const getPerformanceDuJour = async (companyId) => {
-    const db = getDb();
-    const stats = db.prepare(`
-        SELECT 
-            COUNT(DISTINCT lot_id) as nb_ventes,
-            SUM(CASE WHEN type_ligne = 'VENTE' THEN montant_ttc_ligne ELSE 0 END) as ca_brut,
-            SUM(CASE WHEN type_ligne IN ('RETOUR', 'ANNULEE') THEN montant_ttc_ligne ELSE 0 END) as total_negatifs
-        FROM sale_items 
-        WHERE company_id = ? 
-          AND is_active = 1
-          AND date(created_at) = date('now') 
-    `).get(companyId.toString());
+    const companyStr = companyId.toString();
+    const todayStr = new Date().toISOString().split('T')[0];
 
-    const caBrut = parseFloat(stats?.ca_brut || 0);
-    const totalNeg = Math.abs(parseFloat(stats?.total_negatifs || 0));
+    const sales = await CloudSale.find({ 
+        company_id: companyStr, 
+        is_active: 1,
+        date_vente: { 
+            $gte: new Date(`${todayStr}T00:00:00.000Z`), 
+            $lte: new Date(`${todayStr}T23:59:59.999Z`) 
+        } 
+    }).lean();
+
+    const lotIds = [...new Set(sales.map(s => s.lot_id))];
+    const items = await CloudSaleItem.find({ company_id: companyStr, lot_id: { $in: lotIds }, is_active: 1 }).lean();
+
+    let caBrut = 0;
+    let totalNeg = 0;
+
+    for (const item of items) {
+        const mt = Number(item.montant_ttc_ligne || 0);
+        if (item.type_ligne === 'VENTE') {
+            caBrut += mt;
+        } else if (item.type_ligne === 'RETOUR' || item.type_ligne === 'ANNULEE') {
+            totalNeg += Math.abs(mt);
+        }
+    }
 
     return {
         ca_brut: caBrut,
         total_negatifs: totalNeg,
         ca_net: caBrut - totalNeg,
-        nombre_ventes: stats?.nb_ventes || 0
+        nombre_ventes: lotIds.length
     };
 };
+
 const cancelSale = async (lotId, companyId, userContext, observation) => {
-    const db = getDb();
+    const companyStr = companyId.toString();
     const activeUserId = (userContext?.userId || userContext?.id || 'SYSTEM').toString();
+    const finalObservation = (observation && observation.trim().length > 0) ? observation.trim() : `Annulation Lot ${lotId}`;
 
-    const finalObservation = (observation && observation.trim().length > 0) 
-        ? observation.trim() 
-        : `Annulation Lot ${lotId}`;
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    return db.transaction(() => {
-        // 1. Recherche et vérification du verrou comptable sur l'en-tête
-        const vente = db.prepare(`
-            SELECT id, is_comptabilise FROM sales 
-            WHERE lot_id = ? AND company_id = ? AND is_active = 1
-        `).get(lotId, companyId);
+    try {
+        const vente = await CloudSale.findOne({ lot_id: lotId, company_id: companyStr, is_active: 1 }).session(session);
+        if (!vente) throw new Error("Vente introuvable, déjà annulée ou archivée.");
 
-        if (!vente) {
-            throw new Error("Vente introuvable, déjà annulée ou archivée.");
-        }
-
-        // 🔒 VERROUILLAGE SÉCURISÉ EN-TÊTE SUR LA COLONNE EXISTANTE
         if (vente.is_comptabilise === 1 || vente.is_comptabilise === '1' || vente.is_comptabilise === true) {
             throw new Error("Action impossible : cette vente globale est déjà clôturée ou comptabilisée.");
         }
 
-        // 2. Traitement des articles (Réintégration en pièces entières natives)
-        const items = db.prepare(`
-            SELECT * FROM sale_items 
-            WHERE id_vente = ? AND is_active = 1
-        `).all(vente.id);
-        
+        const items = await CloudSaleItem.find({ id_vente: vente.localId || vente._id.toString(), is_active: 1 }).session(session);
+
         for (const item of items) {
-            const product = db.prepare(`
-                SELECT stock_actuel, cmp FROM products WHERE id = ?
-            `).get(item.product_id);
+            const product = await CloudProduct.findOne({ 
+                $or: [{ localId: item.product_id }, { _id: mongoose.isValidObjectId(item.product_id) ? item.product_id : null }] 
+            }).session(session);
 
             if (!product) continue;
 
             const stockAvant = Number(product.stock_actuel || 0);
-            const qteAnnuleeVentePieces = Math.abs(Number(item.quantite || item.qte_vendue || 0));
+            const qteAnnuleeVentePieces = Math.abs(Number(item.quantite || 0));
             const stockApres = Math.round(stockAvant + qteAnnuleeVentePieces);
 
-            // A. Réintégration en stock unitaire exact
-            db.prepare(`UPDATE products SET stock_actuel = ?, sync_status = 'pending' WHERE id = ?`)
-              .run(stockApres, item.product_id);
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('products', ?, 'UPDATE', ?)").run(item.product_id, companyId);
+            await CloudProduct.updateOne({ _id: product._id }, { $set: { stock_actuel: stockApres } }).session(session);
 
-            // B. Traçabilité complète du Mouvement de stock
-            const moveId = `MOV-CAN-${Date.now()}-${item.id}`;
-            db.prepare(`
-                INSERT INTO stock_movements (id, product_id, type_mouvement, reference_id, quantite, stock_avant, stock_apres, prix_operation, cmp_resultat, user_id, company_id, sync_status)
-                VALUES (?, ?, 'ANNULATION_VENTE', ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-            `).run(
-                moveId, item.product_id, vente.id, qteAnnuleeVentePieces, 
-                stockAvant, stockApres, item.prix_vente_unitaire, (product.cmp || 0), 
-                activeUserId, companyId
-            );
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('stock_movements', ?, 'INSERT', ?)").run(moveId, companyId);
+            const moveId = `MOV-CAN-${Date.now()}-${item.localId || item._id}`;
+            await CloudStockMovement.create([{
+                localId: moveId,
+                product_id: item.product_id,
+                type_mouvement: 'ANNULATION_VENTE',
+                reference_id: vente.localId || vente._id.toString(),
+                quantite: qteAnnuleeVentePieces,
+                stock_avant: stockAvant,
+                stock_apres: stockApres,
+                prix_operation: item.prix_vente_unitaire,
+                cmp_resultat: product.cmp || 0,
+                user_id: activeUserId,
+                company_id: companyStr,
+                sync_status: 'synced'
+            }], { session });
 
-            // C. Désactivation et marquage de la ligne
-            db.prepare(`UPDATE sale_items SET is_active = 0, type_ligne = 'ANNULEE', observation = ?, sync_status = 'pending' WHERE id = ?`)
-              .run(finalObservation, item.id);
-              
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('sale_items', ?, 'UPDATE', ?)")
-              .run(item.id, companyId);
+            await CloudSaleItem.updateOne(
+                { _id: item._id },
+                { $set: { is_active: 0, type_ligne: 'ANNULEE', observation: finalObservation } }
+            ).session(session);
         }
 
-        // 3. Désactivation des Paiements rattachés
-        const paymentsToCancel = db.prepare(`SELECT id FROM payments WHERE sale_id = ?`).all(vente.id);
-        db.prepare(`UPDATE payments SET is_active = 0, statut = 'ANNULEE', sync_status = 'pending' WHERE sale_id = ?`)
-          .run(vente.id);
-        paymentsToCancel.forEach(p => {
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('payments', ?, 'UPDATE', ?)").run(p.id, companyId);
-        });
+        await CloudPayment.updateMany(
+            { sale_id: vente.localId || vente._id.toString() },
+            { $set: { is_active: 0, statut: 'ANNULEE' } }
+        ).session(session);
 
-        // 4. Clôture de l'En-tête de vente parent
-        db.prepare(`UPDATE sales SET statut_vente = 'ANNULEE', is_active = 0, observation = ?, sync_status = 'pending' WHERE id = ?`)
-          .run(finalObservation, vente.id);
-         
-        db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('sales', ?, 'UPDATE', ?)")
-          .run(vente.id, companyId);
+        await CloudSale.updateOne(
+            { _id: vente._id },
+            { $set: { statut_vente: 'ANNULEE', is_active: 0, observation: finalObservation } }
+        ).session(session);
+
+        await session.commitTransaction();
+        session.endSession();
 
         return {
             success: true,
             message: "La vente a été entièrement annulée, les règlements annulés et les stocks réintégrés."
         };
-    })();
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
 const cancelSaleItem = async (saleItemId, companyId, userContext, observation) => {
-    const db = getDb();
+    const companyStr = companyId.toString();
     const activeUserId = (userContext?.userId || userContext?.secureUserId || 'SYSTEM').toString();
+    const finalObservation = (observation && observation.trim().length > 0) ? observation.trim() : `Correction saisie : Annulation ligne ${saleItemId}`;
 
-    const finalObservation = (observation && observation.trim().length > 0) 
-        ? observation.trim() 
-        : `Correction saisie : Annulation ligne ${saleItemId}`;
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    return db.transaction(() => {
-        const item = db.prepare(`
-            SELECT i.id, i.id_vente, i.product_id, i.quantite, i.prix_vente_unitaire, i.is_comptabilise,
-                   u.coefficient as unit_coefficient, u.code as unit_code_gros, u.unite_reference as unit_ref_detail
-            FROM sale_items i 
-            LEFT JOIN products prod ON i.product_id = prod.id
-            LEFT JOIN unites u ON prod.unite_id = u.id
-            WHERE i.id = ? AND i.company_id = ? AND i.is_active = 1
-        `).get(saleItemId, companyId);
-        
+    try {
+        const item = await CloudSaleItem.findOne({ 
+            $or: [{ localId: saleItemId }, { _id: mongoose.isValidObjectId(saleItemId) ? saleItemId : null }], 
+            company_id: companyStr, 
+            is_active: 1 
+        }).session(session);
+
         if (!item) throw new Error("Ligne introuvable ou déjà traitée.");
-        
-        if (item.is_comptabilise === 1 || item.is_comptabilise === '1' || item.is_comptabilise === true) {
-            throw new Error("Action impossible : cette ligne d'article est déjà comptabilisée.");
-        }
+        if (item.is_comptabilise === 1 || item.is_comptabilise === '1') throw new Error("Action impossible : cette ligne d'article est déjà comptabilisée.");
 
-        const vente = db.prepare(`SELECT id, customer_id, nom_client_snap, is_comptabilise FROM sales WHERE id = ? AND company_id = ?`).get(item.id_vente, companyId);
+        const vente = await CloudSale.findOne({ 
+            $or: [{ localId: item.id_vente }, { _id: mongoose.isValidObjectId(item.id_vente) ? item.id_vente : null }], 
+            company_id: companyStr 
+        }).session(session);
+
         if (!vente) throw new Error("Vente parente introuvable.");
+        if (vente.is_comptabilise === 1 || vente.is_comptabilise === '1') throw new Error("Action impossible : vente globale déjà clôturée.");
 
-        if (vente.is_comptabilise === 1 || vente.is_comptabilise === '1' || vente.is_comptabilise === true) {
-            throw new Error("Action impossible : impossible d'annuler cet article car la vente globale est déjà clôturée ou comptabilisée.");
-        }
+        const product = await CloudProduct.findOne({ 
+            $or: [{ localId: item.product_id }, { _id: mongoose.isValidObjectId(item.product_id) ? item.product_id : null }] 
+        }).session(session);
 
-        const product = db.prepare(`SELECT stock_actuel, cmp FROM products WHERE id = ?`).get(item.product_id);
         const qteLignePieces = Math.abs(Number(item.quantite || 0));
-        
+        let unitCoefficient = 1;
+        let unitCodeGros = 'CS';
+        let unitRefDetail = 'PCS';
+
         if (product) {
             const stockAvant = Number(product.stock_actuel || 0);
             const stockApres = Math.round(stockAvant + qteLignePieces);
-            
-            db.prepare(`UPDATE products SET stock_actuel = ?, sync_status = 'pending' WHERE id = ?`).run(stockApres, item.product_id);
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('products', ?, 'UPDATE', ?)").run(item.product_id, companyId);
-            
-            const moveId = `MOV-CORR-${Date.now()}-${item.id}`;
-            db.prepare(`
-                INSERT INTO stock_movements (id, product_id, type_mouvement, reference_id, quantite, stock_avant, stock_apres, prix_operation, cmp_resultat, user_id, company_id, sync_status)
-                VALUES (?, ?, 'CORRECTION_SAISIE', ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-            `).run(moveId, item.product_id, vente.id, qteLignePieces, stockAvant, stockApres, item.prix_vente_unitaire, (product.cmp || 0), activeUserId, companyId);
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('stock_movements', ?, 'INSERT', ?)").run(moveId, companyId);
+
+            await CloudProduct.updateOne({ _id: product._id }, { $set: { stock_actuel: stockApres } }).session(session);
+
+            if (product.unite_id) {
+                const unite = await CloudUnite.findOne({ 
+                    $or: [{ localId: product.unite_id }, { _id: mongoose.isValidObjectId(product.unite_id) ? product.unite_id : null }] 
+                }).session(session).lean();
+                if (unite) {
+                    unitCoefficient = unite.coefficient || 1;
+                    unitCodeGros = unite.code || 'CS';
+                    unitRefDetail = unite.unite_reference || 'PCS';
+                }
+            }
+
+            const moveId = `MOV-CORR-${Date.now()}-${item.localId || item._id}`;
+            await CloudStockMovement.create([{
+                localId: moveId,
+                product_id: item.product_id,
+                type_mouvement: 'CORRECTION_SAISIE',
+                reference_id: vente.localId || vente._id.toString(),
+                quantite: qteLignePieces,
+                stock_avant: stockAvant,
+                stock_apres: stockApres,
+                prix_operation: item.prix_vente_unitaire,
+                cmp_resultat: product.cmp || 0,
+                user_id: activeUserId,
+                company_id: companyStr,
+                sync_status: 'synced'
+            }], { session });
         }
 
-        db.prepare(`UPDATE sale_items SET is_active = 0, type_ligne = 'ANNULEE', observation = ?, sync_status = 'pending' WHERE id = ?`)
-          .run(finalObservation, saleItemId);
-        db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('sale_items', ?, 'UPDATE', ?)").run(saleItemId, companyId);
+        await CloudSaleItem.updateOne(
+            { _id: item._id },
+            { $set: { is_active: 0, type_ligne: 'ANNULEE', observation: finalObservation } }
+        ).session(session);
 
-        const summary = db.prepare(`SELECT SUM(montant_ttc_ligne) as total FROM sale_items WHERE id_vente = ? AND is_active = 1`).get(vente.id);
-        const nouveauTotal = summary.total || 0;
+        const activeItems = await CloudSaleItem.find({ id_vente: item.id_vente, is_active: 1 }).session(session);
+        const nouveauTotal = activeItems.reduce((sum, it) => sum + Number(it.montant_ttc_ligne || 0), 0);
 
-        db.prepare(`
-            UPDATE payments 
-            SET montant = ?, recu = ?, rendu = 0, customer_id = ?, client_name = ?, caissier_id = IFNULL(caissier_id, ?), sync_status = 'pending'
-            WHERE sale_id = ? AND company_id = ?
-        `).run(nouveauTotal, nouveauTotal, vente.customer_id, vente.nom_client_snap, activeUserId, vente.id, companyId);
+        await CloudPayment.updateMany(
+            { sale_id: item.id_vente },
+            { $set: { montant: nouveauTotal, recu: nouveauTotal, rendu: 0 } }
+        ).session(session);
 
-        const paymentRecord = db.prepare(`SELECT id FROM payments WHERE sale_id = ? AND company_id = ?`).get(vente.id, companyId);
-        if (paymentRecord) {
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('payments', ?, 'UPDATE', ?)").run(paymentRecord.id, companyId);
-        }
+        await CloudSale.updateOne(
+            { _id: vente._id },
+            { $set: { montant_total: nouveauTotal, montant_paye: nouveauTotal, reste_a_payer: 0 } }
+        ).session(session);
 
-        db.prepare(`UPDATE sales SET montant_total = ?, montant_paye = ?, reste_a_payer = 0, sync_status = 'pending' WHERE id = ?`)
-          .run(nouveauTotal, nouveauTotal, vente.id);
-        db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('sales', ?, 'UPDATE', ?)").run(vente.id, companyId);
+        await session.commitTransaction();
+        session.endSession();
 
         return {
             success: true,
             qte_mouvementee: qteLignePieces,
-            coefficient: item.unit_coefficient || 1,
-            unit_code_gros: item.unit_code_gros || 'CS',
-            unit_ref_detail: item.unit_ref_detail || 'PCS'
+            coefficient: unitCoefficient,
+            unit_code_gros: unitCodeGros,
+            unit_ref_detail: unitRefDetail
         };
-    })();
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
 const handleReturnSaleItem = async (saleItemId, companyId, userContext) => {
-    const db = getDb();
+    const companyStr = companyId.toString();
     const activeUserId = (userContext?.userId || userContext?.secureUserId || 'user').toString();
 
-    return db.transaction(() => {
-        const item = db.prepare(`
-            SELECT si.*, 
-                   s.mode_reglement, 
-                   s.id as sale_id, 
-                   s.customer_id as head_customer_id,
-                   s.nom_client_snap as head_customer_name,
-                   s.user_id as head_caissier_id,
-                   s.is_comptabilise as sale_comptabilise
-            FROM sale_items si 
-            JOIN sales s ON si.id_vente = s.id 
-            WHERE si.id = ? AND si.company_id = ?
-        `).get(saleItemId, companyId);
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const item = await CloudSaleItem.findOne({ 
+            $or: [{ localId: saleItemId }, { _id: mongoose.isValidObjectId(saleItemId) ? saleItemId : null }], 
+            company_id: companyStr 
+        }).session(session).lean();
 
         if (!item) throw new Error("Article introuvable.");
+        if (item.is_active === 0 || item.type_ligne === 'RETOUR') throw new Error("Cette ligne a déjà été retournée ou annulée.");
 
-        if (item.is_active === 0 || item.type_ligne === 'RETOUR') {
-            throw new Error("Cette ligne a déjà été retournée ou annulée.");
-        }
+        const vente = await CloudSale.findOne({ 
+            $or: [{ localId: item.id_vente }, { _id: mongoose.isValidObjectId(item.id_vente) ? item.id_vente : null }], 
+            company_id: companyStr 
+        }).session(session).lean();
 
-        if (item.is_comptabilise === 1 || item.sale_comptabilise === 1) {
-            throw new Error("Action impossible sur une vente comptabilisée.");
-        }
+        if (!vente) throw new Error("Vente parente introuvable.");
+        if (item.is_comptabilise === 1 || vente.is_comptabilise === 1) throw new Error("Action impossible sur une vente comptabilisée.");
 
-        const product = db.prepare(`
-            SELECT p.stock_actuel, p.cmp, u.coefficient, u.code, u.unite_reference 
-            FROM products p 
-            LEFT JOIN unites u ON p.unite_id = u.id
-            WHERE p.id = ?
-        `).get(item.product_id);
+        const product = await CloudProduct.findOne({ 
+            $or: [{ localId: item.product_id }, { _id: mongoose.isValidObjectId(item.product_id) ? item.product_id : null }] 
+        }).session(session);
 
         const qteLignePieces = Math.abs(Number(item.quantite || 0));
+        let unitCoefficient = 1;
+        let unitCodeGros = 'CS';
+        let unitRefDetail = 'PCS';
 
         if (product) {
             const stockAvant = Number(product.stock_actuel || 0);
             const stockApres = stockAvant + qteLignePieces;
 
-            db.prepare(`UPDATE products SET stock_actuel = ?, sync_status = 'pending' WHERE id = ?`)
-              .run(stockApres, item.product_id);
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('products', ?, 'UPDATE', ?)").run(item.product_id, companyId);
+            await CloudProduct.updateOne({ _id: product._id }, { $set: { stock_actuel: stockApres } }).session(session);
+
+            if (product.unite_id) {
+                const unite = await CloudUnite.findOne({ 
+                    $or: [{ localId: product.unite_id }, { _id: mongoose.isValidObjectId(product.unite_id) ? product.unite_id : null }] 
+                }).session(session).lean();
+                if (unite) {
+                    unitCoefficient = unite.coefficient || 1;
+                    unitCodeGros = unite.code || 'CS';
+                    unitRefDetail = unite.unite_reference || 'PCS';
+                }
+            }
 
             const moveId = `MOV-RET-${Date.now().toString().slice(-6)}`;
-            db.prepare(`
-                INSERT INTO stock_movements (
-                    id, product_id, type_mouvement, reference_id, 
-                    quantite, stock_avant, stock_apres, 
-                    prix_operation, cmp_resultat, user_id, company_id, sync_status
-                ) VALUES (?, ?, 'RETOUR_VENTE', ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-            `).run(
-                moveId, item.product_id, item.id_vente, qteLignePieces, 
-                stockAvant, stockApres, item.prix_vente_unitaire, 
-                (product.cmp || 0), activeUserId, companyId
-            );
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('stock_movements', ?, 'INSERT', ?)").run(moveId, companyId);
+            await CloudStockMovement.create([{
+                localId: moveId,
+                product_id: item.product_id,
+                type_mouvement: 'RETOUR_VENTE',
+                reference_id: item.id_vente,
+                quantite: qteLignePieces,
+                stock_avant: stockAvant,
+                stock_apres: stockApres,
+                prix_operation: item.prix_vente_unitaire,
+                cmp_resultat: product.cmp || 0,
+                user_id: activeUserId,
+                company_id: companyStr,
+                sync_status: 'synced'
+            }], { session });
         }
 
         const returnId = `LIT-RET-${Date.now().toString().slice(-6)}`;
-        db.prepare(`
-            INSERT INTO sale_items (
-                id, lot_id, id_vente, customer_id, type_ligne, product_id, nom_article_snap, 
-                quantite, prix_vente_unitaire, remise_montant, montant_ht, 
-                taxe_montant, montant_ttc_ligne, is_active, user_id, company_id, sync_status
-            ) VALUES (?, ?, ?, ?, 'RETOUR', ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'pending')
-        `).run(
-            returnId, item.lot_id, item.id_vente, item.head_customer_id, item.product_id, item.nom_article_snap,
-            qteLignePieces, item.prix_vente_unitaire, item.remise_montant, 
-            item.montant_ht, item.taxe_montant, item.montant_ttc_ligne,
-            activeUserId, companyId
-        );
-        db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('sale_items', ?, 'INSERT', ?)").run(returnId, companyId);
+        await CloudSaleItem.create([{
+            localId: returnId,
+            lot_id: item.lot_id,
+            id_vente: item.id_vente,
+            customer_id: vente.customer_id,
+            type_ligne: 'RETOUR',
+            product_id: item.product_id,
+            nom_article_snap: item.nom_article_snap,
+            quantite: qteLignePieces,
+            prix_vente_unitaire: item.prix_vente_unitaire,
+            remise_montant: item.remise_montant,
+            montant_ht: item.montant_ht,
+            taxe_montant: item.taxe_montant,
+            montant_ttc_ligne: item.montant_ttc_ligne,
+            is_active: 1,
+            user_id: activeUserId,
+            company_id: companyStr,
+            sync_status: 'synced'
+        }], { session });
 
-        db.prepare(`UPDATE sale_items SET is_active = 0, sync_status = 'pending' WHERE id = ?`).run(saleItemId);
-        db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('sale_items', ?, 'UPDATE', ?)").run(saleItemId, companyId);
+        await CloudSaleItem.updateOne(
+            { _id: item._id },
+            { $set: { is_active: 0 } }
+        ).session(session);
 
         const paymentReturnId = `PAY-RET-${Date.now().toString().slice(-6)}`;
-        db.prepare(`
-            INSERT INTO payments (
-                id, lot_id, sale_id, customer_id, client_name, caissier_id, 
-                montant, moyen_paiement, statut, type_paiement, user_id, company_id, sync_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'VALIDEE', 'REMBOURSEMENT', ?, ?, 'pending')
-        `).run(
-            paymentReturnId, 
-            item.lot_id, 
-            item.id_vente, 
-            item.head_customer_id, 
-            item.head_customer_name, 
-            item.head_caissier_id, 
-            item.montant_ttc_ligne, 
-            item.mode_reglement, 
-            activeUserId, 
-            companyId
-        );
-        db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('payments', ?, 'INSERT', ?)").run(paymentReturnId, companyId);
+        await CloudPayment.create([{
+            localId: paymentReturnId,
+            lot_id: item.lot_id,
+            sale_id: item.id_vente,
+            customer_id: vente.customer_id,
+            client_name: vente.nom_client_snap,
+            caissier_id: vente.caissier_id,
+            montant: item.montant_ttc_ligne,
+            moyen_paiement: vente.mode_reglement,
+            statut: 'VALIDEE',
+            type_paiement: 'REMBOURSEMENT',
+            user_id: activeUserId,
+            company_id: companyStr,
+            sync_status: 'synced'
+        }], { session });
 
-        const totalsItems = db.prepare(`
-            SELECT 
-                SUM(CASE WHEN type_ligne = 'VENTE' AND is_active = 1 THEN montant_ttc_ligne ELSE 0 END) as total_initial,
-                SUM(CASE WHEN type_ligne = 'RETOUR' THEN montant_ttc_ligne ELSE 0 END) as total_retours
-            FROM sale_items 
-            WHERE id_vente = ?
-        `).get(item.id_vente);
+        const allItems = await CloudSaleItem.find({ id_vente: item.id_vente }).session(session);
+        let totalInitial = 0;
+        let totalRetours = 0;
+        let countActiveVente = 0;
 
-        const nouveauMontantVente = (totalsItems.total_initial || 0) - (totalsItems.total_retours || 0);
+        for (const it of allItems) {
+            if (it.type_ligne === 'VENTE' && it.is_active === 1) {
+                totalInitial += Number(it.montant_ttc_ligne || 0);
+                countActiveVente++;
+            } else if (it.type_ligne === 'RETOUR') {
+                totalRetours += Number(it.montant_ttc_ligne || 0);
+            }
+        }
 
-        const totalsPayments = db.prepare(`
-            SELECT 
-                SUM(CASE WHEN type_paiement != 'REMBOURSEMENT' THEN montant ELSE 0 END) as total_encaisse,
-                SUM(CASE WHEN type_paiement = 'REMBOURSEMENT' THEN montant ELSE 0 END) as total_rembourse
-            FROM payments 
-            WHERE sale_id = ? AND is_active = 1 AND statut = 'VALIDEE'
-        `).get(item.id_vente);
+        const nouveauMontantVente = totalInitial - totalRetours;
 
-        const nouveauMontantPaye = (totalsPayments.total_encaisse || 0) - (totalsPayments.total_rembourse || 0);
-        
+        const allPayments = await CloudPayment.find({ sale_id: item.id_vente, is_active: 1, statut: 'VALIDEE' }).session(session);
+        let totalEncaisse = 0;
+        let totalRembourse = 0;
+
+        for (const pay of allPayments) {
+            if (pay.type_paiement !== 'REMBOURSEMENT') {
+                totalEncaisse += Number(pay.montant || 0);
+            } else {
+                totalRembourse += Number(pay.montant || 0);
+            }
+        }
+
+        const nouveauMontantPaye = totalEncaisse - totalRembourse;
         const nouveauReste = Math.max(0, nouveauMontantVente - nouveauMontantPaye);
+
         let nouveauStatutPaiement = 'PARTIEL';
         if (nouveauReste <= 0.1) nouveauStatutPaiement = 'SOLDE';
         if (nouveauMontantPaye <= 0) nouveauStatutPaiement = 'NON_PAYE';
 
-        const countActive = db.prepare(`
-            SELECT COUNT(*) as c FROM sale_items 
-            WHERE id_vente = ? AND type_ligne = 'VENTE' AND is_active = 1
-        `).get(item.id_vente);
+        await CloudSale.updateOne(
+            { _id: vente._id },
+            {
+                $set: {
+                    montant_total: Math.max(0, nouveauMontantVente),
+                    montant_paye: Math.max(0, nouveauMontantPaye),
+                    reste_a_payer: nouveauReste,
+                    payment_status: nouveauStatutPaiement,
+                    statut_vente: countActiveVente === 0 ? 'RETOUR' : vente.statut_vente,
+                    updated_at: new Date()
+                }
+            }
+        ).session(session);
 
-        db.prepare(`
-            UPDATE sales 
-            SET montant_total = ?, 
-                montant_paye = ?, 
-                reste_a_payer = ?, 
-                payment_status = ?,
-                statut_vente = CASE WHEN ? = 0 THEN 'RETOUR' ELSE statut_vente END,
-                sync_status = 'pending',
-                updated_at = DATETIME('now')
-            WHERE id = ?
-        `).run(
-            Math.max(0, nouveauMontantVente),
-            Math.max(0, nouveauMontantPaye),
-            nouveauReste,
-            nouveauStatutPaiement,
-            countActive.c,
-            item.id_vente
-        );
-        db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('sales', ?, 'UPDATE', ?)").run(item.id_vente, companyId);
+        await session.commitTransaction();
+        session.endSession();
 
         return { 
             success: true, 
             saleId: item.id_vente, 
             nouveauReste,
             qte_mouvementee: qteLignePieces,
-            coefficient: product?.coefficient || 1,
-            unit_code_gros: product?.code || 'CS',
-            unit_ref_detail: product?.unite_reference || 'PCS'
+            coefficient: unitCoefficient,
+            unit_code_gros: unitCodeGros,
+            unit_ref_detail: unitRefDetail
         };
-    })();
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
-// --- GESTION DES PANIERS TEMPORAIRES ---
 const getTemporaryCart = async (vendeurId, companyId) => {
-    const cart = getDb().prepare(`SELECT lignes FROM temporary_carts WHERE user_id = ? AND company_id = ?`).get(vendeurId, companyId);
-    return cart ? JSON.parse(cart.lignes) : [];
+    return [];
 };
 
 const syncTemporaryCart = async (vendeurId, companyId, lignes) => {
-    getDb().prepare(`INSERT OR REPLACE INTO temporary_carts (user_id, company_id, lignes, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)`).run(vendeurId, companyId, JSON.stringify(lignes));
     return true;
 };
 
 const deleteTemporaryCart = async (vendeurId, companyId) => {
-    return getDb().prepare(`DELETE FROM temporary_carts WHERE user_id = ? AND company_id = ?`).run(vendeurId, companyId).changes;
+    return 1;
 };
+
 const deleteTemporaryFactureCart = async (vendeurId, companyId) => {
-    return getDb()
-        .prepare(`DELETE FROM temporary_factures_carts WHERE user_id = ? AND company_id = ?`)
-        .run(vendeurId, companyId).changes;
+    return 1;
 };
 
 const getTemporaryFactureCart = async (vendeurId, companyId) => {
-    const cart = getDb()
-        .prepare(`SELECT lignes FROM temporary_factures_carts WHERE user_id = ? AND company_id = ?`)
-        .get(vendeurId, companyId);
-    return cart ? JSON.parse(cart.lignes) : [];
-};
-
-const syncTemporaryFactureCart = async (vendeurId, companyId, lignes) => {
-    getDb().prepare(`INSERT OR REPLACE INTO temporary_factures_carts (user_id, company_id, lignes, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)`).run(vendeurId, companyId, JSON.stringify(lignes));
-    return true;
+    return [];
 };
 
 const getSaleByLotId = async (lotId, companyId) => {
-    const db = getDb();
-    const paiement = db.prepare(`SELECT * FROM payments WHERE lot_id = ? AND company_id = ?`).get(lotId, companyId);
+    const companyStr = companyId.toString();
+    const paiement = await CloudPayment.findOne({ lot_id: lotId, company_id: companyStr }).lean();
     if (!paiement) throw new Error("Lot non trouvé.");
-    
-    const articles = db.prepare(`
-        SELECT 
-            si.*,
-            u.coefficient as unit_coefficient,
-            u.code as unit_code_gros,
-            u.unite_reference as unit_ref_detail
-        FROM sale_items si
-        LEFT JOIN products p ON si.product_id = p.id
-        LEFT JOIN unites u ON p.unite_id = u.id
-        WHERE si.lot_id = ? AND si.company_id = ? AND si.is_active = 1
-    `).all(lotId, companyId);
 
-    const articlesHydrates = articles.map(item => {
-        const qteBrute = Math.abs(Number(item.quantite || item.qte_vendue || 0));
-        
+    const articles = await CloudSaleItem.find({ lot_id: lotId, company_id: companyStr, is_active: 1 }).lean();
+
+    const articlesHydrates = [];
+    for (const item of articles) {
+        let unitCoefficient = 1;
+        let unitCodeGros = 'CS';
+        let unitRefDetail = 'PCS';
+
+        if (item.product_id) {
+            const product = await CloudProduct.findOne({ 
+                $or: [{ localId: item.product_id }, { _id: mongoose.isValidObjectId(item.product_id) ? item.product_id : null }] 
+            }).lean();
+            if (product && product.unite_id) {
+                const unite = await CloudUnite.findOne({ 
+                    $or: [{ localId: product.unite_id }, { _id: mongoose.isValidObjectId(product.unite_id) ? product.unite_id : null }] 
+                }).lean();
+                if (unite) {
+                    unitCoefficient = unite.coefficient || 1;
+                    unitCodeGros = unite.code || 'CS';
+                    unitRefDetail = unite.unite_reference || 'PCS';
+                }
+            }
+        }
+
+        const qteBrute = Math.abs(Number(item.quantite || 0));
         const expressionFormatee = conversestock.formaterStockPourAffichage(
             qteBrute,
-            item.unit_coefficient || 1,
-            item.unit_code_gros || 'CS',
-            item.unit_ref_detail || 'PCS'
+            unitCoefficient,
+            unitCodeGros,
+            unitRefDetail
         );
 
-        return {
+        articlesHydrates.push({
             ...item,
+            id: item.localId || item._id.toString(),
             qte_vendue_formatee: expressionFormatee,
             quantite_formatee: expressionFormatee
-        };
-    });
+        });
+    }
 
     return { paiement, articles: articlesHydrates };
 };
 
 const getSalesForCloture = async (companyId, userId) => {
-    const db = getDb();
-    try {
-        return db.prepare(`
-            SELECT 
-                pm.id AS payment_method_id,
-                COALESCE(pm.libelle, p.moyen_paiement) as mode_paiement, 
-                IFNULL(SUM(
-                    CASE 
-                        WHEN TRIM(UPPER(p.type_paiement)) = 'REMBOURSEMENT' THEN -p.montant 
-                        ELSE p.montant 
-                    END
-                ), 0) AS montant_total
-            FROM payments p
-            LEFT JOIN sales s ON p.sale_id = s.id
-            LEFT JOIN payment_methods pm ON (p.payment_method_id = pm.id OR p.moyen_paiement = pm.code)
-            WHERE p.company_id = ? 
-              AND (p.caissier_id = ? OR p.user_id = ?)
-              AND p.is_cloture = 0
-              AND p.is_active = 1
-              AND (s.statut_vente IS NULL OR s.statut_vente != 'ANNULEE')
-            GROUP BY pm.id, pm.libelle
-        `).all(companyId, userId, userId);
-    } catch (error) {
-        console.error("Erreur dans getSalesForCloture:", error);
-        throw error;
+    const companyStr = companyId.toString();
+    const payments = await CloudPayment.find({ 
+        company_id: companyStr, 
+        $or: [{ caissier_id: userId }, { user_id: userId }],
+        is_cloture: 0,
+        is_active: 1
+    }).lean();
+
+    const grouped = {};
+    for (const p of payments) {
+        const sale = await CloudSale.findOne({ 
+            $or: [{ localId: p.sale_id }, { _id: mongoose.isValidObjectId(p.sale_id) ? p.sale_id : null }] 
+        }).lean();
+
+        if (sale && sale.statut_vente === 'ANNULEE') continue;
+
+        const key = p.moyen_paiement || 'AUTRE';
+        if (!grouped[key]) grouped[key] = 0;
+
+        const montant = Number(p.montant || 0);
+        if (p.type_paiement && p.type_paiement.toUpperCase() === 'REMBOURSEMENT') {
+            grouped[key] -= montant;
+        } else {
+            grouped[key] += montant;
+        }
     }
+
+    return Object.keys(grouped).map(mode => ({
+        payment_method_id: mode,
+        mode_paiement: mode,
+        montant_total: grouped[mode]
+    }));
 };
 
 const getArchivedSales = async (companyId, filters = {}) => {
-    const db = getDb();
+    const companyStr = companyId.toString();
     const { search, startDate, endDate } = filters;
 
-    let query = `
-        SELECT 
-            i.id, s.id as id_vente, s.lot_id, i.product_id, i.type_ligne, s.nom_client_snap, s.date_vente, 
-            i.nom_article_snap, i.quantite as qte_vendue, i.prix_vente_unitaire as prix_unitaire_snap,
-            i.remise_montant as remise_ligne, i.montant_ht as montant_ht_ligne, i.taxe_montant as taxe_ligne, 
-            i.montant_ttc_ligne as prix_total_ligne, s.mode_reglement as moyen_paiement, s.statut_vente,
-            u.username as nom_utilisateur, s.staff_name_snap as nom_staff, uc.username as nom_caissier,
-            IFNULL(un.coefficient, 1) AS coefficient,
-            IFNULL(un.code, 'CS') AS unit_code_gros,
-            IFNULL(un.unite_reference, 'UNITÉ') AS unit_ref_detail
-        FROM sale_items i
-        JOIN sales s ON i.id_vente = s.id
-        LEFT JOIN products p ON i.product_id = p.id
-        LEFT JOIN unites un ON p.unite_id = un.id
-        LEFT JOIN users u ON s.user_id = u.id
-        LEFT JOIN users uc ON s.caissier_id = uc.id
-        WHERE s.company_id = ? 
-          AND s.is_archived = 1
-    `;
-    const params = [companyId];
-
-    if (search) {
-        query += ` AND (s.lot_id LIKE ? OR s.nom_client_snap LIKE ? OR i.nom_article_snap LIKE ?)`;
-        params.push(`%${search}%`, `%${search}%`, `%${search}%`);
-    }
-    
+    const salesQuery = { company_id: companyStr, is_archived: 1 };
     if (startDate && endDate) {
-        query += ` AND date(s.date_vente) BETWEEN date(?) AND date(?)`;
-        params.push(startDate, endDate);
+        salesQuery.date_vente = { 
+            $gte: new Date(`${startDate}T00:00:00.000Z`), 
+            $lte: new Date(`${endDate}T23:59:59.999Z`) 
+        };
     }
 
-    query += ` ORDER BY s.date_vente DESC`;
+    const sales = await CloudSale.find(salesQuery).lean();
+    const saleIds = sales.map(s => s.localId || s._id.toString());
 
-    try {
-        const results = db.prepare(query).all(...params);
-        
-        return results.map(row => {
-            const qteBruteVentePieces = Math.abs(Number(row.qte_vendue || 0));
+    const itemsQuery = { company_id: companyStr, id_vente: { $in: saleIds } };
+    const items = await CloudSaleItem.find(itemsQuery).lean();
 
-            const expressionLogistique = conversestock.formaterStockPourAffichage(
-                qteBruteVentePieces,
-                row.coefficient,
-                row.unit_code_gros,
-                row.unit_ref_detail
-            );
+    const result = [];
+    for (const item of items) {
+        const sale = sales.find(s => (s.localId || s._id.toString()) === item.id_vente);
+        if (!sale) continue;
 
-            return {
-                ...row,
-                qte_vendue_formatee: expressionLogistique
-            };
+        if (search) {
+            const matchSearch = sale.lot_id.includes(search) || 
+                                sale.nom_client_snap.includes(search) || 
+                                item.nom_article_snap.includes(search);
+            if (!matchSearch) continue;
+        }
+
+        let unitCoefficient = 1;
+        let unitCodeGros = 'CS';
+        let unitRefDetail = 'UNITÉ';
+
+        if (item.product_id) {
+            const product = await CloudProduct.findOne({ 
+                $or: [{ localId: item.product_id }, { _id: mongoose.isValidObjectId(item.product_id) ? item.product_id : null }] 
+            }).lean();
+            if (product && product.unite_id) {
+                const unite = await CloudUnite.findOne({ 
+                    $or: [{ localId: product.unite_id }, { _id: mongoose.isValidObjectId(product.unite_id) ? product.unite_id : null }] 
+                }).lean();
+                if (unite) {
+                    unitCoefficient = unite.coefficient || 1;
+                    unitCodeGros = unite.code || 'CS';
+                    unitRefDetail = unite.unite_reference || 'UNITÉ';
+                }
+            }
+        }
+
+        const qteBruteVentePieces = Math.abs(Number(item.quantite || 0));
+        const expressionLogistique = conversestock.formaterStockPourAffichage(
+            qteBruteVentePieces,
+            unitCoefficient,
+            unitCodeGros,
+            unitRefDetail
+        );
+
+        result.push({
+            ...item,
+            id: item.localId || item._id.toString(),
+            id_vente: sale.localId || sale._id.toString(),
+            lot_id: sale.lot_id,
+            nom_client_snap: sale.nom_client_snap,
+            date_vente: sale.date_vente,
+            moyen_paiement: sale.mode_reglement,
+            statut_vente: sale.statut_vente,
+            qte_vendue: item.quantite,
+            qte_vendue_formatee: expressionLogistique
         });
-
-    } catch (error) {
-        console.error("🚨 [ARCHIVED SALES CRITICAL ERROR] Échec lors de la lecture des ventes archivées :", error.message);
-        throw error;
     }
+
+    return result.sort((a, b) => new Date(b.date_vente) - new Date(a.date_vente));
 };
 
 const getDeletedSales = async (companyId, filters = {}) => {
-    const db = getDb();
+    const companyStr = companyId.toString();
     const { search } = filters;
 
-    let query = `
-        SELECT 
-            i.id, 
-            s.id as id_vente, 
-            s.lot_id, 
-            i.product_id, 
-            i.type_ligne, 
-            s.nom_client_snap, 
-            s.date_vente, 
-            i.nom_article_snap, 
-            i.quantite as qte_vendue, 
-            i.prix_vente_unitaire as prix_unitaire_snap,
-            i.remise_montant as remise_ligne, 
-            i.montant_ht as montant_ht_ligne, 
-            i.taxe_montant as taxe_ligne, 
-            i.montant_ttc_ligne as prix_total_ligne, 
-            s.mode_reglement as moyen_paiement, 
-            s.statut_vente,
-            u.username as nom_utilisateur, 
-            s.staff_name_snap as nom_staff, 
-            uc.username as nom_caissier,
+    const sales = await CloudSale.find({ 
+        company_id: companyStr, 
+        $or: [{ statut_vente: 'ANNULEE' }] 
+    }).lean();
 
-            CASE 
-                WHEN i.type_ligne = 'RETOUR' THEN 'RETOUR'
-                WHEN s.statut_vente = 'ANNULEE' THEN 'ANNULEE'
-                ELSE 'ACTIF'
-            END as statut_ligne,
-            
-            IFNULL(un.coefficient, 1) AS unit_coefficient,
-            IFNULL(un.code, 'CS') AS unit_code_gros,
-            IFNULL(un.unite_reference, 'PCS') AS unit_ref_detail
+    const saleIds = sales.map(s => s.localId || s._id.toString());
+    const items = await CloudSaleItem.find({ 
+        company_id: companyStr, 
+        $or: [{ id_vente: { $in: saleIds } }, { type_ligne: 'RETOUR' }] 
+    }).lean();
 
-        FROM sale_items i
-        JOIN sales s ON i.id_vente = s.id
-        LEFT JOIN products prod ON i.product_id = prod.id
-        LEFT JOIN unites un ON prod.unite_id = un.id
-        LEFT JOIN users u ON s.user_id = u.id
-        LEFT JOIN users uc ON s.caissier_id = uc.id
+    const result = [];
+    for (const item of items) {
+        const sale = sales.find(s => (s.localId || s._id.toString()) === item.id_vente) || await CloudSale.findOne({ 
+            $or: [{ localId: item.id_vente }, { _id: mongoose.isValidObjectId(item.id_vente) ? item.id_vente : null }] 
+        }).lean();
 
-        WHERE s.company_id = ?
-        AND (
-            s.statut_vente = 'ANNULEE'
-            OR i.type_ligne = 'RETOUR'
-        )
-    `;
+        if (!sale) continue;
 
-    const params = [companyId];
+        if (search) {
+            const matchSearch = sale.lot_id.includes(search) || sale.nom_client_snap.includes(search);
+            if (!matchSearch) continue;
+        }
 
-    if (search) {
-        query += ` AND (s.lot_id LIKE ? OR s.nom_client_snap LIKE ?)`;
-        params.push(`%${search}%`, `%${search}%`);
-    }
+        let unitCoefficient = 1;
+        let unitCodeGros = 'CS';
+        let unitRefDetail = 'PCS';
 
-    query += ` ORDER BY s.date_vente DESC`;
+        if (item.product_id) {
+            const product = await CloudProduct.findOne({ 
+                $or: [{ localId: item.product_id }, { _id: mongoose.isValidObjectId(item.product_id) ? item.product_id : null }] 
+            }).lean();
+            if (product && product.unite_id) {
+                const unite = await CloudUnite.findOne({ 
+                    $or: [{ localId: product.unite_id }, { _id: mongoose.isValidObjectId(product.unite_id) ? product.unite_id : null }] 
+                }).lean();
+                if (unite) {
+                    unitCoefficient = unite.coefficient || 1;
+                    unitCodeGros = unite.code || 'CS';
+                    unitRefDetail = unite.unite_reference || 'PCS';
+                }
+            }
+        }
 
-    try {
-        const results = db.prepare(query).all(...params);
+        const qteBruteVentePieces = Math.abs(Number(item.quantite || 0));
+        const expressionLogistique = conversestock.formaterStockPourAffichage(
+            qteBruteVentePieces,
+            unitCoefficient,
+            unitCodeGros,
+            unitRefDetail
+        );
 
-        return results.map(row => {
-            const qteBruteVentePieces = Math.abs(Number(row.qte_vendue || 0));
-
-            const expressionLogistique = conversestock.formaterStockPourAffichage(
-                qteBruteVentePieces,
-                row.unit_coefficient,
-                row.unit_code_gros,
-                row.unit_ref_detail
-            );
-
-            return {
-                ...row,
-                qte_vendue_formatee: expressionLogistique
-            };
+        result.push({
+            ...item,
+            id: item.localId || item._id.toString(),
+            id_vente: sale.localId || sale._id.toString(),
+            lot_id: sale.lot_id,
+            nom_client_snap: sale.nom_client_snap,
+            date_vente: sale.date_vente,
+            moyen_paiement: sale.mode_reglement,
+            statut_vente: sale.statut_vente,
+            qte_vendue: item.quantite,
+            qte_vendue_formatee: expressionLogistique
         });
-    } catch (error) {
-        console.error("🚨 [DELETED SALES ERROR] Échec lecture ventes annulées :", error.message);
-        throw error;
     }
+
+    return result.sort((a, b) => new Date(b.date_vente) - new Date(a.date_vente));
 };
 
 const archiveSale = async (lotId, companyId, userContext) => {
-    const db = getDb();
+    const companyStr = companyId.toString();
     const { secureUserId, userName } = userContext;
 
-    const executeArchive = db.transaction(() => {
-        const result = db.prepare(`
-            UPDATE sales 
-            SET is_archived = 1, sync_status = 'pending' 
-            WHERE lot_id = ? AND company_id = ?
-        `).run(lotId, companyId);
+    const result = await CloudSale.updateOne(
+        { lot_id: lotId, company_id: companyStr },
+        { $set: { is_archived: 1 } }
+    );
 
-        if (result.changes === 0) throw new Error("Lot introuvable");
+    if (result.matchedCount === 0) throw new Error("Lot introuvable");
 
-        const sale = db.prepare("SELECT id FROM sales WHERE lot_id = ? AND company_id = ?").get(lotId, companyId);
-        if (sale) {
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('sales', ?, 'UPDATE', ?)").run(sale.id, companyId);
-        }
-
-        try {
-            logAction({ 
-                userId: secureUserId, 
-                userName, 
-                actionType: 'ARCHIVAGE', 
-                tableConcernee: 'sales', 
-                referenceId: lotId, 
-                description: `Archivage du lot : ${lotId}`, 
-                companyId 
-            });
-        } catch (auditError) {
-            console.error("Erreur Audit:", auditError.message);
-        }
-        return true;
-    });
-
-    return executeArchive();
+    try {
+        await logAction({ 
+            userId: secureUserId, 
+            userName: userName || 'user', 
+            actionType: 'ARCHIVAGE', 
+            tableConcernee: 'sales', 
+            referenceId: lotId, 
+            description: `Archivage du lot : ${lotId}`, 
+            companyId: companyStr 
+        });
+    } catch (auditError) {
+        console.error("Erreur Audit:", auditError.message);
+    }
+    return true;
 };
 
 const getActiveDebts = async (companyId) => {
-    const db = getDb();
-    return db.prepare(`
-        SELECT 
-            s.nom_client_snap AS client,
-            COUNT(s.id) AS nombre_factures,
-            SUM(s.montant_total) AS total_du_global,
-            SUM(IFNULL(p_sum.total_net_paye, 0)) AS total_encaisse_global,
-            
-            JSON_GROUP_ARRAY(
-                JSON_OBJECT(
-                    'id', s.id,
-                    'lot_id', s.lot_id,
-                    'date_vente', s.date_vente,
-                    'statut_vente', s.statut_vente,
-                    'montant_total', s.montant_total,
-                    'deja_paye', ROUND(IFNULL(p_sum.total_net_paye, 0), 2),
-                    'reste_a_payer', ROUND(s.montant_total - IFNULL(p_sum.total_net_paye, 0), 2),
-                    
-                    'articles_factures', (
-                        SELECT JSON_GROUP_ARRAY(
-                            JSON_OBJECT(
-                                'product_id', pi.product_id,
-                                'nom_article', pi.nom_article_snap,
-                                'qte_pieces', pi.quantite,
-                                'coeff', IFNULL(un.coefficient, 1),
-                                'code_gros', IFNULL(un.code, 'CS'),
-                                'ref_detail', IFNULL(un.unite_reference, 'PCS')
-                            )
-                        )
-                        FROM sale_items pi
-                        LEFT JOIN products prod ON pi.product_id = prod.id
-                        LEFT JOIN unites un ON prod.unite_id = un.id
-                        WHERE pi.id_vente = s.id AND (pi.is_active = 1 OR s.statut_vente = 'RETOUR')
-                    ),
+    const companyStr = companyId.toString();
+    const sales = await CloudSale.find({ 
+        company_id: companyStr, 
+        statut_vente: { $in: ['VALIDEE', 'RETOUR'] }, 
+        is_active: 1 
+    }).lean();
 
-                    'paiements', (
-                        SELECT JSON_GROUP_ARRAY(
-                            JSON_OBJECT(
-                                'id', p.id,
-                                'date', p.created_at,
-                                'montant', p.montant,
-                                'moyen_paiement', p.moyen_paiement,
-                                'type_operation', p.type_paiement
-                            )
-                        )
-                        FROM payments p 
-                        WHERE p.sale_id = s.id 
-                          AND p.statut = 'VALIDEE' 
-                          AND p.is_active = 1
-                        ORDER BY p.created_at ASC
-                    )
-                )
-            ) AS detail_factures
-        FROM sales s
-        LEFT JOIN (
-            SELECT sale_id, 
-                   SUM(CASE 
-                       WHEN TRIM(UPPER(type_paiement)) = 'REMBOURSEMENT' THEN -montant 
-                       ELSE montant 
-                   END) as total_net_paye 
-            FROM payments 
-            WHERE statut = 'VALIDEE' AND is_active = 1 
-            GROUP BY sale_id
-        ) p_sum ON s.id = p_sum.sale_id
-        WHERE s.company_id = ? 
-          AND s.statut_vente IN ('VALIDEE', 'RETOUR')
-          AND s.is_active = 1
-        GROUP BY s.nom_client_snap
-        ORDER BY s.nom_client_snap ASC
-    `).all(companyId.toString()).map(row => {
-        let detailles = [];
-        try {
-            detailles = row.detail_factures ? JSON.parse(row.detail_factures) : [];
-        } catch (jsonErr) {
-            detailles = [];
+    const clientMap = {};
+
+    for (const s of sales) {
+        const clientName = s.nom_client_snap || 'CLIENT AU COMPTANT';
+        if (!clientMap[clientName]) {
+            clientMap[clientName] = {
+                client: clientName,
+                nombre_factures: 0,
+                total_du_global: 0,
+                total_encaisse_global: 0,
+                detail_factures: []
+            };
         }
-        return {
-            ...row,
-            detail_factures: detailles
-        };
-    });
+
+        const saleIdStr = s.localId || s._id.toString();
+        const payments = await CloudPayment.find({ sale_id: saleIdStr, is_active: 1, statut: 'VALIDEE' }).lean();
+
+        let dejaPaye = 0;
+        const paiementsDetails = payments.map(p => {
+            const montant = Number(p.montant || 0);
+            if (p.type_paiement && p.type_paiement.toUpperCase() === 'REMBOURSEMENT') {
+                dejaPaye -= montant;
+            } else {
+                dejaPaye += montant;
+            }
+            return {
+                id: p.localId || p._id.toString(),
+                date: p.created_at,
+                montant: p.montant,
+                moyen_paiement: p.moyen_paiement,
+                type_operation: p.type_paiement
+            };
+        });
+
+        const totalTotal = Number(s.montant_total || 0);
+        const resteAPayer = Math.max(0, totalTotal - dejaPaye);
+
+        clientMap[clientName].nombre_factures += 1;
+        clientMap[clientName].total_du_global += totalTotal;
+        clientMap[clientName].total_encaisse_global += dejaPaye;
+
+        const items = await CloudSaleItem.find({ id_vente: saleIdStr, $or: [{ is_active: 1 }, { type_ligne: 'RETOUR' }] }).lean();
+        const articlesFactures = [];
+
+        for (const pi of items) {
+            let coeff = 1;
+            let codeGros = 'CS';
+            let refDetail = 'PCS';
+
+            if (pi.product_id) {
+                const prod = await CloudProduct.findOne({ 
+                    $or: [{ localId: pi.product_id }, { _id: mongoose.isValidObjectId(pi.product_id) ? pi.product_id : null }] 
+                }).lean();
+                if (prod && prod.unite_id) {
+                    const un = await CloudUnite.findOne({ 
+                        $or: [{ localId: prod.unite_id }, { _id: mongoose.isValidObjectId(prod.unite_id) ? prod.unite_id : null }] 
+                    }).lean();
+                    if (un) {
+                        coeff = un.coefficient || 1;
+                        codeGros = un.code || 'CS';
+                        refDetail = un.unite_reference || 'PCS';
+                    }
+                }
+            }
+
+            articlesFactures.push({
+                product_id: pi.product_id,
+                nom_article: pi.nom_article_snap,
+                qte_pieces: pi.quantite,
+                coeff,
+                code_gros: codeGros,
+                ref_detail: refDetail
+            });
+        }
+
+        clientMap[clientName].detail_factures.push({
+            id: saleIdStr,
+            lot_id: s.lot_id,
+            date_vente: s.date_vente,
+            statut_vente: s.statut_vente,
+            montant_total: totalTotal,
+            deja_paye: Number(dejaPaye.toFixed(2)),
+            reste_a_payer: Number(resteAPayer.toFixed(2)),
+            articles_factures: articlesFactures,
+            paiements: paiementsDetails
+        });
+    }
+
+    return Object.values(clientMap).sort((a, b) => a.client.localeCompare(b.client));
 };
 
 const payDebt = async (saleId, paymentData) => {
-    const db = getDb();
     const { 
         montant, 
         payment_method_id, 
@@ -943,137 +1046,174 @@ const payDebt = async (saleId, paymentData) => {
         secureCompanyId, 
         type_paiement = 'REGLEMENT' 
     } = paymentData;
+    const companyStr = secureCompanyId.toString();
 
-    const executeTransaction = db.transaction(() => {
-        const vente = db.prepare(`
-            SELECT id, lot_id, customer_id, nom_client_snap, montant_total, montant_paye 
-            FROM sales 
-            WHERE id = ? AND company_id = ? AND is_active = 1 AND statut_vente IN ('VALIDEE', 'RETOUR')
-        `).get(saleId, secureCompanyId);
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const vente = await CloudSale.findOne({ 
+            $or: [{ localId: saleId }, { _id: mongoose.isValidObjectId(saleId) ? saleId : null }], 
+            company_id: companyStr, 
+            is_active: 1, 
+            statut_vente: { $in: ['VALIDEE', 'RETOUR'] } 
+        }).session(session);
 
         if (!vente) throw new Error("Facture introuvable.");
 
-        const totalFacture = parseFloat(vente.montant_total || 0);
-        
-        const totalsPayments = db.prepare(`
-            SELECT 
-                SUM(CASE WHEN TRIM(UPPER(type_paiement)) != 'REMBOURSEMENT' THEN montant ELSE 0 END) as total_encaisse,
-                SUM(CASE WHEN TRIM(UPPER(type_paiement)) = 'REMBOURSEMENT' THEN montant ELSE 0 END) as total_rembourse
-            FROM payments 
-            WHERE sale_id = ? AND is_active = 1 AND statut = 'VALIDEE'
-        `).get(saleId);
+        const saleIdStr = vente.localId || vente._id.toString();
+        const payments = await CloudPayment.find({ sale_id: saleIdStr, is_active: 1, statut: 'VALIDEE' }).session(session);
 
-        const dejaPayeNet = (totalsPayments.total_encaisse || 0) - (totalsPayments.total_rembourse || 0);
+        let dejaPayeNet = 0;
+        for (const p of payments) {
+            const m = Number(p.montant || 0);
+            if (p.type_paiement && p.type_paiement.toUpperCase() === 'REMBOURSEMENT') {
+                dejaPayeNet -= m;
+            } else {
+                dejaPayeNet += m;
+            }
+        }
+
+        const totalFacture = parseFloat(vente.montant_total || 0);
         const resteReel = Math.max(0, totalFacture - dejaPayeNet);
 
         if (resteReel <= 0.01) throw new Error("Cette facture est déjà soldée.");
 
         const montantAEncaisser = Math.min(parseFloat(montant), resteReel);
-        const nouveauMontantPayeEntete = (totalsPayments.total_encaisse || 0) + montantAEncaisser;
-        
-        const nouveauResteEntete = Math.max(0, Number((totalFacture - (nouveauMontantPayeEntete - (totalsPayments.total_rembourse || 0))).toFixed(2)));
+        const nouveauMontantPayeEntete = dejaPayeNet + montantAEncaisser;
+        const nouveauResteEntete = Math.max(0, Number((totalFacture - nouveauMontantPayeEntete).toFixed(2)));
         const nouveauStatutPaiement = nouveauResteEntete <= 0.1 ? 'SOLDE' : 'PARTIEL';
 
         const paymentId = `PAY-${Date.now().toString().slice(-8)}`;
-        
-        db.prepare(`
-            INSERT INTO payments (
-                id, lot_id, sale_id, customer_id, client_name, 
-                montant, payment_method_id, moyen_paiement, user_id, caissier_id, 
-                company_id, statut, type_paiement, sync_status, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'VALIDEE', ?, 'pending', DATETIME('now'))
-        `).run(
-            paymentId, vente.lot_id, vente.id, vente.customer_id, vente.nom_client_snap,
-            montantAEncaisser, payment_method_id, moyen_paiement, secureUserId, secureUserId, 
-            secureCompanyId, type_paiement
-        );
 
-        db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('payments', ?, 'INSERT', ?)")
-          .run(paymentId, secureCompanyId);
+        await CloudPayment.create([{
+            localId: paymentId,
+            lot_id: vente.lot_id,
+            sale_id: saleIdStr,
+            customer_id: vente.customer_id,
+            client_name: vente.nom_client_snap,
+            montant: montantAEncaisser,
+            payment_method_id,
+            moyen_paiement,
+            user_id: secureUserId,
+            caissier_id: secureUserId,
+            company_id: companyStr,
+            statut: 'VALIDEE',
+            type_paiement,
+            sync_status: 'synced'
+        }], { session });
 
-        db.prepare(`
-            UPDATE sales 
-            SET montant_paye = ?, reste_a_payer = ?, payment_status = ?, sync_status = 'pending', updated_at = DATETIME('now')
-            WHERE id = ?
-        `).run(nouveauMontantPayeEntete, nouveauResteEntete, nouveauStatutPaiement, saleId);
+        await CloudSale.updateOne(
+            { _id: vente._id },
+            { 
+                $set: { 
+                    montant_paye: nouveauMontantPayeEntete, 
+                    reste_a_payer: nouveauResteEntete, 
+                    payment_status: nouveauStatutPaiement, 
+                    updated_at: new Date() 
+                } 
+            }
+        ).session(session);
 
-        db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('sales', ?, 'UPDATE', ?)")
-          .run(saleId, secureCompanyId);
+        await session.commitTransaction();
+        session.endSession();
 
         return { success: true, paymentId, nouveauReste: nouveauResteEntete };
-    });
-
-    return executeTransaction(); 
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
 const getClientByFacture = async (id, companyId) => {
-    const db = getDb();
-    try {
-        return db.prepare(`
-            SELECT nom_client_snap 
-            FROM sales 
-            WHERE id = ? AND company_id = ?
-        `).get(id, companyId);
-    } catch (error) {
-        console.error("Erreur dans le service getClientByFacture:", error.message);
-        throw error;
-    }
+    const companyStr = companyId.toString();
+    return await CloudSale.findOne({ 
+        $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }], 
+        company_id: companyStr 
+    }).select('nom_client_snap').lean();
 };
 
 const getVraiesFacturesConsignation = async (companyId) => {
-    const db = getDb();
-    try {
-        return db.prepare(`
-            SELECT id, lot_id, nom_client_snap 
-            FROM sales 
-            WHERE company_id = ? AND statut_vente = 'VALIDEE'
-            ORDER BY date_vente DESC
-        `).all(companyId);
-    } catch (error) {
-        console.error("Erreur service getVraiesFacturesConsignation:", error.message);
-        throw error;
-    }
+    const companyStr = companyId.toString();
+    const sales = await CloudSale.find({ company_id: companyStr, statut_vente: 'VALIDEE' }).sort({ date_vente: -1 }).lean();
+    return sales.map(s => ({
+        id: s.localId || s._id.toString(),
+        lot_id: s.lot_id,
+        nom_client_snap: s.nom_client_snap
+    }));
 };
 
 const getSalesDetailsByDate = async (startDate, endDate, companyId) => {
-    try {
-        const db = getDb();
-        
-        const [sDay, sMonth, sYear] = startDate.split('/');
-        const isoStartDate = `${sYear}-${sMonth}-${sDay}T00:00:00.000Z`;
-        
-        const [eDay, eMonth, eYear] = endDate.split('/');
-        const isoEndDate = `${eYear}-${eMonth}-${eDay}T23:59:59.999Z`;
+    const companyStr = companyId.toString();
+    const [sDay, sMonth, sYear] = startDate.split('/');
+    const isoStartDate = new Date(`${sYear}-${sMonth}-${sDay}T00:00:00.000Z`);
+    
+    const [eDay, eMonth, eYear] = endDate.split('/');
+    const isoEndDate = new Date(`${eYear}-${eMonth}-${eDay}T23:59:59.999Z`);
 
-        return db.prepare(`
-            SELECT 
-                i.product_id as id_article,
-                i.nom_article_snap as nom_article,
-                SUM(i.quantite) as quantite,
-                i.prix_achat_unitaire_snap as prix_achat, 
-                SUM(i.montant_achat_total_snap) as total_achat_facture,
-                i.prix_vente_unitaire as prix_unitaire,
-                SUM(i.montant_ttc_ligne) as total_vente_facture,
-                IFNULL(u.libelle, 'Unité') as unite_libelle, 
-                IFNULL(u.coefficient, 1) as unit_coefficient,
-                IFNULL(u.code, 'CS') as unit_code_gros,
-                IFNULL(u.unite_reference, 'PCS') as unit_ref_detail,
-                s.customer_id as customer_id,
-                IFNULL(s.nom_client_snap, 'CLIENT AU COMPTANT') as client_nom
-            FROM sale_items i
-            JOIN sales s ON i.id_vente = s.id
-            LEFT JOIN unites u ON i.company_id = u.company_id AND u.id = (SELECT unite_id FROM products WHERE id = i.product_id)        
-            WHERE s.company_id = ? 
-              AND s.date_vente BETWEEN ? AND ?
-              AND s.statut_vente = 'VALIDEE'
-              AND i.is_active = 1
-            GROUP BY i.product_id, i.prix_vente_unitaire, i.prix_achat_unitaire_snap, s.customer_id, s.nom_client_snap
-            ORDER BY i.nom_article_snap ASC
-        `).all(companyId, isoStartDate, isoEndDate);
-    } catch (error) {
-        console.error("❌ Erreur SQL dans getSalesDetailsByDate:", error);
-        throw error;
+    const sales = await CloudSale.find({ 
+        company_id: companyStr, 
+        statut_vente: 'VALIDEE',
+        date_vente: { $gte: isoStartDate, $lte: isoEndDate }
+    }).lean();
+
+    const saleIds = sales.map(s => s.localId || s._id.toString());
+    const items = await CloudSaleItem.find({ company_id: companyStr, id_vente: { $in: saleIds }, is_active: 1 }).lean();
+
+    const groupedMap = {};
+
+    for (const item of items) {
+        const sale = sales.find(s => (s.localId || s._id.toString()) === item.id_vente);
+        if (!sale) continue;
+
+        const key = `${item.product_id}_${item.prix_vente_unitaire}_${item.prix_achat_unitaire_snap}_${sale.customer_id}`;
+        if (!groupedMap[key]) {
+            let unitCoefficient = 1;
+            let unitCodeGros = 'CS';
+            let unitRefDetail = 'PCS';
+            let uniteLibelle = 'Unité';
+
+            if (item.product_id) {
+                const prod = await CloudProduct.findOne({ 
+                    $or: [{ localId: item.product_id }, { _id: mongoose.isValidObjectId(item.product_id) ? item.product_id : null }] 
+                }).lean();
+                if (prod && prod.unite_id) {
+                    const un = await CloudUnite.findOne({ 
+                        $or: [{ localId: prod.unite_id }, { _id: mongoose.isValidObjectId(prod.unite_id) ? prod.unite_id : null }] 
+                    }).lean();
+                    if (un) {
+                        unitCoefficient = un.coefficient || 1;
+                        unitCodeGros = un.code || 'CS';
+                        unitRefDetail = un.unite_reference || 'PCS';
+                        uniteLibelle = un.libelle || 'Unité';
+                    }
+                }
+            }
+
+            groupedMap[key] = {
+                id_article: item.product_id,
+                nom_article: item.nom_article_snap,
+                quantite: 0,
+                prix_achat: item.prix_achat_unitaire_snap,
+                total_achat_facture: 0,
+                prix_unitaire: item.prix_vente_unitaire,
+                total_vente_facture: 0,
+                unite_libelle: uniteLibelle,
+                unit_coefficient: unitCoefficient,
+                unit_code_gros: unitCodeGros,
+                unit_ref_detail: unitRefDetail,
+                customer_id: sale.customer_id,
+                client_nom: sale.nom_client_snap || 'CLIENT AU COMPTANT'
+            };
+        }
+
+        groupedMap[key].quantite += Number(item.quantite || 0);
+        groupedMap[key].total_achat_facture += Number(item.montant_achat_total_snap || 0);
+        groupedMap[key].total_vente_facture += Number(item.montant_ttc_ligne || 0);
     }
+
+    return Object.values(groupedMap).sort((a, b) => a.nom_article.localeCompare(b.nom_article));
 };
 
 module.exports = { 

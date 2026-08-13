@@ -3,13 +3,9 @@ const cors = require('cors');
 const path = require('path');
 const http = require('http');
 const { Server } = require('socket.io');
-const { io: ioClient } = require('socket.io-client');
-const { initDatabase, initFinancialData, getDb } = require('./config/database');
+const { initDatabase } = require('./config/database');
 const { verifyToken } = require('./middlewares/auth.middleware');
 const { gatekeeper } = require('./middlewares/permissionManager');
-const LoadService = require('./services/load.service');
-const { syncLocalToCloud, syncCloudToLocal } = require('./services/sync.service');
-const { restoreFromCloud } = require('./services/restore.service');
 
 // --- IMPORTATION DES ROUTES ---
 const authRoutes = require('./routes/auth.routes');
@@ -53,7 +49,6 @@ const methodPaiementRoutes = require('./routes/MethodPaiement.routes');
 const clotureRoutes = require('./routes/clotureJournalier.route');
 const loadRoutes = require('./routes/load.routes');
 const emballageRoutes = require('./routes/emballages.routes');
-const regleConsignationRoutes = require('./routes/RegleConsignation.routes');
 const achatemballagesRoutes = require('./routes/achatemballages.routes');
 const RegleConsignationRoutes = require('./routes/RegleConsignation.routes');
 const tableRoutes = require('./routes/table.routes');
@@ -61,84 +56,23 @@ const stockAdjustmentRoutes = require('./routes/stockajustement.routes');
 const consignationRoutes = require('./routes/consignation.routes');
 const inventairePackageRoutes = require('./routes/inventairePackage.route');
 const bonCommandeRoutes = require('./routes/boncommande.route'); 
-const syncRoutes = require('./routes/sync.routes'); // 🚀 IMPORTATION DES ROUTES DE SYNCHRONISATION OFFICIELLES
 
 const app = express();
 const PORT = process.env.PORT || 3030;
 
-const setupCloudListener = (companyId) => {
-    // 🌐 Remplacement de l'ancienne URL Render par Railway
-    const CLOUD_URL = 'https://erplediexpertcloud-production.up.railway.app';
-    const cloudSocket = ioClient(CLOUD_URL, {
-        transports: ['websocket'],
-        reconnection: true,
-        reconnectionAttempts: Infinity
-    });
-
-    cloudSocket.on('connect', () => {
-        console.log('📡 Connecté au Cloud');
-        cloudSocket.emit('join_company', String(companyId));
-    });
-
-    cloudSocket.on('DATA_CHANGED_ON_CLOUD', async () => {
-        console.log('⚡ Synchronisation instantanée...');
-        try {
-            await syncCloudToLocal(companyId);
-            console.log('✅ Synchronisation OK');
-        } catch (err) {
-            console.error('❌ Erreur Sync:', err.message);
-        }
-    });
-
-    cloudSocket.on('disconnect', () => {
-        console.log('⚠️ Déconnecté du Cloud');
-    });
-};
-
-function startServer() {
-    console.log('🚀 Démarrage du serveur backend...');
+async function startServer() {
+    console.log('🚀 Démarrage du serveur backend (100% Cloud)...');
     
-    const userDataPath = process.env.USER_DATA_PATH || __dirname;
-    console.log('📂 Dossier de données détecté :', userDataPath);
-
     try {
-        initDatabase(userDataPath);      
-        console.log('✅ Base de données initialisée.');
+        // Connexion à MongoDB Atlas
+        await initDatabase();      
+        console.log('✅ Base de données Cloud initialisée.');
     } catch (err) {
-        console.error('❌ ERREUR CRITIQUE DB :', err);
+        console.error('❌ ERREUR CRITIQUE DB CLOUD :', err);
+        process.exit(1);
     }
 
     const server = http.createServer(app);
-    const db = getDb();
-
-    let companyId = process.env.MY_COMPANY_ID;
-    if (!companyId) {
-        try {
-            const localComp = db.prepare('SELECT id FROM companies LIMIT 1').get();
-            companyId = localComp ? localComp.id : null;
-        } catch (err) {
-            console.log('⚠️ Aucune entreprise locale détectée');
-        }
-    }
-
-    // --- VÉRIFICATION LICENCE ---
-    let systemStatus = { valid: false, allowed_modules: [] };
-    try {
-        if (companyId) {
-            systemStatus = LoadService.getSystemStatus(companyId);
-            if (!systemStatus.valid) {
-                console.error('❌ LICENCE INVALIDE OU EXPIRÉE :', systemStatus.reason);
-            } else {
-                console.log('✅ LICENCE VALIDÉE | Modules:', systemStatus.allowed_modules.join(', '));
-            }
-        } else {
-            console.log('⚠️ Première installation détectée');
-            systemStatus = { valid: true, allowed_modules: ['AUTH', 'SIGNUP'] };
-        }
-    } catch (err) {
-        console.error('⚠️ Erreur licence:', err.message);
-    }
-    app.set('license', systemStatus);
 
     // --- SOCKET.IO ---
     const io = new Server(server, {
@@ -167,7 +101,6 @@ function startServer() {
 
     app.use((req, res, next) => {
         req.io = io;
-        req.db = db;
         next();
     });
 
@@ -177,25 +110,6 @@ function startServer() {
     app.use('/api/settings', require('./routes/settingsRoutes'));
     app.use('/api/company', companyRoutes);
     app.use('/api/companies', companyRoutes);
-    
-    // 🌐 MONTAGE DES ROUTES OFFICIELLES DE SYNCHRONISATION (PUSH / PULL)
-    app.use('/api/sync', syncRoutes); 
-     
-    // Route de déclenchement manuel rapide
-    app.post('/api/trigger-sync', verifyToken, async (req, res) => {
-        try {
-            if (!companyId) {
-                return res.status(400).json({ success: false, error: "Aucune entreprise configurée localement." });
-            }
-            console.log('🔄 Lancement de la synchronisation manuelle...');
-            await syncLocalToCloud();
-            await syncCloudToLocal(companyId);
-            res.json({ success: true, message: 'Synchronisation effectuée avec succès.' });
-        } catch (err) {
-            console.error('❌ Erreur lors de la synchronisation :', err.message);
-            res.status(500).json({ success: false, error: err.message });
-        }
-    });
 
     app.use(gatekeeper);
     app.use('/api/audit', verifyToken, auditRoutes);
@@ -258,23 +172,10 @@ function startServer() {
     });
 
     // --- DÉMARRAGE ÉCOUTE ---
-    server.listen(PORT, '0.0.0.0', async () => { 
-       console.log(`🟢 ERP ACTIF SUR PORT ${PORT}`);
+    server.listen(PORT, '0.0.0.0', () => { 
+       console.log(`🟢 ERP CLOUD ACTIF SUR PORT ${PORT}`);
        if (process.send) {
             process.send('SERVER_READY'); 
-       }
-
-       // 🌐 ACTIVATION DU PONT CLOUD (Temps réel & Sync initiale)
-       if (companyId) {
-            setupCloudListener(companyId);
-            try {
-                console.log('🔄 Synchronisation initiale avec le Cloud...');
-                await syncCloudToLocal(companyId);
-                await syncLocalToCloud();
-                console.log('✅ Synchronisation initiale terminée avec succès');
-            } catch (err) {
-                console.warn('⚠️ Mode hors-ligne détecté (Sync impossible pour le moment) :', err.message);
-            }
        }
     }).on('error', (err) => {
         if (err.code === 'EADDRINUSE') {

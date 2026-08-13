@@ -1,17 +1,18 @@
-const { getDb } = require('../config/database');
+// backend/controllers/Rap_Bilan.controller.js
 const BilanService = require('../services/Rap_Bilan.service');
+const { CloudRubriqueEtat } = require('../models/cloud.model');
 
 // --- RÉCUPÉRATION DU BILAN (ACTIF) ---
 exports.getBilan = async (req, res) => {
-    const db = getDb();
     const companyId = req.user?.company_id || req.user?.companyId;
     const { exerciceId, dateDebut, dateFin } = req.query;
 
     try {
-        if (!exerciceId) return res.status(400).json({ error: "ID Exercice manquant" });
+        if (!companyId) return res.status(401).json({ success: false, error: "Session invalide." });
+        if (!exerciceId) return res.status(400).json({ success: false, error: "ID Exercice manquant" });
 
-        const rows = BilanService.getRawBalance(exerciceId, companyId, dateDebut, dateFin);
-        const prevValues = BilanService.getPrevYearValues(exerciceId, companyId);
+        const rows = await BilanService.getRawBalance(exerciceId, companyId, dateDebut, dateFin);
+        const prevValues = await BilanService.getPrevYearValues(exerciceId, companyId);
         const rubValues = {};
 
         rows.forEach(row => {
@@ -78,7 +79,7 @@ exports.getBilan = async (req, res) => {
             return res;
         };
 
-        const structure = db.prepare("SELECT * FROM rubriques_etats WHERE company_id = ? ORDER BY ordre").all(companyId);
+        const structure = await CloudRubriqueEtat.find({ company_id: companyId.toString() }).sort({ ordre: 1 }).lean();
         const results = structure.map(r => {
             const v = calculate(r.code);
             return {
@@ -93,45 +94,31 @@ exports.getBilan = async (req, res) => {
             passif: results.filter(x => x.type_etat === 'PASSIF') 
         });
 
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) { 
+        console.error("❌ Erreur getBilan:", err.message);
+        res.status(500).json({ success: false, error: err.message }); 
+    }
 };
 
 // --- RÉCUPÉRATION DU PASSIF DÉTAILLÉ ---
 exports.getPassif = async (req, res) => {
-    const db = getDb();
     const companyId = req.user?.company_id || req.user?.companyId;
     const { exerciceId, dateDebut, dateFin } = req.query;
 
     try {
-        if (!exerciceId) return res.status(400).json({ error: "ID Exercice manquant" });
+        if (!companyId) return res.status(401).json({ success: false, error: "Session invalide." });
+        if (!exerciceId) return res.status(400).json({ success: false, error: "ID Exercice manquant" });
 
         // 1. RESULTAT NET N
-        const sqlResN = `
-            SELECT SUM(
-                (SELECT IFNULL(SUM(montant_debit - montant_credit), 0) FROM reports_a_nouveau WHERE exercice_id = ? AND num_compte = p.numero_compte AND company_id = ?)
-                + 
-                (SELECT IFNULL(SUM(debit - credit), 0) FROM lignes_ecritures 
-                 WHERE exercice_id = ? AND num_compte = p.numero_compte AND company_id = ? AND is_deleted = 0 
-                 AND date_ecriture >= ? AND date_ecriture <= ?
-                 AND journal_id NOT IN (SELECT id FROM journaux WHERE type_journal = 'RAN' OR code = 'RAN'))
-            ) as solde_global
-            FROM plan_comptable p
-            WHERE p.company_id = ? AND (p.numero_compte GLOB '[6-7]*' OR p.numero_compte GLOB '8*')
-        `;
-        const resN = db.prepare(sqlResN).get(exerciceId, companyId, exerciceId, companyId, dateDebut, dateFin, companyId);
-        const resultatNetN = (resN.solde_global || 0) * -1;
+        const resN = await BilanService.getCalculResultatNetN(exerciceId, companyId, dateDebut, dateFin);
+        const resultatNetN = (resN || 0) * -1;
 
         // 2. RESULTAT NET N-1
-        const sqlResN1 = `
-            SELECT SUM(montant_debit - montant_credit) as solde_ran_gestion
-            FROM reports_a_nouveau 
-            WHERE exercice_id = ? AND company_id = ? AND (num_compte GLOB '[6-7]*' OR num_compte GLOB '8*')
-        `;
-        const resN1 = db.prepare(sqlResN1).get(exerciceId, companyId);
-        const resultatNetN1 = (resN1.solde_ran_gestion || 0) * -1;
+        const resN1 = await BilanService.getCalculResultatNetN1(exerciceId, companyId);
+        const resultatNetN1 = (resN1 || 0) * -1;
 
         // 3. COMPTES DE BILAN
-        const rows = BilanService.getRawBalance(exerciceId, companyId, dateDebut, dateFin);
+        const rows = await BilanService.getRawBalance(exerciceId, companyId, dateDebut, dateFin);
 
         const vN = {}; const vN1 = {};
         const codes = ['CA','CB','CD','CE','CF','CG','CH','CI','CJ','CL','CM','DA','DB','DC','DH','DI','DJ','DK','DM','DN','DQ','DR','DV'];
@@ -219,5 +206,8 @@ exports.getPassif = async (req, res) => {
             code: s.code, libelle: s.libelle, montant_net: s.n, montant_prec: s.n1 
         }))});
 
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) { 
+        console.error("❌ Erreur getPassif:", err.message);
+        res.status(500).json({ success: false, error: err.message }); 
+    }
 };

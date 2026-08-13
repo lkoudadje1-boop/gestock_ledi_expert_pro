@@ -1,12 +1,21 @@
-const { getDb } = require('../config/database');
+// backend/controllers/SaisieAnalytique.controller.js
 const AnalytiqueService = require('../services/SaisieAnalytique.service');
+const { 
+    CloudLigneAnalytique, 
+    CloudPlanAnalytique, 
+    CloudDepartement, 
+    CloudAnalytiqueConfigCompte, 
+    CloudAnalytiqueAutoRepartition, 
+    CloudPlanComptable, 
+    CloudLigneEcriture 
+} = require('../models/cloud.model');
 
 // Utilitaire de contexte harmonisé
 const getContext = (req) => {
     const user = req.user || {};
     const companyId = user.companyId || user.company_id;
     return {
-        companyId: companyId,
+        companyId: companyId ? companyId.toString() : null,
         userId: user.userId || user.id,
         userName: user.username || 'Utilisateur'
     };
@@ -14,21 +23,52 @@ const getContext = (req) => {
 
 // --- 1. VÉRIFICATION DU MODÈLE (MATCHING) ---
 exports.checkConfigForSaisie = async (req, res) => {
-    const db = getDb();
     const { compte_id } = req.params; 
     const { ligne_id } = req.query; 
     const { companyId } = getContext(req);
 
     try {
-        // 1. Vérifier si une ventilation existe déjà (Cas d'une modification)
-        const existingLana = db.prepare(`
-            SELECT la.plan_analytique_id, la.montant, pa.libelle as plan_libelle,
-                   la.departement_id, d.nom as departement_nom
-            FROM lignes_analytiques la 
-            JOIN plan_analytique pa ON la.plan_analytique_id = pa.id
-            JOIN departements d ON la.departement_id = d.id
-            WHERE la.ligne_ecriture_id = ? AND la.company_id = ?
-        `).all(ligne_id, companyId);
+        if (!companyId) {
+            return res.status(401).json({ success: false, error: "Session invalide." });
+        }
+
+        // 1. Vérifier si une ventilation existe déjà (Cas d'une modification) via agrégation Mongoose
+        const existingLana = await CloudLigneAnalytique.aggregate([
+            {
+                $match: {
+                    ligne_ecriture_id: ligne_id.toString(),
+                    company_id: companyId
+                }
+            },
+            {
+                $lookup: {
+                    from: 'cloud_plan_analytiques',
+                    localField: 'plan_analytique_id',
+                    foreignField: 'localId',
+                    as: 'pa'
+                }
+            },
+            { $unwind: '$pa' },
+            {
+                $lookup: {
+                    from: 'cloud_departements',
+                    localField: 'departement_id',
+                    foreignField: 'localId',
+                    as: 'd'
+                }
+            },
+            { $unwind: { path: '$d', preserveNullAndEmptyArrays: true } },
+            {
+                $project: {
+                    _id: 0,
+                    plan_analytique_id: 1,
+                    montant: 1,
+                    plan_libelle: '$pa.libelle',
+                    departement_id: 1,
+                    departement_nom: '$d.nom'
+                }
+            }
+        ]);
 
         if (existingLana.length > 0) {
             const repartitions = {};
@@ -43,23 +83,51 @@ exports.checkConfigForSaisie = async (req, res) => {
         }
 
         // 2. Sinon chercher la configuration automatique liée au compte
-        const config = db.prepare(`
-            SELECT id, mode_saisie FROM analytique_config_comptes 
-            WHERE (
-                compte_general_id = ? 
-                OR compte_general_id = (SELECT id FROM plan_comptable WHERE numero_compte = ? AND company_id = ?)
-            )
-            AND company_id = ? AND is_deleted = 0
-        `).get(compte_id, compte_id, companyId, companyId);
+        let compteGeneralId = compte_id;
+        // Si compte_id n'est pas le localId mais un numéro de compte, on cherche le plan comptable
+        const planCompte = await CloudPlanComptable.findOne({ numero_compte: compte_id, company_id: companyId }).lean();
+        if (planCompte) {
+            compteGeneralId = planCompte.localId;
+        }
+
+        const config = await CloudAnalytiqueConfigCompte.findOne({
+            $or: [
+                { compte_general_id: compte_id.toString() },
+                { compte_general_id: compteGeneralId }
+            ],
+            company_id: companyId,
+            is_deleted: { $ne: 1 }
+        }).lean();
 
         if (!config) return res.json({ success: true, data: null });
 
-        const lines = db.prepare(`
-            SELECT r.plan_analytique_id, r.pourcentage, r.montant, p.libelle, p.parent_dept_id
-            FROM analytique_auto_repartition r
-            JOIN plan_analytique p ON r.plan_analytique_id = p.id
-            WHERE r.config_id = ? AND r.is_deleted = 0
-        `).all(config.id);
+        const lines = await CloudAnalytiqueAutoRepartition.aggregate([
+            {
+                $match: {
+                    config_id: config.localId,
+                    is_deleted: { $ne: 1 }
+                }
+            },
+            {
+                $lookup: {
+                    from: 'cloud_plan_analytiques',
+                    localField: 'plan_analytique_id',
+                    foreignField: 'localId',
+                    as: 'p'
+                }
+            },
+            { $unwind: '$p' },
+            {
+                $project: {
+                    _id: 0,
+                    plan_analytique_id: 1,
+                    pourcentage: 1,
+                    montant: 1,
+                    libelle: '$p.libelle',
+                    parent_dept_id: '$p.parent_dept_id'
+                }
+            }
+        ]);
 
         const repartitions = {};
         const details_plans = {};
@@ -70,75 +138,111 @@ exports.checkConfigForSaisie = async (req, res) => {
 
         res.json({ success: true, isUpdate: false, data: { mode_saisie: config.mode_saisie, repartitions, details_plans } });
     } catch (err) {
+        console.error("❌ Erreur checkConfigForSaisie:", err.message);
         res.status(500).json({ success: false, error: err.message });
     }
 };
 
 // --- 2. ENREGISTREMENT DE LA VENTILATION ---
 exports.ventilerEcriture = async (req, res) => {
-    const db = getDb();
     const { ligne_id, repartitions } = req.body; 
     const context = getContext(req);
 
     try {
-        const ligneOriginale = db.prepare(`SELECT id, num_compte, debit, credit FROM lignes_ecritures WHERE id = ? AND company_id = ?`).get(ligne_id, context.companyId);
-        if (!ligneOriginale) return res.status(404).json({ error: "Ligne comptable introuvable." });
+        if (!context.companyId) {
+            return res.status(401).json({ success: false, error: "Session invalide." });
+        }
+
+        const ligneOriginale = await CloudLigneEcriture.findOne({ 
+            localId: ligne_id.toString(), 
+            company_id: context.companyId 
+        }).lean();
+
+        if (!ligneOriginale) return res.status(404).json({ success: false, error: "Ligne comptable introuvable." });
 
         const montantComptable = Math.abs(parseFloat(ligneOriginale.debit || 0) - parseFloat(ligneOriginale.credit || 0));
         const equilibre = AnalytiqueService.checkEquilibre(montantComptable, repartitions);
 
         if (!equilibre.isEquilibre) {
-            return res.status(400).json({ error: "DÉSÉQUILIBRE", message: `Attendu: ${equilibre.attendu}, Saisi: ${equilibre.totalVentile}` });
+            return res.status(400).json({ success: false, error: "DÉSÉQUILIBRE", message: `Attendu: ${equilibre.attendu}, Saisi: ${equilibre.totalVentile}` });
         }
 
-        db.transaction(() => {
-            // Nettoyage de l'ancienne ventilation
-            db.prepare(`DELETE FROM lignes_analytiques WHERE ligne_ecriture_id = ?`).run(ligne_id);
+        // Nettoyage de l'ancienne ventilation
+        await CloudLigneAnalytique.deleteMany({ ligne_ecriture_id: ligne_id.toString(), company_id: context.companyId });
 
-            const stmt = db.prepare(`
-                INSERT INTO lignes_analytiques (id, company_id, ligne_ecriture_id, plan_analytique_id, departement_id, num_compte, montant, sync_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-            `);
-
-            for (const row of repartitions) {
-                const finalDeptId = AnalytiqueService.resolveDepartement(db, row);
-                stmt.run(AnalytiqueService.generateLanaId(), context.companyId, ligne_id, row.plan_analytique_id, finalDeptId, ligneOriginale.num_compte, parseFloat(row.montant));
-            }
-        })();
+        // Insertion des nouvelles lignes analytiques
+        for (const row of repartitions) {
+            const finalDeptId = await AnalytiqueService.resolveDepartement(row, context.companyId);
+            await CloudLigneAnalytique.create({
+                localId: AnalytiqueService.generateLanaId(),
+                company_id: context.companyId,
+                ligne_ecriture_id: ligne_id.toString(),
+                plan_analytique_id: row.plan_analytique_id.toString(),
+                departement_id: finalDeptId ? finalDeptId.toString() : null,
+                num_compte: ligneOriginale.num_compte,
+                montant: parseFloat(row.montant),
+                sync_status: 'synced'
+            });
+        }
 
         // 🔥 SIGNAL SOCKET
         if (req.io && context.companyId) {
             const room = String(context.companyId);
-            // Signal universel pour les rapports analytiques
             req.io.to(room).emit('DATA_EVENT', { 
                 table: 'analytic_entries', 
                 action: 'UPDATE', 
                 parent_id: ligne_id 
             });
-            // Signal UI pour mettre à jour l'icône de ventilation dans le journal
             req.io.to(room).emit('REFRESH_JOURNAL_ENTRIES', { action: 'VENTILATION_UPDATE' });
         }
 
         res.json({ success: true, message: "Ventilation analytique enregistrée." });
     } catch (err) {
+        console.error("❌ Erreur ventilerEcriture:", err.message);
         res.status(500).json({ success: false, error: err.message });
     }
 };
 
 // --- 3. RÉCUPÉRATION DU PLAN ANALYTIQUE (Lecture seule) ---
-exports.getPlanAnalytique = (req, res) => {
-    const db = getDb();
+exports.getPlanAnalytique = async (req, res) => {
     const { companyId } = getContext(req);
     try {
-        const rows = db.prepare(`
-            SELECT pa.id, pa.code, pa.libelle, pa.parent_dept_id as departement_id, d.nom as departement_nom 
-            FROM plan_analytique pa
-            LEFT JOIN departements d ON pa.parent_dept_id = d.id 
-            WHERE pa.company_id = ? AND pa.is_deleted = 0 
-            ORDER BY pa.code ASC
-        `).all(companyId);
+        if (!companyId) {
+            return res.status(401).json({ success: false, error: "Session invalide." });
+        }
+
+        const rows = await CloudPlanAnalytique.aggregate([
+            {
+                $match: {
+                    company_id: companyId,
+                    is_deleted: { $ne: 1 }
+                }
+            },
+            {
+                $lookup: {
+                    from: 'cloud_departements',
+                    localField: 'parent_dept_id',
+                    foreignField: 'localId',
+                    as: 'd'
+                }
+            },
+            { $unwind: { path: '$d', preserveNullAndEmptyArrays: true } },
+            {
+                $project: {
+                    _id: 0,
+                    id: '$localId',
+                    code: 1,
+                    libelle: 1,
+                    departement_id: '$parent_dept_id',
+                    departement_nom: '$d.nom'
+                }
+            },
+            { $sort: { code: 1 } }
+        ]);
+
         res.json({ success: true, data: rows });
     } catch (err) {
+        console.error("❌ Erreur getPlanAnalytique:", err.message);
         res.status(500).json({ success: false, error: err.message });
     }
 };

@@ -1,3 +1,4 @@
+// backend/controllers/stockajustement.controller.js
 const StockAdjustmentService = require('../services/stockajustement.service');
 
 const StockAdjustmentController = {
@@ -7,6 +8,7 @@ const StockAdjustmentController = {
     getProducts: async (req, res) => {
         const companyId = (req.user?.companyId || req.user?.company_id || req.headers['x-company-id'])?.toString();
         try {
+            if (!companyId) return res.status(401).json({ success: false, error: "Entreprise non identifiée." });
             const products = await StockAdjustmentService.getProductsForAdjustment(companyId);
             return res.json({ success: true, products });
         } catch (err) {
@@ -19,7 +21,6 @@ const StockAdjustmentController = {
      * Crée et valide un nouvel ajustement
      */
     create: async (req, res) => {
-        // 🛡️ SÉCURISATION DU CONTEXTE : Alignement strict avec le format fonctionnel des ventes
         const secureUserId = (req.user?.userId || req.user?.id || req.user?.id_utilisateur)?.toString();
         const secureCompanyId = (req.user?.companyId || req.user?.company_id || req.headers['x-company-id'])?.toString();
         const userName = req.user?.username || req.user?.nom || 'Utilisateur';
@@ -35,7 +36,6 @@ const StockAdjustmentController = {
         }
 
         try {
-            // Unification de la structure de l'objet de contexte attendu par le service révisé
             const userContext = { secureUserId, secureCompanyId, userName };
 
             // ✅ APPEL AU SERVICE AVEC L'OBJET CONTEXTE SÉCURISÉ
@@ -45,7 +45,7 @@ const StockAdjustmentController = {
                 userContext
             );
 
-            // 🚀 ÉMISSION SOCKET (Optionnelle mais recommandée si req.io est dispo)
+            // 🚀 ÉMISSION SOCKET
             if (req.io) {
                 const room = secureCompanyId;
                 req.io.to(room).emit('DATA_EVENT', { table: 'stock_adjustments', action: 'INSERT' });
@@ -66,6 +66,7 @@ const StockAdjustmentController = {
     getHistory: async (req, res) => {
         const companyId = (req.user?.companyId || req.user?.company_id || req.headers['x-company-id'])?.toString();
         try {
+            if (!companyId) return res.status(401).json({ success: false, error: "Entreprise non identifiée." });
             const history = await StockAdjustmentService.getAdjustmentsHistory(companyId);
             return res.json({ success: true, data: history });
         } catch (err) {
@@ -81,6 +82,7 @@ const StockAdjustmentController = {
         const companyId = (req.user?.companyId || req.user?.company_id || req.headers['x-company-id'])?.toString();
         const { id } = req.params;
         try {
+            if (!companyId) return res.status(401).json({ success: false, error: "Entreprise non identifiée." });
             const details = await StockAdjustmentService.getAdjustmentDetails(id, companyId);
             return res.json({ success: true, data: details });
         } catch (err) {

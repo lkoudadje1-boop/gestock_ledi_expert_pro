@@ -1,4 +1,4 @@
-const { getDb } = require('../config/database');
+// backend/services/Rap_tafir.service.js
 
 class TafirService {
     /**

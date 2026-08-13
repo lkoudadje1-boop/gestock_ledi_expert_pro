@@ -1,100 +1,112 @@
-const { getDb } = require('../config/database');
+// backend/services/emballages.services.js
+const mongoose = require('mongoose');
+const { 
+    CloudPackaging, CloudUnite, CloudPackagingRule, 
+    CloudPackagingRuleTier, CloudAuditLog 
+} = require('../models/cloud.model');
 const { logAction } = require('../utils/auditHelper');
 
 function genererIdArticle() {
     return `EMB-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 100)}`;
 }
 
-exports.createPackaging = ({ companyId, userId, userName, data }) => {
-    const db = getDb();
-    const { nom, unite_id, rule_id, prix_consigne, prix_deconsigne, prix_achat, stock_alerte } = data;
-    
+exports.createPackaging = async ({ companyId, userId, userName, data }) => {
+    const { nom, unite_id, rule_id, prix_consigne, prix_deconsigne, prix_achat, stock_alerte, cmp } = data;
     const packagingId = genererIdArticle();
 
-    db.transaction(() => {
-// Dans createPackaging
-db.prepare(`
-    INSERT INTO packaging (
-        id, nom, unite_id, rule_id, prix_consigne, prix_deconsigne, 
-        prix_achat, stock_alerte, company_id, sync_status, cmp -- AJOUTEZ CMP ICI
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0) -- Valeur par défaut 0
-`).run(
-    packagingId, nom.toUpperCase(), unite_id, rule_id || null, 
-    prix_consigne || 0, prix_deconsigne || 0, prix_achat || 0, 
-    stock_alerte || 0, companyId
-);
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('packaging', ?, 'INSERT', ?)
-        `).run(packagingId, companyId);
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-        logAction({
+    try {
+        await CloudPackaging.create([{
+            localId: packagingId,
+            nom: nom.toUpperCase(),
+            unite_id: unite_id || null,
+            rule_id: rule_id || null,
+            prix_consigne: prix_consigne || 0,
+            prix_deconsigne: prix_deconsigne || 0,
+            prix_achat: prix_achat || 0,
+            stock_alerte: stock_alerte || 0,
+            cmp: cmp || 0,
+            company_id: companyId.toString(),
+            sync_status: 'synced'
+        }], { session });
+
+        await logAction({
             userId,
-            userName,
+            userName: userName || 'user',
             actionType: 'INSERTION',
             tableConcernee: 'packaging',
             referenceId: packagingId,
             description: `Création de l'emballage: ${nom.toUpperCase()}`,
-            companyId
+            companyId: companyId.toString()
         });
-    })();
 
-    return packagingId;
+        await session.commitTransaction();
+        session.endSession();
+        return packagingId;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
-// Récupérer tous les emballages d'une entreprise
-// Récupérer tous les emballages d'une entreprise
-exports.getAllPackagings = (companyId) => {
-    const db = getDb();
+// Récupérer tous les emballages d'une entreprise (Cloud)
+exports.getAllPackagings = async (companyId) => {
     try {
-        // 1. On récupère les packagings, le nom de l'unité ET les infos de la règle globale
-        const packagings = db.prepare(`
-            SELECT 
-                p.*, 
-                u.nom as unite_nom,
-                r.code_regle,
-                r.libelle as regle_libelle
-            FROM packaging p
-            LEFT JOIN unites u ON p.unite_id = u.id
-            LEFT JOIN packaging_rules r ON p.rule_id = r.id
-            WHERE p.company_id = ?
-        `).all(companyId);
+        const packagings = await CloudPackaging.find({ company_id: companyId.toString() }).lean();
+        const result = [];
 
-        // 2. Pour chaque packaging, on va chercher ses paliers de règles (tiers) s'il a une règle associée
-        return packagings.map(pkg => {
-            let tiers = [];
-            
-            if (pkg.rule_id) {
-                tiers = db.prepare(`
-                    SELECT id, jours_min, jours_max, type_calcul, valeur 
-                    FROM packaging_rule_tiers 
-                    WHERE rule_id = ? AND company_id = ?
-                    ORDER BY jours_min ASC
-                `).all(pkg.rule_id, companyId);
+        for (const pkg of packagings) {
+            let uniteNom = null;
+            if (pkg.unite_id) {
+                const unite = await CloudUnite.findOne({ 
+                    $or: [{ localId: pkg.unite_id }, { _id: mongoose.isValidObjectId(pkg.unite_id) ? pkg.unite_id : null }] 
+                }).lean();
+                uniteNom = unite?.nom || null;
             }
 
-            // On assemble le tout proprement pour le frontend
-            return {
-                ...pkg,
-                regle: pkg.rule_id ? {
-                    id: pkg.rule_id,
-                    code_regle: pkg.code_regle,
-                    libelle: pkg.regle_libelle,
-                    tiers: tiers
-                } : null
-            };
-        });
+            let regleObj = null;
+            if (pkg.rule_id) {
+                const rule = await CloudPackagingRule.findOne({ 
+                    $or: [{ localId: pkg.rule_id }, { _id: mongoose.isValidObjectId(pkg.rule_id) ? pkg.rule_id : null }] 
+                }).lean();
 
+                if (rule) {
+                    const tiers = await CloudPackagingRuleTier.find({ 
+                        rule_id: pkg.rule_id, 
+                        company_id: companyId.toString() 
+                    }).sort({ jours_min: 1 }).lean();
+
+                    regleObj = {
+                        id: rule.localId || rule._id.toString(),
+                        code_regle: rule.code_regle,
+                        libelle: rule.libelle,
+                        tiers: tiers.map(t => ({
+                            id: t.localId || t._id.toString(),
+                            jours_min: t.jours_min,
+                            jours_max: t.jours_max,
+                            type_calcul: t.type_calcul,
+                            valeur: t.valeur
+                        }))
+                    };
+                }
+            }
+
+            result.push({
+                ...pkg,
+                unite_nom: uniteNom,
+                regle: regleObj
+            });
+        }
+
+        return result;
     } catch (error) {
         console.warn("⚠️ Échec de la récupération complète des packagings avec règles :", error.message);
-        
-        // Solution de secours sans jointures complexes pour éviter de bloquer l'application
         try {
-            return db.prepare(`
-                SELECT *, NULL as unite_nom, NULL as regle 
-                FROM packaging 
-                WHERE company_id = ?
-            `).all(companyId);
+            const packagings = await CloudPackaging.find({ company_id: companyId.toString() }).lean();
+            return packagings.map(pkg => ({ ...pkg, unite_nom: null, regle: null }));
         } catch (fallbackError) {
             console.error("Erreur critique sur la table packaging :", fallbackError.message);
             return [];
@@ -103,92 +115,98 @@ exports.getAllPackagings = (companyId) => {
 };
 
 // Récupérer un emballage par son ID
-exports.getPackagingById = (id, companyId) => {
-    const db = getDb();
-    return db.prepare(`
-        SELECT * FROM packaging 
-        WHERE id = ? AND company_id = ?
-    `).get(id, companyId);
+exports.getPackagingById = async (id, companyId) => {
+    return await CloudPackaging.findOne({ 
+        $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }],
+        company_id: companyId.toString() 
+    }).lean();
 };
 
 // Mettre à jour un emballage
-exports.updatePackaging = ({ id, companyId, userId, userName, data }) => {
-    const db = getDb();
-    const { nom, unite_id, rule_id, prix_consigne, prix_deconsigne, prix_achat, stock_alerte } = data;
+exports.updatePackaging = async ({ id, companyId, userId, userName, data }) => {
+    const { nom, unite_id, rule_id, prix_consigne, prix_deconsigne, prix_achat, stock_alerte, cmp } = data;
 
-    let info;
-    db.transaction(() => {
-     // Dans updatePackaging
-const result = db.prepare(`
-    UPDATE packaging 
-    SET nom = ?, unite_id = ?, rule_id = ?, prix_consigne = ?, 
-        prix_deconsigne = ?, prix_achat = ?, stock_alerte = ?, 
-        cmp = ?, sync_status = 'pending' -- AJOUTEZ CMP = ? ICI
-    WHERE id = ? AND company_id = ?
-`).run(
-    nom.toUpperCase(), unite_id, rule_id || null, 
-    prix_consigne || 0, prix_deconsigne || 0, prix_achat || 0, 
-    stock_alerte || 0, data.cmp || 0, id, companyId // AJOUTEZ data.cmp || 0 ICI
-);
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-        info = result.changes;
+    try {
+        const result = await CloudPackaging.updateOne(
+            { 
+                $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }],
+                company_id: companyId.toString() 
+            },
+            {
+                $set: {
+                    nom: nom.toUpperCase(),
+                    unite_id: unite_id || null,
+                    rule_id: rule_id || null,
+                    prix_consigne: prix_consigne || 0,
+                    prix_deconsigne: prix_deconsigne || 0,
+                    prix_achat: prix_achat || 0,
+                    stock_alerte: stock_alerte || 0,
+                    cmp: cmp || 0,
+                    updated_at: new Date(),
+                    sync_status: 'synced'
+                }
+            }
+        ).session(session);
 
-        if (info > 0) {
-            // Ajouter à la queue de synchro pour le serveur distant
-            db.prepare(`
-                INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-                VALUES ('packaging', ?, 'UPDATE', ?)
-            `).run(id, companyId);
-
-            // Tracer l'action
-            logAction({
+        if (result.matchedCount > 0) {
+            await logAction({
                 userId,
-                userName,
+                userName: userName || 'user',
                 actionType: 'MODIFICATION',
                 tableConcernee: 'packaging',
                 referenceId: id,
                 description: `Modification de l'emballage: ${nom.toUpperCase()}`,
-                companyId
+                companyId: companyId.toString()
             });
         }
-    })();
 
-    return info;
+        await session.commitTransaction();
+        session.endSession();
+        return result;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
 // Supprimer un emballage
-exports.deletePackaging = ({ id, companyId, userId, userName }) => {
-    const db = getDb();
-    let info;
+exports.deletePackaging = async ({ id, companyId, userId, userName }) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    db.transaction(() => {
-        // Optionnel : Récupérer le nom avant suppression pour un log d'audit plus précis
-        const current = db.prepare('SELECT nom FROM packaging WHERE id = ? AND company_id = ?').get(id, companyId);
-        
-        const result = db.prepare(`
-            DELETE FROM packaging 
-            WHERE id = ? AND company_id = ?
-        `).run(id, companyId);
+    try {
+        const current = await CloudPackaging.findOne({ 
+            $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }],
+            company_id: companyId.toString() 
+        }).lean();
 
-        info = result.changes;
+        const result = await CloudPackaging.deleteOne({ 
+            $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }],
+            company_id: companyId.toString() 
+        }).session(session);
 
-        if (info > 0) {
-            db.prepare(`
-                INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-                VALUES ('packaging', ?, 'DELETE', ?)
-            `).run(id, companyId);
-
-            logAction({
+        if (result.deletedCount > 0) {
+            await logAction({
                 userId,
-                userName,
+                userName: userName || 'user',
                 actionType: 'SUPPRESSION',
                 tableConcernee: 'packaging',
                 referenceId: id,
                 description: `Suppression de l'emballage: ${current ? current.nom : id}`,
-                companyId
+                companyId: companyId.toString()
             });
         }
-    })();
 
-    return info;
+        await session.commitTransaction();
+        session.endSession();
+        return result;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };

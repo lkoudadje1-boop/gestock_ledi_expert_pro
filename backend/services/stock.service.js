@@ -1,25 +1,29 @@
-const { getDb } = require('../config/database');
+// backend/services/stock.service.js
+const { CloudProduct } = require('../models/cloud.model');
 
 /**
  * Ajoute de la quantité au stock (Réception / Retour) avec traçabilité Cloud et multi-tenant
  */
 const addStock = async (productId, qte, companyId) => {
-    const db = getDb();
     try {
-        db.transaction(() => {
-            db.prepare(`
-                UPDATE products 
-                SET stock_actuel = stock_actuel + ?, 
-                    sync_status = 'pending',
-                    updated_at = CURRENT_TIMESTAMP 
-                WHERE id = ? AND company_id = ?
-            `).run(qte, productId, companyId);
+        const cid = companyId.toString();
+        const pid = productId.toString();
+        const quantity = Number(qte) || 0;
 
-            db.prepare(`
-                INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-                VALUES ('products', ?, 'UPDATE', ?)
-            `).run(productId, companyId);
-        })();
+        const result = await CloudProduct.updateOne(
+            { localId: pid, company_id: cid },
+            { 
+                $inc: { stock_actuel: quantity }, 
+                $set: { 
+                    sync_status: 'synced', 
+                    updated_at: new Date() 
+                } 
+            }
+        );
+
+        if (result.matchedCount === 0) {
+            throw new Error(`Produit introuvable pour l'ID : ${pid}`);
+        }
 
         return true;
     } catch (err) {
@@ -31,22 +35,32 @@ const addStock = async (productId, qte, companyId) => {
  * Retire de la quantité au stock (Vente / Perte) avec traçabilité Cloud et multi-tenant
  */
 const removeStock = async (productId, qte, companyId) => {
-    const db = getDb();
     try {
-        db.transaction(() => {
-            db.prepare(`
-                UPDATE products 
-                SET stock_actuel = stock_actuel - ?, 
-                    sync_status = 'pending',
-                    updated_at = CURRENT_TIMESTAMP 
-                WHERE id = ? AND company_id = ?
-            `).run(qte, productId, companyId);
+        const cid = companyId.toString();
+        const pid = productId.toString();
+        const quantity = Number(qte) || 0;
 
-            db.prepare(`
-                INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-                VALUES ('products', ?, 'UPDATE', ?)
-            `).run(productId, companyId);
-        })();
+        // Optionnel : vérifier si le stock est suffisant avant de décrémenter
+        const product = await CloudProduct.findOne({ localId: pid, company_id: cid }).lean();
+        if (!product) {
+            throw new Error(`Produit introuvable pour l'ID : ${pid}`);
+        }
+
+        const currentStock = Number(product.stock_actuel || 0);
+        if (currentStock < quantity) {
+            throw new Error(`Stock insuffisant pour le produit [${product.nom || pid}]. Actuel: ${currentStock}, Demandé: ${quantity}`);
+        }
+
+        await CloudProduct.updateOne(
+            { localId: pid, company_id: cid },
+            { 
+                $inc: { stock_actuel: -quantity }, 
+                $set: { 
+                    sync_status: 'synced', 
+                    updated_at: new Date() 
+                } 
+            }
+        );
 
         return true;
     } catch (err) {
@@ -58,10 +72,16 @@ const removeStock = async (productId, qte, companyId) => {
  * Récupère le stock actuel d'un produit avec isolation multi-tenant
  */
 const getStock = async (productId, companyId) => {
-    const db = getDb();
     try {
-        const row = db.prepare("SELECT stock_actuel FROM products WHERE id = ? AND company_id = ?").get(productId, companyId);
-        return row ? row.stock_actuel : 0;
+        const cid = companyId.toString();
+        const pid = productId.toString();
+
+        const product = await CloudProduct.findOne({ 
+            localId: pid, 
+            company_id: cid 
+        }).select('stock_actuel').lean();
+
+        return product ? Number(product.stock_actuel || 0) : 0;
     } catch (err) {
         throw new Error("Erreur lors de la lecture du stock : " + err.message);
     }

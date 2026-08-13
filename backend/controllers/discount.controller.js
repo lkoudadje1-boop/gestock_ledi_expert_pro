@@ -1,28 +1,21 @@
-// backend/controllers/dashboard.controller.js
-const { getDb } = require('../config/database'); // On utilise getDb pour éviter l'erreur d'initialisation
+// backend/controllers/discount.controller.js
+const { CloudProduct, CloudBranch } = require('../models/cloud.model');
 
-exports.getStats = (req, res) => {
+exports.getStats = async (req, res) => {
     try {
-        const db = getDb(); // Récupération de la base ici
-        const { companyId } = req.query;
+        const companyId = req.companyId || (req.user ? (req.user.companyId || req.user.company_id) : null) || req.query.companyId || '1';
 
-        // Requêtes sécurisées avec une valeur par défaut
-        const productCount = db.prepare(
-            "SELECT COUNT(*) as total FROM products WHERE company_id = ?"
-        ).get(companyId || 1) || { total: 0 };
+        const productCount = await CloudProduct.countDocuments({ company_id: companyId.toString() });
+        const branchCount = await CloudBranch.countDocuments({ company_id: companyId.toString() });
 
-        const branchCount = db.prepare(
-            "SELECT COUNT(*) as total FROM branches WHERE company_id = ?"
-        ).get(companyId || 1) || { total: 0 };
-
-        res.json({
-            totalProducts: productCount.total,
-            totalBranches: branchCount.total,
+        return res.json({
+            totalProducts: productCount,
+            totalBranches: branchCount,
             stockAlerts: 0,
             dailySales: "0 FCFA"
         });
     } catch (error) {
-        console.error("Erreur Stats Dashboard:", error);
-        res.status(500).json({ error: "Erreur serveur" });
+        console.error("Erreur Stats Discount/Dashboard:", error);
+        return res.status(500).json({ error: "Erreur serveur" });
     }
 };

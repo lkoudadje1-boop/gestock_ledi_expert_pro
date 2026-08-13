@@ -5,14 +5,15 @@ module.exports = {
   ENV: process.env.NODE_ENV || 'development',
   
   // Sécurité
-  JWT_SECRET: process.env.JWT_SECRET || 'MA_CLE_SUPER_SECRETE_123',
+  JWT_SECRET: process.env.JWT_SECRET, // On force la récupération depuis le .env
   SALT_ROUNDS: 10,
 
-  // Configuration Cloud (Nécessaire pour la synchronisation mono-site)
-  CLOUD_SYNC_ENABLED: true,
+  // Configuration Cloud
+  // Plus besoin de SYNC_ENABLED, nous sommes en connexion directe avec MongoDB Atlas
   
   // Paramètres par défaut de l'application
   DEFAULT_CURRENCY: 'FCFA',
   
-  // Note : Toutes les références aux IDs de succursales par défaut ont été supprimées.
+  // Temps d'expiration des sessions (utile pour le cloud)
+  JWT_EXPIRES_IN: '24h' 
 };

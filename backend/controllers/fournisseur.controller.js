@@ -1,19 +1,27 @@
+// backend/controllers/fournisseur.controller.js
 const supplierService = require('../services/fournisseur.service');
 
 // --- RÉCUPÉRER TOUS LES FOURNISSEURS ---
 exports.getAllSuppliers = async (req, res) => {
     try {
-        const suppliers = await supplierService.getAllSuppliers(req.user.companyId);
-        res.json(suppliers);
+        const companyId = req.user?.companyId || req.user?.company_id;
+        const suppliers = await supplierService.getAllSuppliers(companyId);
+        return res.json(suppliers);
     } catch (err) {
-        res.status(500).json({ error: "Erreur lors de la récupération." });
+        console.error("❌ Erreur getAllSuppliers:", err);
+        return res.status(500).json({ error: "Erreur lors de la récupération." });
     }
 };
 
 // --- CRÉER UN NOUVEAU FOURNISSEUR ---
 exports.createSupplier = async (req, res) => {
     try {
-        const supplierId = await supplierService.createSupplier(req.body, req.user, req.io);
+        const userContext = { 
+            ...req.user, 
+            userName: 'user' // Respect strict de la consigne [2026-02-08]
+        };
+
+        const supplierId = await supplierService.createSupplier(req.body, userContext);
 
         // 🔥 SIGNAL UNIVERSEL : Nouveau fournisseur créé
         if (req.io && req.user.companyId) {
@@ -24,16 +32,22 @@ exports.createSupplier = async (req, res) => {
             });
         }
 
-        res.status(201).json({ success: true, id: supplierId });
+        return res.status(201).json({ success: true, id: supplierId });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error("❌ Erreur createSupplier:", err);
+        return res.status(500).json({ error: err.message });
     }
 };
 
 // --- METTRE À JOUR UN FOURNISSEUR ---
 exports.updateSupplier = async (req, res) => {
     try {
-        const success = await supplierService.updateSupplier(req.params.id, req.body, req.user, req.io);
+        const userContext = { 
+            ...req.user, 
+            userName: 'user' 
+        };
+
+        const success = await supplierService.updateSupplier(req.params.id, req.body, userContext);
 
         // 🔥 SIGNAL UNIVERSEL : Fournisseur mis à jour
         if (req.io && req.user.companyId && success) {
@@ -44,9 +58,10 @@ exports.updateSupplier = async (req, res) => {
             });
         }
 
-        res.json({ success });
+        return res.json({ success });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error("❌ Erreur updateSupplier:", err);
+        return res.status(500).json({ error: err.message });
     }
 };
 
@@ -54,7 +69,12 @@ exports.updateSupplier = async (req, res) => {
 exports.updateStatus = async (req, res) => {
     try {
         const { is_active } = req.body;
-        const success = await supplierService.updateStatus(req.params.id, is_active, req.user, req.io);
+        const userContext = { 
+            ...req.user, 
+            userName: 'user' 
+        };
+
+        const success = await supplierService.updateStatus(req.params.id, is_active, userContext);
 
         // 🔥 SIGNAL UNIVERSEL : Statut changé
         if (req.io && req.user.companyId && success) {
@@ -66,16 +86,22 @@ exports.updateStatus = async (req, res) => {
             });
         }
 
-        res.json({ success });
+        return res.json({ success });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error("❌ Erreur updateStatus:", err);
+        return res.status(500).json({ error: err.message });
     }
 };
 
 // --- SUPPRIMER UN FOURNISSEUR ---
 exports.deleteSupplier = async (req, res) => {
     try {
-        const success = await supplierService.deleteSupplier(req.params.id, req.user, req.io);
+        const userContext = { 
+            ...req.user, 
+            userName: 'user' 
+        };
+
+        const success = await supplierService.deleteSupplier(req.params.id, userContext);
 
         // 🔥 SIGNAL UNIVERSEL : Fournisseur supprimé
         if (req.io && req.user.companyId && success) {
@@ -86,8 +112,9 @@ exports.deleteSupplier = async (req, res) => {
             });
         }
 
-        res.json({ success });
+        return res.json({ success });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        console.error("❌ Erreur deleteSupplier:", err);
+        return res.status(500).json({ error: err.message });
     }
 };

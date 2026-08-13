@@ -1,49 +1,91 @@
-const { getDb } = require('../config/database');
+// backend/services/Rap_GrandLivreComptes.service.js
+const { CloudLigneEcriture } = require('../models/cloud.model');
 
 class GrandLivreComptesService {
     /**
-     * Récupère et traite les données du Grand Livre
+     * Récupère et traite les données du Grand Livre via MongoDB Pipeline
      */
     async fetchGrandLivre(params) {
-        const db = getDb();
         const { typeGL, companyId, exerciceId, dateDebut, dateFin, deCompte, aCompte, deTiers, aTiers } = params;
+        const cid = companyId.toString();
 
-        let sql = "";
-        let queryParams = [];
+        const matchStage = {
+            company_id: cid,
+            exercice_id: exerciceId.toString(),
+            is_deleted: { $ne: 1 },
+            date_ecriture: {
+                $gte: new Date(dateDebut),
+                $lte: new Date(dateFin + 'T23:59:59.999Z')
+            }
+        };
 
         if (typeGL === 'GENERAL') {
-            sql = `
-                SELECT 
-                    e.id, e.date_ecriture, e.piece, e.facture, e.reference, e.libelle, 
-                    e.debit, e.credit, e.lettre, e.num_compte, e.num_tiers, e.journal_id, e.exercice_id,
-                    j.code as code_journal, j.type_journal, j.mode_numerotation,
-                    ex.date_debut as date_debut_ex, ex.date_fin as date_fin_ex
-                FROM lignes_ecritures e
-                JOIN journaux j ON e.journal_id = j.id
-                JOIN exercices ex ON e.exercice_id = ex.id
-                WHERE e.company_id = ? AND e.exercice_id = ? AND e.is_deleted = 0
-                AND e.date_ecriture BETWEEN ? AND ?
-                AND e.num_compte BETWEEN ? AND ?
-                ORDER BY e.num_compte ASC, e.date_ecriture ASC, e.id ASC
-            `;
-            queryParams = [companyId, exerciceId, dateDebut, dateFin, deCompte || '0', aCompte || '99999999'];
+            matchStage.num_compte = {
+                $gte: deCompte || '0',
+                $lte: aCompte || '99999999'
+            };
         } else {
-            sql = `
-                SELECT 
-                    e.*, j.code as code_journal, j.type_journal, j.mode_numerotation,
-                    ex.date_debut as date_debut_ex, ex.date_fin as date_fin_ex
-                FROM lignes_ecritures e
-                JOIN journaux j ON e.journal_id = j.id
-                JOIN exercices ex ON e.exercice_id = ex.id
-                WHERE e.company_id = ? AND e.exercice_id = ? AND e.is_deleted = 0
-                AND e.date_ecriture BETWEEN ? AND ?
-                AND e.num_tiers BETWEEN ? AND ?
-                ORDER BY e.num_tiers ASC, e.date_ecriture ASC, e.id ASC
-            `;
-            queryParams = [companyId, exerciceId, dateDebut, dateFin, deTiers || ' ', aTiers || 'ZZZZZZ'];
+            matchStage.num_tiers = {
+                $gte: deTiers || ' ',
+                $lte: aTiers || 'ZZZZZZ'
+            };
         }
 
-        const rows = db.prepare(sql).all(...queryParams);
+        const pipeline = [
+            { $match: matchStage },
+            // Jointure avec les journaux
+            {
+                $lookup: {
+                    from: 'cloud_journaux',
+                    localField: 'journal_id',
+                    foreignField: 'localId',
+                    as: 'j'
+                }
+            },
+            { $unwind: { path: '$j', preserveNullAndEmptyArrays: true } },
+            // Jointure avec les exercices
+            {
+                $lookup: {
+                    from: 'cloud_exercices',
+                    localField: 'exercice_id',
+                    foreignField: 'localId',
+                    as: 'ex'
+                }
+            },
+            { $unwind: { path: '$ex', preserveNullAndEmptyArrays: true } },
+            // Tri chronologique et par compte / tiers
+            {
+                $sort: typeGL === 'GENERAL' 
+                    ? { num_compte: 1, date_ecriture: 1, localId: 1 }
+                    : { num_tiers: 1, date_ecriture: 1, localId: 1 }
+            },
+            // Projection des champs
+            {
+                $project: {
+                    _id: 0,
+                    id: '$localId',
+                    date_ecriture: 1,
+                    piece: 1,
+                    facture: 1,
+                    reference: 1,
+                    libelle: 1,
+                    debit: 1,
+                    credit: 1,
+                    lettre: 1,
+                    num_compte: 1,
+                    num_tiers: 1,
+                    journal_id: 1,
+                    exercice_id: 1,
+                    code_journal: '$j.code',
+                    type_journal: '$j.type_journal',
+                    mode_numerotation: '$j.mode_numerotation',
+                    date_debut_ex: '$ex.date_debut',
+                    date_fin_ex: '$ex.date_fin'
+                }
+            }
+        ];
+
+        const rows = await CloudLigneEcriture.aggregate(pipeline);
 
         // --- REGROUPEMENT DU RAN ET CALCUL DES SOLDES ---
         let finalData = [];

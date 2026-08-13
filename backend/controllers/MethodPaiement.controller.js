@@ -1,3 +1,4 @@
+// backend/controllers/MethodPaiement.controller.js
 const methodService = require('../services/MethodPaiement.service');
 
 const getContext = (req) => {
@@ -5,28 +6,28 @@ const getContext = (req) => {
     return {
         companyId: user.companyId || user.company_id,
         userId: user.userId || user.id,
-        userName: user.username || 'utilisateur'
+        userName: 'user' // Respect strict de la consigne [2026-02-08]
     };
 };
 
 // 1. Récupérer la liste
-exports.getMethods = (req, res) => {
+exports.getMethods = async (req, res) => {
     try {
         const { companyId } = getContext(req);
         if (!companyId) return res.status(401).json({ error: "Session invalide." });
         
-        const methods = methodService.findAllMethods(companyId);
-        res.json({ success: true, data: methods });
+        const methods = await methodService.findAllMethods(companyId);
+        return res.json({ success: true, data: methods });
     } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
+        return res.status(500).json({ success: false, error: err.message });
     }
 };
 
 // 2. Création
-exports.creerMethod = (req, res) => {
+exports.creerMethod = async (req, res) => {
     try {
         const context = getContext(req);
-        const id = methodService.createMethod(req.body, context);
+        const id = await methodService.createMethod(req.body, context);
 
         if (req.io && context.companyId) {
             req.io.to(context.companyId.toString()).emit('DATA_EVENT', { 
@@ -35,19 +36,17 @@ exports.creerMethod = (req, res) => {
             });
         }
 
-        res.json({ success: true, message: "Moyen de paiement créé avec succès.", id });
+        return res.json({ success: true, message: "Moyen de paiement créé avec succès.", id });
     } catch (err) {
-        res.status(400).json({ error: err.message });
+        return res.status(400).json({ error: err.message });
     }
 };
 
 // 3. Modification (avec gestion du verrouillage transactionnel)
-exports.modifierMethod = (req, res) => {
+exports.modifierMethod = async (req, res) => {
     try {
         const context = getContext(req);
-        
-        // On récupère le flag isUsed renvoyé par le service
-        const isUsed = methodService.updateMethod(req.params.id, req.body, context);
+        const isUsed = await methodService.updateMethod(req.params.id, req.body, context);
 
         if (req.io && context.companyId) {
             req.io.to(context.companyId.toString()).emit('DATA_EVENT', { 
@@ -57,22 +56,21 @@ exports.modifierMethod = (req, res) => {
             });
         }
 
-        // Message adapté si le moyen est utilisé
         const message = isUsed 
             ? "Note : Seul le statut a été mis à jour car ce moyen est lié à des transactions."
             : "Moyen de paiement mis à jour avec succès.";
 
-        res.json({ success: true, message });
+        return res.json({ success: true, message });
     } catch (err) {
-        res.status(400).json({ error: err.message });
+        return res.status(400).json({ error: err.message });
     }
 };
 
 // 4. Suppression
-exports.supprimerMethod = (req, res) => {
+exports.supprimerMethod = async (req, res) => {
     try {
         const { companyId } = getContext(req);
-        methodService.deleteMethod(req.params.id, companyId);
+        await methodService.deleteMethod(req.params.id, companyId);
 
         if (req.io && companyId) {
             req.io.to(companyId.toString()).emit('DATA_EVENT', { 
@@ -82,9 +80,8 @@ exports.supprimerMethod = (req, res) => {
             });
         }
 
-        res.json({ success: true, message: "Moyen de paiement supprimé avec succès." });
+        return res.json({ success: true, message: "Moyen de paiement supprimé avec succès." });
     } catch (err) {
-        // Erreur 403 (Interdit) ou 500 si c'est utilisé
-        res.status(err.message.includes('🔒') ? 403 : 500).json({ error: err.message });
+        return res.status(err.message.includes('🔒') ? 403 : 500).json({ error: err.message });
     }
 };

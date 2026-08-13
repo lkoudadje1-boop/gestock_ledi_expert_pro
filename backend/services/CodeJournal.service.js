@@ -1,157 +1,187 @@
-const { getDb } = require('../config/database');
+// backend/services/CodeJournal.service.js
+const mongoose = require('mongoose');
+const { CloudJournal, CloudEcriture, CloudExercice, CloudPlanComptable, CloudAuditLog } = require('../models/cloud.model');
 const { logAction } = require('../utils/auditHelper');
 
 /**
- * Récupère la liste des journaux avec le compte des écritures
+ * Récupère la liste des journaux avec une agrégation pour vérifier les écritures
  */
-exports.findAllJournaux = (companyId) => {
-    const db = getDb();
-    return db.prepare(`
-        SELECT 
-            j.*, 
-            pc.numero_compte as compte_numero, 
-            pc.intitule as compte_libelle,
-            (SELECT COUNT(*) FROM ecritures WHERE journal_id = j.id) as has_entries
-        FROM journaux j
-        LEFT JOIN plan_comptable pc ON j.compte_contrepartie_id = pc.id
-        WHERE j.company_id = ? 
-        ORDER BY j.type_journal, j.code ASC
-    `).all(companyId);
+exports.findAllJournaux = async (companyId) => {
+    // Pipeline d'agrégation pour remplacer la jointure et le count SQL
+    return await CloudJournal.aggregate([
+        { $match: { company_id: companyId.toString() } },
+        {
+            $lookup: {
+                from: 'plan_comptable',
+                localField: 'compte_contrepartie_id',
+                foreignField: 'localId',
+                as: 'compte'
+            }
+        },
+        { $unwind: { path: '$compte', preserveNullAndEmptyArrays: true } },
+        {
+            $lookup: {
+                from: 'ecritures',
+                localField: 'localId',
+                foreignField: 'journal_id',
+                as: 'ecritures'
+            }
+        },
+        {
+            $project: {
+                _id: 1,
+                localId: 1,
+                code: 1,
+                libelle: 1,
+                type_journal: 1,
+                mode_numerotation: 1,
+                compte_numero: '$compte.numero_compte',
+                compte_libelle: '$compte.intitule',
+                has_entries: { $gt: [{ $size: '$ecritures' }, 0] }
+            }
+        },
+        { $sort: { type_journal: 1, code: 1 } }
+    ]);
 };
 
 /**
- * Logique de création d'un journal
+ * Logique de création d'un journal (Cloud)
  */
-exports.createJournal = (data, user) => {
-    const db = getDb();
+exports.createJournal = async (data, user) => {
     const { code, libelle, type_journal, mode_numerotation, compte_contrepartie_id, contrepartie_auto } = data;
     const { companyId, userId, userName } = user;
-
-    const id = `JR-${Date.now()}`;
     const codePropre = code.toUpperCase().trim();
 
-    // Vérifier exercice ouvert
-    const exerciceOuvert = db.prepare(`SELECT id FROM exercices WHERE company_id = ? AND statut = 'OUVERT' LIMIT 1`).get(companyId);
-    if (!exerciceOuvert) throw new Error("Aucun exercice OUVERT. Action impossible.");
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    db.transaction(() => {
-        const existe = db.prepare("SELECT id FROM journaux WHERE company_id = ? AND code = ?").get(companyId, codePropre);
+    try {
+        const exerciceOuvert = await CloudExercice.findOne({ company_id: companyId.toString(), statut: 'OUVERT' }).session(session);
+        if (!exerciceOuvert) throw new Error("Aucun exercice OUVERT. Action impossible.");
+
+        const existe = await CloudJournal.findOne({ company_id: companyId.toString(), code: codePropre }).session(session);
         if (existe) throw new Error(`Le code journal "${codePropre}" existe déjà.`);
 
-        db.prepare(`
-            INSERT INTO journaux (
-                id, company_id, code, libelle, type_journal, 
-                mode_numerotation, compte_contrepartie_id, contrepartie_auto, sync_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-        `).run(
-            id, companyId, codePropre, libelle.toUpperCase(), type_journal,
-            mode_numerotation || 'AUTO', compte_contrepartie_id || null, contrepartie_auto || 0
-        );
+        const journalId = `JR-${Date.now()}`;
+        
+        await CloudJournal.create([{
+            localId: journalId,
+            company_id: companyId.toString(),
+            code: codePropre,
+            libelle: libelle.toUpperCase(),
+            type_journal,
+            mode_numerotation: mode_numerotation || 'AUTO',
+            compte_contrepartie_id: compte_contrepartie_id || null,
+            contrepartie_auto: contrepartie_auto || 0,
+            sync_status: 'synced'
+        }], { session });
 
-        // 🔄 Ajout dans la file de synchronisation Cloud
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('journaux', ?, 'INSERT', ?)
-        `).run(id, companyId);
-
-        logAction({
-            userId, userName, actionType: 'INSERTION', tableConcernee: 'journaux', 
-            referenceId: id, description: `Création journal : ${codePropre}`, companyId
+        await logAction({
+            userId, userName, actionType: 'INSERTION', tableConcernee: 'journaux',
+            referenceId: journalId, description: `Création journal : ${codePropre}`, companyId
         });
-    })();
-    return id;
+
+        await session.commitTransaction();
+        session.endSession();
+        return journalId;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
 /**
  * Logique de modification sécurisée
  */
-exports.updateJournal = (id, data, user) => {
-    const db = getDb();
+exports.updateJournal = async (id, data, user) => {
     const { libelle, mode_numerotation, compte_contrepartie_id, contrepartie_auto } = data;
     const { companyId } = user;
 
-    const entries = db.prepare("SELECT COUNT(*) as count FROM ecritures WHERE journal_id = ?").get(id);
-    const hasEntries = entries.count > 0;
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    db.transaction(() => {
-        if (hasEntries) {
-            // VERROU : Uniquement libellé et numérotation si écritures existantes
-            db.prepare(`
-                UPDATE journaux 
-                SET libelle = ?, mode_numerotation = ?, updated_at = CURRENT_TIMESTAMP, sync_status = 'pending'
-                WHERE id = ? AND company_id = ?
-            `).run(libelle.toUpperCase(), mode_numerotation, id, companyId);
-        } else {
-            // LIBERTÉ : Modification totale possible
-            db.prepare(`
-                UPDATE journaux 
-                SET libelle = ?, mode_numerotation = ?, compte_contrepartie_id = ?, 
-                    contrepartie_auto = ?, updated_at = CURRENT_TIMESTAMP, sync_status = 'pending'
-                WHERE id = ? AND company_id = ?
-            `).run(libelle.toUpperCase(), mode_numerotation, compte_contrepartie_id || null, contrepartie_auto || 0, id, companyId);
+    try {
+        const journal = await CloudJournal.findOne({ $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }], company_id: companyId.toString() }).session(session);
+        if (!journal) throw new Error("Journal introuvable.");
+
+        const hasEntries = await CloudEcriture.exists({ journal_id: journal.localId || journal._id.toString() }).session(session);
+
+        const updateData = hasEntries 
+            ? { libelle: libelle.toUpperCase(), mode_numerotation, sync_status: 'synced', updated_at: new Date() }
+            : { libelle: libelle.toUpperCase(), mode_numerotation, compte_contrepartie_id: compte_contrepartie_id || null, contrepartie_auto: contrepartie_auto || 0, sync_status: 'synced', updated_at: new Date() };
+
+        await CloudJournal.updateOne({ _id: journal._id }, { $set: updateData }).session(session);
+
+        await session.commitTransaction();
+        session.endSession();
+        return hasEntries;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
+};
+
+/**
+ * Logique de suppression
+ */
+exports.deleteJournal = async (id, companyId) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const journal = await CloudJournal.findOne({ $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }], company_id: companyId.toString() }).session(session);
+        if (!journal) throw new Error("Journal introuvable.");
+
+        const hasEntries = await CloudEcriture.exists({ journal_id: journal.localId || journal._id.toString() }).session(session);
+        if (hasEntries) throw new Error("🔒 Impossible : ce journal contient des écritures comptables.");
+
+        await CloudJournal.deleteOne({ _id: journal._id }).session(session);
+        
+        await session.commitTransaction();
+        session.endSession();
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
+};
+
+/**
+ * Importation massive
+ */
+exports.importJournauxBatch = async (journaux, user) => {
+    const { companyId, userId, userName } = user;
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        for (const j of journaux) {
+            await CloudJournal.updateOne(
+                { code: j.code, company_id: companyId.toString() },
+                { 
+                    $set: { 
+                        libelle: j.libelle.toUpperCase(), 
+                        type_journal: j.type, 
+                        sync_status: 'synced', 
+                        updated_at: new Date() 
+                    } 
+                },
+                { upsert: true, session }
+            );
         }
 
-        // 🔄 Ajout de la mise à jour dans la file de synchronisation Cloud
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('journaux', ?, 'UPDATE', ?)
-        `).run(id, companyId);
-    })();
-    return hasEntries;
-};
-
-/**
- * Logique de suppression (Blindage strict)
- */
-exports.deleteJournal = (id, companyId) => {
-    const db = getDb();
-    const hasEcritures = db.prepare("SELECT id FROM ecritures WHERE journal_id = ? LIMIT 1").get(id);
-    if (hasEcritures) throw new Error("🔒 Impossible : ce journal contient des écritures comptables.");
-
-    db.transaction(() => {
-        // 🔄 Enregistrement de la suppression dans la file de synchronisation Cloud avant suppression effective
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('journaux', ?, 'DELETE', ?)
-        `).run(id, companyId);
-
-        db.prepare("DELETE FROM journaux WHERE id = ? AND company_id = ?").run(id, companyId);
-    })();
-};
-
-/**
- * Logique d'importation massive
- */
-exports.importJournauxBatch = (journaux, user) => {
-    const db = getDb();
-    const { companyId, userId, userName } = user;
-
-    db.transaction(() => {
-        const stmt = db.prepare(`
-            INSERT INTO journaux (
-                id, company_id, code, libelle, type_journal, 
-                mode_numerotation, contrepartie_auto, sync_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-            ON CONFLICT(code, company_id) DO UPDATE SET
-                libelle = excluded.libelle,
-                type_journal = excluded.type_journal,
-                sync_status = 'pending',
-                updated_at = CURRENT_TIMESTAMP
-        `);
-
-        const syncStmt = db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('journaux', ?, 'INSERT', ?)");
-
-        journaux.forEach((j, index) => {
-            const existing = db.prepare("SELECT id FROM journaux WHERE code = ? AND company_id = ?").get(j.code, companyId);
-            const id = existing ? existing.id : `JR-${Date.now()}-${index}`;
-
-            stmt.run(id, companyId, j.code, j.libelle.toUpperCase(), j.type, j.modeNum, j.contrepartie);
-            syncStmt.run(id, companyId);
-        });
-
-        logAction({
+        await logAction({
             userId, userName, actionType: 'IMPORTATION', tableConcernee: 'journaux',
             description: `Importation massive de ${journaux.length} journaux`, companyId
         });
-    })();
+
+        await session.commitTransaction();
+        session.endSession();
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };

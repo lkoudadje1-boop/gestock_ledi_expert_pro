@@ -1,4 +1,9 @@
-const { getDb } = require('../config/database');
+// backend/services/SaisieAnalytiqueBrouillon.service.js
+const { 
+    CloudBrouillonLigneAnalytique, 
+    CloudPlanAnalytique, 
+    CloudDepartement 
+} = require('../models/cloud.model');
 
 class SaisieAnalytiqueBrouillonService {
     /**
@@ -25,28 +30,40 @@ class SaisieAnalytiqueBrouillonService {
     }
 
     /**
-     * Résout le département ID (priorité saisie, sinon fallback plan) avec isolation multi-tenant
+     * Résout le département ID (priorité saisie, sinon fallback plan) avec isolation multi-tenant (Cloud)
      */
-    resolveDeptId(db, row, companyId) {
+    async resolveDeptId(row, companyId) {
         let finalDeptId = row.departement_id;
+        const cid = companyId.toString();
+
         if (!finalDeptId || finalDeptId === 'DEPT-INCONNU') {
-            const fallback = db.prepare(`SELECT parent_dept_id FROM plan_analytique WHERE id = ? AND company_id = ?`).get(row.plan_analytique_id, companyId);
+            const fallback = await CloudPlanAnalytique.findOne({ 
+                localId: row.plan_analytique_id.toString(), 
+                company_id: cid 
+            }).lean();
             finalDeptId = fallback ? fallback.parent_dept_id : null;
         }
 
-        const checkExist = db.prepare(`SELECT id FROM departements WHERE id = ? AND company_id = ?`).get(finalDeptId, companyId);
-        if (!checkExist) {
-            throw new Error(`Département invalide pour la section ${row.plan_analytique_id}`);
+        if (finalDeptId) {
+            const checkExist = await CloudDepartement.findOne({ 
+                localId: finalDeptId.toString(), 
+                company_id: cid 
+            }).lean();
+            if (!checkExist) {
+                throw new Error(`Département invalide pour la section ${row.plan_analytique_id}`);
+            }
+        } else {
+            throw new Error(`Aucun département valide trouvé pour la section ${row.plan_analytique_id}`);
         }
+
         return finalDeptId;
     }
 
     /**
-     * Enregistre ou met à jour les ventilations analytiques sous forme de brouillon
-     * avec traçabilité complète dans la sync_queue (Cloud).
+     * Enregistre ou met à jour les ventilations analytiques sous forme de brouillon (Cloud)
      */
-    saveBrouillonVentilation(brouillonLigneId, montantTheorique, repartitions, companyId) {
-        const db = getDb();
+    async saveBrouillonVentilation(brouillonLigneId, montantTheorique, repartitions, companyId) {
+        const cid = companyId.toString();
 
         // 1. Validation de l'équilibre
         const equilibre = this.validerEquilibre(montantTheorique, repartitions);
@@ -54,47 +71,32 @@ class SaisieAnalytiqueBrouillonService {
             throw new Error(`Déséquilibre analytique (Brouillon) : Le montant total ventilé (${equilibre.totalVentile}) ne correspond pas au montant attendu (${equilibre.attendu}).`);
         }
 
-        return db.transaction(() => {
-            const stmtSync = db.prepare(`
-                INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-                VALUES ('lignes_analytiques_brouillons', ?, ?, ?)
-            `);
+        // 2. Nettoyage préventif des anciens brouillons pour cette ligne
+        await CloudBrouillonLigneAnalytique.deleteMany({ 
+            ligne_brouillon_id: brouillonLigneId.toString(), 
+            company_id: cid 
+        });
 
-            // 2. Nettoyage préventif des anciens brouillons pour cette ligne (avec DELETE pour le Cloud)
-            const oldBrouillons = db.prepare(`SELECT id FROM lignes_analytiques_brouillons WHERE brouillon_ligne_id = ? AND company_id = ?`).all(brouillonLigneId, companyId);
-            for (const old of oldBrouillons) {
-                stmtSync.run(old.id, 'DELETE', companyId);
+        // 3. Insertion des nouveaux paliers de brouillon
+        for (const rep of repartitions) {
+            const brLanaId = this.generateBrLanaId();
+            const resolvedDeptId = await this.resolveDeptId(rep, cid);
+            const montantVal = Math.round((parseFloat(rep.montant) || 0) * 100) / 100;
+
+            if (montantVal > 0) {
+                await CloudBrouillonLigneAnalytique.create({
+                    localId: brLanaId,
+                    brouillon_ligne_id: brouillonLigneId.toString(),
+                    plan_analytique_id: rep.plan_analytique_id.toString(),
+                    departement_id: resolvedDeptId.toString(),
+                    montant: montantVal,
+                    company_id: cid,
+                    sync_status: 'synced'
+                });
             }
-            db.prepare(`DELETE FROM lignes_analytiques_brouillons WHERE brouillon_ligne_id = ? AND company_id = ?`).run(brouillonLigneId, companyId);
+        }
 
-            // 3. Insertion des nouveaux paliers de brouillon
-            const insertStmt = db.prepare(`
-                INSERT INTO lignes_analytiques_brouillons (
-                    id, brouillon_ligne_id, plan_analytique_id, departement_id, montant, company_id, sync_status
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending')
-            `);
-
-            for (const rep of repartitions) {
-                const brLanaId = this.generateBrLanaId();
-                const resolvedDeptId = this.resolveDeptId(db, rep, companyId);
-                const montantVal = Math.round((parseFloat(rep.montant) || 0) * 100) / 100;
-
-                if (montantVal > 0) {
-                    insertStmt.run(
-                        brLanaId,
-                        brouillonLigneId,
-                        rep.plan_analytique_id,
-                        resolvedDeptId,
-                        montantVal,
-                        companyId
-                    );
-
-                    stmtSync.run(brLanaId, 'INSERT', companyId);
-                }
-            }
-
-            return { success: true, count: repartitions.length };
-        })();
+        return { success: true, count: repartitions.length };
     }
 }
 

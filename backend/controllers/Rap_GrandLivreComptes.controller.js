@@ -1,8 +1,13 @@
+// backend/controllers/Rap_GrandLivreComptes.controller.js
 const GrandLivreService = require('../services/Rap_GrandLivreComptes.service');
 
 exports.getGrandLivreDynamique = async (req, res) => {
     const companyId = req.user?.company_id || req.user?.companyId;
     
+    if (!companyId) {
+        return res.status(401).json({ success: false, error: "Session invalide." });
+    }
+
     const { 
         typeGL, exerciceId, dateDebut, dateFin,
         deCompte, aCompte, deTiers, aTiers
@@ -35,25 +40,31 @@ exports.getGrandLivreDynamique = async (req, res) => {
         });
     }
 };
+
 exports.getHistoriqueIndividuelTiers = async (req, res) => {
     const { num_tiers } = req.params;
     const { exerciceId } = req.query;
     const companyId = req.user?.company_id || req.user?.companyId;
 
+    if (!companyId) {
+        return res.status(401).json({ success: false, error: "Session invalide." });
+    }
+
     try {
-        const results = await GrandLivreComptesService.fetchGrandLivre({
+        const results = await GrandLivreService.fetchGrandLivre({
             typeGL: 'TIERS',
             companyId,
             exerciceId,
-            // On fixe les dates larges pour tout voir, ou on les récupère de la query
+            // Dates larges pour capturer l'historique global du tiers
             dateDebut: '1900-01-01', 
             dateFin: '2099-12-31',
-            deTiers: num_tiers, // On restreint à ce tiers précis
+            deTiers: num_tiers, // Restreint au tiers précis
             aTiers: num_tiers
         });
 
         res.json({ success: true, data: results });
     } catch (err) {
+        console.error("❌ Erreur Historique Individuel Tiers :", err.message);
         res.status(500).json({ success: false, error: err.message });
     }
 };

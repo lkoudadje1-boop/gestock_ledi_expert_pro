@@ -1,55 +1,69 @@
-const { getDb } = require('../config/database');
-const { logAction } = require('../utils/auditHelper');
-const conversestock = require('./conversestock'); // 📦 Importation directe (Même dossier)
+// backend/services/product.service.js
+const mongoose = require('mongoose');
+const { 
+    CloudProduct, 
+    CloudProductPalier, 
+    CloudUnite, 
+    CloudProductGroup, 
+    CloudCategory, 
+    CloudFamille, 
+    CloudAuditLog,
+    CloudPurchaseItem,
+    CloudSaleItem,
+    CloudInventoryItem
+} = require('../models/cloud.model');
+const conversestock = require('./conversestock'); // 📦 Importation directe
 
 const cleanNum = (val) => Math.round((parseFloat(val) || 0) * 100) / 100;
 
 class ProductService {
     // --- CRÉATION ---
     async createProduct(d, user, io) {
-        const db = getDb();
-        const companyId = user?.companyId;
-        const userId = user?.userId;
-        const userName = user?.username || 'Utilisateur';
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            const companyId = user?.companyId || user?.company_id;
+            const userId = user?.userId || user?.id;
+            const userName = user?.username || 'Utilisateur';
 
-        if (!companyId) throw new Error("Session invalide");
+            if (!companyId) throw new Error("Session invalide");
 
-        const productId = d.id || d.id_article;
-        if (!productId) throw new Error("L'ID de l'article est manquant.");
+            const productId = d.id || d.id_article || `ART-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 100)}`;
+            const productName = d.nom ? d.nom.toUpperCase().trim() : null;
+            if (!productName) throw new Error("Le nom de l'article est obligatoire.");
 
-        const productName = d.nom ? d.nom.toUpperCase().trim() : null;
-        if (!productName) throw new Error("Le nom de l'article est obligatoire.");
+            const existing = await CloudProduct.findOne({ nom: productName, company_id: companyId.toString() }).session(session);
+            if (existing) throw new Error(`L'article "${productName}" existe déjà.`);
 
-        const existing = db.prepare(`SELECT id FROM products WHERE nom = ? AND company_id = ?`).get(productName, companyId);
-        if (existing) throw new Error(`L'article "${productName}" existe déjà.`);
+            // 🌟 RECUPERATION EN AMONT DU COEFFICIENT DE CONVERSION DE L'UNITE CHOISIE
+            let coeffUnite = 1;
+            let codeGros = 'CS';
+            let refDetail = 'BTL';
 
-        // 🌟 RECUPERATION EN AMONT DU COEFFICIENT DE CONVERSION DE L'UNITE CHOISIE
-        let coeffUnite = 1;
-        if (d.unite_id) {
-            const rowUnite = db.prepare("SELECT coefficient FROM unites WHERE id = ?").get(d.unite_id);
-            if (rowUnite && rowUnite.coefficient) {
-                coeffUnite = Number(rowUnite.coefficient) || 1;
+            if (d.unite_id) {
+                const rowUnite = await CloudUnite.findOne({ localId: d.unite_id }).session(session).lean();
+                if (rowUnite) {
+                    coeffUnite = Number(rowUnite.coefficient) || 1;
+                    codeGros = rowUnite.code || 'CS';
+                    refDetail = rowUnite.unite_reference || 'BTL';
+                }
             }
-        }
 
-        // 🌟 SÉCURISATION DU STOCK ALERTE : Utilisation du coefficient récupéré en amont
-        const chaineAlerte = String(d.stock_alerte || d.stockAlerte || 0).trim();
-        let stockAlerteValue = 0;
-        if (chaineAlerte.includes('+')) {
-            const parties = chaineAlerte.split('+');
-            const gros = parseFloat(String(parties[0]).replace(',', '.').trim()) || 0;
-            const detail = parseFloat(String(parties[1]).replace(',', '.').trim()) || 0;
-            stockAlerteValue = Math.round(gros * coeffUnite) + Math.round(detail);
-        } else {
-            stockAlerteValue = Math.round((parseFloat(chaineAlerte.replace(',', '.')) || 0) * coeffUnite);
-        }
+            // 🌟 SÉCURISATION DU STOCK ALERTE
+            const chaineAlerte = String(d.stock_alerte || d.stockAlerte || 0).trim();
+            let stockAlerteValue = 0;
+            if (chaineAlerte.includes('+')) {
+                const parties = chaineAlerte.split('+');
+                const gros = parseFloat(String(parties[0]).replace(',', '.').trim()) || 0;
+                const detail = parseFloat(String(parties[1]).replace(',', '.').trim()) || 0;
+                stockAlerteValue = Math.round(gros * coeffUnite) + Math.round(detail);
+            } else {
+                stockAlerteValue = Math.round((parseFloat(chaineAlerte.replace(',', '.')) || 0) * coeffUnite);
+            }
 
-        // Déclaration hors de la transaction pour l'utiliser dans le bloc io
-        let stockInitialBouteilles = 0;
-
-        db.transaction(() => {
-            // 🚀 CALCUL DU STOCK INITIAL EN AMONT DE L'INSERTION UNIQUE
+            // 🚀 CALCUL DU STOCK INITIAL
             const chaineStock = String(d.stock_actuel || 0).trim();
+            let stockInitialBouteilles = 0;
             if (chaineStock.includes('+')) {
                 const parties = chaineStock.split('+');
                 const grosFlottant = parseFloat(String(parties[0]).replace(',', '.').trim()) || 0;
@@ -60,54 +74,37 @@ class ProductService {
             }
 
             // 1. INSCRIPTION DU PRODUIT PRINCIPAL
-            const stmt = db.prepare(`
-                INSERT INTO products (
-                    id, nom, company_id, codeBarre, unite_id, image_path, group_id,
-                    is_active, cmp, prixVente, taxeActive, taxeTaux, stockAlerte, 
-                    stock_actuel, remiseActive,
-                    r1Active, r1Seuil, r1Montant, r1Taux, r1IsPromo, r1DateDebut, r1DateFin,
-                    r2Active, r2Seuil, r2Montant, r2Taux, r2IsPromo, r2DateDebut, r2DateFin,
-                    r3Active, r3Multiple, r3Montant, r3Taux, r3IsPromo, r3DateDebut, r3DateFin,
-                    r4Active, r4A_Max, r4A_Montant, r4A_Taux, r4B_Max, r4B_Montant, r4B_Taux, 
-                    r4C_Montant, r4C_Taux, r4IsPromo, r4DateDebut, r4DateFin, sync_status
-                ) VALUES (
-                    ?, ?, ?, ?, ?, ?, ?,
-                    1, ?, ?, ?, ?, ?, 
-                    ?, ?,
-                    ?, ?, ?, ?, ?, ?, ?, 
-                    ?, ?, ?, ?, ?, ?, ?, 
-                    ?, ?, ?, ?, ?, ?, ?, 
-                    ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending'
-                )
-            `);
-
-            stmt.run(
-                productId, productName, companyId, d.codeBarre || null, d.unite_id || null, d.image_path || null, d.group_id,
-                parseFloat(d.cmp) || 0, parseFloat(d.prixVente) || 0, d.taxeActive || 0, parseFloat(d.taxeTaux) || 0, stockAlerteValue,
-                stockInitialBouteilles, d.remiseActive || 0,
-                d.r1Active || 0, cleanNum(d.r1Seuil), cleanNum(d.r1Montant), cleanNum(d.r1Taux), d.r1IsPromo || 0, d.r1DateDebut || null, d.r1DateFin || null,
-                d.r2Active || 0, cleanNum(d.r2Seuil), cleanNum(d.r2Montant), cleanNum(d.r2Taux), d.r2IsPromo || 0, d.r2DateDebut || null, d.r2DateFin || null,
-                d.r3Active || 0, cleanNum(d.r3Multiple), cleanNum(d.r3Montant), cleanNum(d.r3Taux), d.r3IsPromo || 0, d.r3DateDebut || null, d.r3DateFin || null,
-                d.r4Active || 0, cleanNum(d.r4A_Max), cleanNum(d.r4A_Montant), cleanNum(d.r4A_Taux), cleanNum(d.r4B_Max), cleanNum(d.r4B_Montant), cleanNum(d.r4B_Taux),
-                cleanNum(d.r4C_Montant), cleanNum(d.r4C_Taux), d.r4IsPromo || 0, d.r4DateDebut || null, d.r4DateFin || null
-            );
+            await CloudProduct.create([{
+                localId: productId,
+                nom: productName,
+                company_id: companyId.toString(),
+                codeBarre: d.codeBarre || null,
+                unite_id: d.unite_id || null,
+                image_path: d.image_path || null,
+                group_id: d.group_id,
+                is_active: 1,
+                cmp: parseFloat(d.cmp) || 0,
+                prixVente: parseFloat(d.prixVente) || 0,
+                taxeActive: d.taxeActive || 0,
+                taxeTaux: parseFloat(d.taxeTaux) || 0,
+                stockAlerte: stockAlerteValue,
+                stock_actuel: stockInitialBouteilles,
+                stock_reserve: 0,
+                remiseActive: d.remiseActive || 0,
+                r1Active: d.r1Active || 0, r1Seuil: cleanNum(d.r1Seuil), r1Montant: cleanNum(d.r1Montant), r1Taux: cleanNum(d.r1Taux), r1IsPromo: d.r1IsPromo || 0, r1DateDebut: d.r1DateDebut || null, r1DateFin: d.r1DateFin || null,
+                r2Active: d.r2Active || 0, r2Seuil: cleanNum(d.r2Seuil), r2Montant: cleanNum(d.r2Montant), r2Taux: cleanNum(d.r2Taux), r2IsPromo: d.r2IsPromo || 0, r2DateDebut: d.r2DateDebut || null, r2DateFin: d.r2DateFin || null,
+                r3Active: d.r3Active || 0, r3Multiple: cleanNum(d.r3Multiple), r3Montant: cleanNum(d.r3Montant), r3Taux: cleanNum(d.r3Taux), r3IsPromo: d.r3IsPromo || 0, r3DateDebut: d.r3DateDebut || null, r3DateFin: d.r3DateFin || null,
+                r4Active: d.r4Active || 0, r4A_Max: cleanNum(d.r4A_Max), r4A_Montant: cleanNum(d.r4A_Montant), r4A_Taux: cleanNum(d.r4A_Taux), r4B_Max: cleanNum(d.r4B_Max), r4B_Montant: cleanNum(d.r4B_Montant), r4B_Taux: cleanNum(d.r4B_Taux),
+                r4C_Montant: cleanNum(d.r4C_Montant), r4C_Taux: cleanNum(d.r4C_Taux), r4IsPromo: d.r4IsPromo || 0, r4DateDebut: d.r4DateDebut || null, r4DateFin: d.r4DateFin || null,
+                sync_status: 'synced',
+                updated_at: new Date()
+            }], { session });
 
             // 2. ENREGISTREMENT COMPLEMENTAIRE DES PALIERS DE PRIX
             if (Array.isArray(d.paliers) && d.paliers.length > 0) {
-                const stmtPalier = db.prepare(`
-                    INSERT INTO product_paliers (
-                        id, product_id, company_id, quantite, prix_total, sync_status
-                    ) VALUES (?, ?, ?, ?, ?, 'pending')
-                `);
-
-                const stmtSyncPalier = db.prepare(`
-                    INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-                    VALUES ('product_paliers', ?, 'INSERT', ?)
-                `);
-
+                const paliersToInsert = [];
                 d.paliers.forEach((palier, index) => {
                     const palierId = `PAL-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`;
-                    
                     const chainePalier = String(palier.quantite || 0).trim();
                     let qteConvertieBouteilles = 0;
 
@@ -123,130 +120,148 @@ class ProductService {
                     const prixTotalVal = parseFloat(palier.prix_total) || 0;
 
                     if (qteConvertieBouteilles > 0 && prixTotalVal >= 0) {
-                        stmtPalier.run(palierId, productId, companyId, qteConvertieBouteilles, prixTotalVal);
-                        stmtSyncPalier.run(palierId, companyId);
+                        paliersToInsert.push({
+                            localId: palierId,
+                            product_id: productId,
+                            company_id: companyId.toString(),
+                            quantite: qteConvertieBouteilles,
+                            prix_total: prixTotalVal,
+                            sync_status: 'synced',
+                            updated_at: new Date()
+                        });
                     }
                 });
+
+                if (paliersToInsert.length > 0) {
+                    await CloudProductPalier.insertMany(paliersToInsert, { session });
+                }
             }
 
             // 3. SYNCHRONISATION & LOGS
-            db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('products', ?, 'INSERT', ?)`).run(productId, companyId);
-
-            logAction({
-                userId, userName, actionType: 'INSERTION',
-                tableConcernee: 'products', referenceId: productId,
+            const logId = `LOG-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+            await CloudAuditLog.create([{
+                localId: logId,
+                user_id: userId,
+                user_name: userName,
+                action_type: 'INSERTION',
+                table_concernee: 'products',
+                reference_id: productId,
                 description: `Création du produit : ${productName} avec ses paliers convertis en bouteilles unitaires via coefficient direct`,
-                companyId
-            });
-        })();
+                date_action: new Date(),
+                company_id: companyId.toString(),
+                sync_status: 'synced'
+            }], { session });
 
-        if (io) {
-            const room = companyId.toString();
-            const txtUnite = db.prepare("SELECT code, unite_reference FROM unites WHERE id = ?").get(d.unite_id);
-            const stockFormateTxt = conversestock.formaterStockPourAffichage(
-                stockInitialBouteilles, 
-                coeffUnite, 
-                txtUnite?.code || 'CS', 
-                txtUnite?.unite_reference || 'BTL'
-            );
+            await session.commitTransaction();
+            session.endSession();
 
-            io.to(room).emit('PRODUCT_CREATED', { 
-                id: productId, 
-                nom: productName, 
-                stock: stockInitialBouteilles, 
-                stock_formate: stockFormateTxt,
-                has_paliers: (d.paliers?.length > 0) 
-            });
+            if (io) {
+                const room = companyId.toString();
+                const stockFormateTxt = conversestock.formaterStockPourAffichage(
+                    stockInitialBouteilles, 
+                    coeffUnite, 
+                    codeGros, 
+                    refDetail
+                );
+
+                io.to(room).emit('PRODUCT_CREATED', { 
+                    id: productId, 
+                    nom: productName, 
+                    stock: stockInitialBouteilles, 
+                    stock_formate: stockFormateTxt,
+                    has_paliers: (d.paliers?.length > 0) 
+                });
+            }
+            return productId;
+        } catch (error) {
+            await session.abortTransaction();
+            session.endSession();
+            throw error;
         }
-        return productId;
     }
 
     // --- MISE À JOUR ---
     async updateProduct(id, d, user, io) {
-        const db = getDb();
-        const companyId = user?.companyId;
-        if (!companyId) throw new Error("Session invalide");
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            const companyId = user?.companyId || user?.company_id;
+            if (!companyId) throw new Error("Session invalide");
 
-        const oldProduct = db.prepare('SELECT nom, image_path FROM products WHERE id = ? AND company_id = ?').get(id, companyId);
-        if (!oldProduct) throw new Error("Article non trouvé");
+            const oldProduct = await CloudProduct.findOne({ localId: id, company_id: companyId.toString() }).session(session).lean();
+            if (!oldProduct) throw new Error("Article non trouvé");
 
-        const finalImagePath = (d.image_path !== undefined) ? d.image_path : oldProduct.image_path;
+            const finalImagePath = (d.image_path !== undefined) ? d.image_path : oldProduct.image_path;
 
-        let coeffUnite = 1;
-        if (d.unite_id) {
-            const rowUnite = db.prepare("SELECT coefficient FROM unites WHERE id = ?").get(d.unite_id);
-            if (rowUnite && rowUnite.coefficient) {
-                coeffUnite = Number(rowUnite.coefficient) || 1;
+            let coeffUnite = 1;
+            let codeGros = 'CS';
+            let refDetail = 'BTL';
+
+            if (d.unite_id) {
+                const rowUnite = await CloudUnite.findOne({ localId: d.unite_id }).session(session).lean();
+                if (rowUnite) {
+                    coeffUnite = Number(rowUnite.coefficient) || 1;
+                    codeGros = rowUnite.code || 'CS';
+                    refDetail = rowUnite.unite_reference || 'BTL';
+                }
             }
-        }
 
-        const chaineAlerte = String(d.stock_alerte !== undefined ? d.stock_alerte : (d.stockAlerte !== undefined ? d.stockAlerte : 0)).trim();
-        let stockAlerteValue = 0;
-        if (chaineAlerte.includes('+')) {
-            const parties = chaineAlerte.split('+');
-            const gros = parseFloat(String(parties[0]).replace(',', '.').trim()) || 0;
-            const detail = parseFloat(String(parties[1]).replace(',', '.').trim()) || 0;
-            stockAlerteValue = Math.round(gros * coeffUnite) + Math.round(detail);
-        } else {
-            stockAlerteValue = Math.round((parseFloat(chaineAlerte.replace(',', '.')) || 0) * coeffUnite);
-        }
+            const chaineAlerte = String(d.stock_alerte !== undefined ? d.stock_alerte : (d.stockAlerte !== undefined ? d.stockAlerte : 0)).trim();
+            let stockAlerteValue = 0;
+            if (chaineAlerte.includes('+')) {
+                const parties = chaineAlerte.split('+');
+                const gros = parseFloat(String(parties[0]).replace(',', '.').trim()) || 0;
+                const detail = parseFloat(String(parties[1]).replace(',', '.').trim()) || 0;
+                stockAlerteValue = Math.round(gros * coeffUnite) + Math.round(detail);
+            } else {
+                stockAlerteValue = Math.round((parseFloat(chaineAlerte.replace(',', '.')) || 0) * coeffUnite);
+            }
 
-        const chaineStock = String(d.stock_actuel !== undefined ? d.stock_actuel : 0).trim();
-        let stockActuelValue = 0;
-        if (chaineStock.includes('+')) {
-            const parties = chaineStock.split('+');
-            const grosFlottant = parseFloat(String(parties[0]).replace(',', '.').trim()) || 0;
-            const detailFlottant = parseFloat(String(parties[1]).replace(',', '.').trim()) || 0;
-            stockActuelValue = Math.round(grosFlottant * coeffUnite) + Math.round(detailFlottant);
-        } else {
-            stockActuelValue = Math.round((parseFloat(chaineStock.replace(',', '.')) || 0) * coeffUnite);
-        }
+            const chaineStock = String(d.stock_actuel !== undefined ? d.stock_actuel : 0).trim();
+            let stockActuelValue = 0;
+            if (chaineStock.includes('+')) {
+                const parties = chaineStock.split('+');
+                const grosFlottant = parseFloat(String(parties[0]).replace(',', '.').trim()) || 0;
+                const detailFlottant = parseFloat(String(parties[1]).replace(',', '.').trim()) || 0;
+                stockActuelValue = Math.round(grosFlottant * coeffUnite) + Math.round(detailFlottant);
+            } else {
+                stockActuelValue = Math.round((parseFloat(chaineStock.replace(',', '.')) || 0) * coeffUnite);
+            }
 
-        db.transaction(() => {
-            const stmt = db.prepare(`
-                UPDATE products SET 
-                    nom = ?, codeBarre = ?, unite_id = ?, image_path = ?, group_id = ?,
-                    cmp = ?, prixVente = ?, taxeActive = ?, taxeTaux = ?, stockAlerte = ?, 
-                    stock_actuel = ?, remiseActive = ?,
-                    r1Active = ?, r1Seuil = ?, r1Montant = ?, r1Taux = ?, r1IsPromo = ?, r1DateDebut = ?, r1DateFin = ?,
-                    r2Active = ?, r2Seuil = ?, r2Montant = ?, r2Taux = ?, r2IsPromo = ?, r2DateDebut = ?, r2DateFin = ?,
-                    r3Active = ?, r3Multiple = ?, r3Montant = ?, r3Taux = ?, r3IsPromo = ?, r3DateDebut = ?, r3DateFin = ?,
-                    r4Active = ?, r4A_Max = ?, r4A_Montant = ?, r4A_Taux = ?, r4B_Max = ?, r4B_Montant = ?, r4B_Taux = ?, 
-                    r4C_Montant = ?, r4C_Taux = ?, r4IsPromo = ?, r4DateDebut = ?, r4DateFin = ?,
-                    sync_status = 'pending'
-                WHERE id = ? AND company_id = ?
-            `);
-
-            stmt.run(
-                d.nom.toUpperCase(), d.codeBarre || null, d.unite_id || null, finalImagePath, d.group_id,
-                cleanNum(d.cmp), cleanNum(d.prixVente), d.taxeActive || 0, cleanNum(d.taxeTaux), 
-                stockAlerteValue, stockActuelValue, d.remiseActive || 0,
-                d.r1Active || 0, cleanNum(d.r1Seuil), cleanNum(d.r1Montant), cleanNum(d.r1Taux), d.r1IsPromo || 0, d.r1DateDebut || null, d.r1DateFin || null,
-                d.r2Active || 0, cleanNum(d.r2Seuil), cleanNum(d.r2Montant), cleanNum(d.r2Taux), d.r2IsPromo || 0, d.r2DateDebut || null, d.r2DateFin || null,
-                d.r3Active || 0, cleanNum(d.r3Multiple), cleanNum(d.r3Montant), cleanNum(d.r3Taux), d.r3IsPromo || 0, d.r3DateDebut || null, d.r3DateFin || null,
-                d.r4Active || 0, cleanNum(d.r4A_Max), cleanNum(d.r4A_Montant), cleanNum(d.r4A_Taux), cleanNum(d.r4B_Max), cleanNum(d.r4B_Montant), cleanNum(d.r4B_Taux),
-                cleanNum(d.r4C_Montant), cleanNum(d.r4C_Taux), d.r4IsPromo || 0, d.r4DateDebut || null, d.r4DateFin || null,
-                id, companyId
+            await CloudProduct.updateOne(
+                { localId: id, company_id: companyId.toString() },
+                {
+                    $set: {
+                        nom: d.nom.toUpperCase(),
+                        codeBarre: d.codeBarre || null,
+                        unite_id: d.unite_id || null,
+                        image_path: finalImagePath,
+                        group_id: d.group_id,
+                        cmp: cleanNum(d.cmp),
+                        prixVente: cleanNum(d.prixVente),
+                        taxeActive: d.taxeActive || 0,
+                        taxeTaux: cleanNum(d.taxeTaux),
+                        stockAlerte: stockAlerteValue,
+                        stock_actuel: stockActuelValue,
+                        remiseActive: d.remiseActive || 0,
+                        r1Active: d.r1Active || 0, r1Seuil: cleanNum(d.r1Seuil), r1Montant: cleanNum(d.r1Montant), r1Taux: cleanNum(d.r1Taux), r1IsPromo: d.r1IsPromo || 0, r1DateDebut: d.r1DateDebut || null, r1DateFin: d.r1DateFin || null,
+                        r2Active: d.r2Active || 0, r2Seuil: cleanNum(d.r2Seuil), r2Montant: cleanNum(d.r2Montant), r2Taux: cleanNum(d.r2Taux), r2IsPromo: d.r2IsPromo || 0, r2DateDebut: d.r2DateDebut || null, r2DateFin: d.r2DateFin || null,
+                        r3Active: d.r3Active || 0, r3Multiple: cleanNum(d.r3Multiple), r3Montant: cleanNum(d.r3Montant), r3Taux: cleanNum(d.r3Taux), r3IsPromo: d.r3IsPromo || 0, r3DateDebut: d.r3DateDebut || null, r3DateFin: d.r3DateFin || null,
+                        r4Active: d.r4Active || 0, r4A_Max: cleanNum(d.r4A_Max), r4A_Montant: cleanNum(d.r4A_Montant), r4A_Taux: cleanNum(d.r4A_Taux), r4B_Max: cleanNum(d.r4B_Max), r4B_Montant: cleanNum(d.r4B_Montant), r4B_Taux: cleanNum(d.r4B_Taux),
+                        r4C_Montant: cleanNum(d.r4C_Montant), r4C_Taux: cleanNum(d.r4C_Taux), r4IsPromo: d.r4IsPromo || 0, r4DateDebut: d.r4DateDebut || null, r4DateFin: d.r4DateFin || null,
+                        sync_status: 'synced',
+                        updated_at: new Date()
+                    }
+                },
+                { session }
             );
 
-            db.prepare('DELETE FROM product_paliers WHERE product_id = ? AND company_id = ?').run(id, companyId);
-            db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('product_paliers', ?, 'DELETE', ?)`).run(id, companyId);
+            await CloudProductPalier.deleteMany({ product_id: id, company_id: companyId.toString() }).session(session);
 
             if (Array.isArray(d.paliers) && d.paliers.length > 0) {
-                const stmtPalier = db.prepare(`
-                    INSERT INTO product_paliers (
-                        id, product_id, company_id, quantite, prix_total, sync_status
-                    ) VALUES (?, ?, ?, ?, ?, 'pending')
-                `);
-
-                const stmtSyncPalier = db.prepare(`
-                    INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-                    VALUES ('product_paliers', ?, 'INSERT', ?)
-                `);
-
+                const paliersToInsert = [];
                 d.paliers.forEach((palier, index) => {
                     const palierId = `PAL-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 6)}`;
-                    
                     const chainePalier = String(palier.quantite || 0).trim();
                     let qteConvertieBouteilles = 0;
 
@@ -262,73 +277,121 @@ class ProductService {
                     const prixTotalVal = parseFloat(palier.prix_total) || 0;
 
                     if (qteConvertieBouteilles > 0 && prixTotalVal >= 0) {
-                        stmtPalier.run(palierId, id, companyId, qteConvertieBouteilles, prixTotalVal);
-                        stmtSyncPalier.run(palierId, companyId);
+                        paliersToInsert.push({
+                            localId: palierId,
+                            product_id: id,
+                            company_id: companyId.toString(),
+                            quantite: qteConvertieBouteilles,
+                            prix_total: prixTotalVal,
+                            sync_status: 'synced',
+                            updated_at: new Date()
+                        });
                     }
                 });
+
+                if (paliersToInsert.length > 0) {
+                    await CloudProductPalier.insertMany(paliersToInsert, { session });
+                }
             }
 
-            db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('products', ?, 'UPDATE', ?)`).run(id, companyId);
-
-            logAction({
-                userId: user.userId, userName: user.username, actionType: 'MODIFICATION',
-                tableConcernee: 'products', referenceId: id,
+            const logId = `LOG-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+            await CloudAuditLog.create([{
+                localId: logId,
+                user_id: user.userId,
+                user_name: user.username,
+                action_type: 'MODIFICATION',
+                table_concernee: 'products',
+                reference_id: id,
                 description: `Mise à jour du produit : ${oldProduct.nom} avec conversion unitaire actualisée via coefficient direct.`,
-                companyId
-            });
-        })();
+                date_action: new Date(),
+                company_id: companyId.toString(),
+                sync_status: 'synced'
+            }], { session });
 
-        if (io) {
-            const txtUnite = db.prepare("SELECT code, unite_reference FROM unites WHERE id = ?").get(d.unite_id);
-            const stockFormateTxt = conversestock.formaterStockPourAffichage(
-                stockActuelValue, 
-                coeffUnite, 
-                txtUnite?.code || 'CS', 
-                txtUnite?.unite_reference || 'BTL'
-            );
+            await session.commitTransaction();
+            session.endSession();
 
-            io.to(companyId.toString()).emit('PRODUCT_UPDATED', { 
-                id, 
-                nom: d.nom.toUpperCase(), 
-                stock: stockActuelValue,
-                stock_formate: stockFormateTxt,
-                has_paliers: (d.paliers?.length > 0) 
-            });
+            if (io) {
+                const stockFormateTxt = conversestock.formaterStockPourAffichage(
+                    stockActuelValue, 
+                    coeffUnite, 
+                    codeGros, 
+                    refDetail
+                );
+
+                io.to(companyId.toString()).emit('PRODUCT_UPDATED', { 
+                    id, 
+                    nom: d.nom.toUpperCase(), 
+                    stock: stockActuelValue,
+                    stock_formate: stockFormateTxt,
+                    has_paliers: (d.paliers?.length > 0) 
+                });
+            }
+            return true;
+        } catch (error) {
+            await session.abortTransaction();
+            session.endSession();
+            throw error;
         }
-        return true;
     }
 
     // --- LECTURE GLOBALE ---
     async getAllProducts(companyId) {
-        const db = getDb();
-        
-        const products = db.prepare(`
-            SELECT 
-                p.*, 
-                p.stock_actuel as stock_brut_base,                    
-                u.coefficient as unite_coefficient,          
-                u.coefficient as coefficient,                
-                IFNULL(u.libelle, 'Unité') as unite_libelle, 
-                IFNULL(u.code, 'U') as unite_code,
-                IFNULL(u.unite_reference, 'UNITÉ') as unite_reference,
-                f.nom as famille_nom, 
-                c.nom as category_nom, 
-                g.nom as group_nom
-            FROM products p
-            LEFT JOIN unites u ON p.unite_id = u.id
-            LEFT JOIN product_groups g ON p.group_id = g.id
-            LEFT JOIN categories c ON g.category_id = c.id
-            LEFT JOIN familles f ON c.famille_id = f.id
-            WHERE p.company_id = ?
-            ORDER BY p.nom ASC
-        `).all(companyId);
+        const products = await CloudProduct.aggregate([
+            { $match: { company_id: companyId.toString() } },
+            {
+                $lookup: {
+                    from: 'cloud_unites',
+                    localField: 'unite_id',
+                    foreignField: 'localId',
+                    as: 'unite'
+                }
+            },
+            { $unwind: { path: '$unite', preserveNullAndEmptyArrays: true } },
+            {
+                $lookup: {
+                    from: 'cloud_product_groups',
+                    localField: 'group_id',
+                    foreignField: 'localId',
+                    as: 'group'
+                }
+            },
+            { $unwind: { path: '$group', preserveNullAndEmptyArrays: true } },
+            {
+                $lookup: {
+                    from: 'cloud_categories',
+                    localField: 'group.category_id',
+                    foreignField: 'localId',
+                    as: 'category'
+                }
+            },
+            { $unwind: { path: '$category', preserveNullAndEmptyArrays: true } },
+            {
+                $lookup: {
+                    from: 'cloud_familles',
+                    localField: 'category.famille_id',
+                    foreignField: 'localId',
+                    as: 'famille'
+                }
+            },
+            { $unwind: { path: '$famille', preserveNullAndEmptyArrays: true } },
+            {
+                $addFields: {
+                    stock_brut_base: '$stock_actuel',
+                    unite_coefficient: '$unite.coefficient',
+                    coefficient: '$unite.coefficient',
+                    unite_libelle: { $ifNull: ['$unite.libelle', 'Unité'] },
+                    unite_code: { $ifNull: ['$unite.code', 'U'] },
+                    unite_reference: { $ifNull: ['$unite.unite_reference', 'UNITÉ'] },
+                    famille_nom: '$famille.nom',
+                    category_nom: '$category.nom',
+                    group_nom: '$group.nom'
+                }
+            },
+            { $sort: { nom: 1 } }
+        ]);
 
-        const allPaliers = db.prepare(`
-            SELECT id, product_id, quantite, prix_total 
-            FROM product_paliers 
-            WHERE company_id = ?
-            ORDER BY quantite DESC
-        `).all(companyId);
+        const allPaliers = await CloudProductPalier.find({ company_id: companyId.toString() }).sort({ quantite: -1 }).lean();
 
         return products.map(product => {
             const coeff = Number(product.unite_coefficient) || 1;
@@ -341,17 +404,18 @@ class ProductService {
                 product.unite_reference
             );
 
-            const productPaliers = allPaliers.filter(palier => palier.product_id === product.id);
+            const productPaliers = allPaliers.filter(palier => palier.product_id === product.localId);
             
             return {
                 ...product,
-                stock: stockBrut,                                   
+                id: product.localId,
+                stock: stockBrut,                            
                 stock_actuel: stockBrut,                            
-                stock_physique_formate: stockTexteFormate,            
-                stock_virtuel: stockTexteFormate,                     
-                stock_formate: stockTexteFormate,                     
+                stock_physique_formate: stockTexteFormate,         
+                stock_virtuel: stockTexteFormate,                  
+                stock_formate: stockTexteFormate,                  
                 paliers: productPaliers.map(p => ({
-                    id: p.id,
+                    id: p.localId,
                     quantite: coeff > 1 ? cleanNum(Number(p.quantite || 0) / coeff) : Number(p.quantite || 0),
                     prix_total: Number(p.prix_total || 0)
                 }))
@@ -361,34 +425,53 @@ class ProductService {
 
     // --- LECTURE UNITAIRE ---
     async getProductById(id, companyId) {
-        const db = getDb();
-        
-        const product = db.prepare(`
-            SELECT 
-                p.*, 
-                p.stock_actuel as stock_brut_base,                    
-                u.coefficient as unite_coefficient,          
-                u.coefficient as coefficient,                
-                IFNULL(u.libelle, 'Unité') as unite_libelle,
-                IFNULL(u.code, 'U') as unite_code,
-                IFNULL(u.unite_reference, 'UNITÉ') as unite_reference,
-                g.category_id, 
-                c.famille_id
-            FROM products p
-            LEFT JOIN unites u ON p.unite_id = u.id
-            LEFT JOIN product_groups g ON p.group_id = g.id
-            LEFT JOIN categories c ON g.category_id = c.id
-            WHERE p.id = ? AND p.company_id = ?
-        `).get(id, companyId);
+        const products = await CloudProduct.aggregate([
+            { $match: { localId: id, company_id: companyId.toString() } },
+            {
+                $lookup: {
+                    from: 'cloud_unites',
+                    localField: 'unite_id',
+                    foreignField: 'localId',
+                    as: 'unite'
+                }
+            },
+            { $unwind: { path: '$unite', preserveNullAndEmptyArrays: true } },
+            {
+                $lookup: {
+                    from: 'cloud_product_groups',
+                    localField: 'group_id',
+                    foreignField: 'localId',
+                    as: 'group'
+                }
+            },
+            { $unwind: { path: '$group', preserveNullAndEmptyArrays: true } },
+            {
+                $lookup: {
+                    from: 'cloud_categories',
+                    localField: 'group.category_id',
+                    foreignField: 'localId',
+                    as: 'category'
+                }
+            },
+            { $unwind: { path: '$category', preserveNullAndEmptyArrays: true } },
+            {
+                $addFields: {
+                    stock_brut_base: '$stock_actuel',
+                    unite_coefficient: '$unite.coefficient',
+                    coefficient: '$unite.coefficient',
+                    unite_libelle: { $ifNull: ['$unite.libelle', 'Unité'] },
+                    unite_code: { $ifNull: ['$unite.code', 'U'] },
+                    unite_reference: { $ifNull: ['$unite.unite_reference', 'UNITÉ'] },
+                    category_id: '$group.category_id',
+                    famille_id: '$category.famille_id'
+                }
+            }
+        ]);
 
-        if (!product) return null;
+        if (!products || products.length === 0) return null;
+        const product = products[0];
 
-        const paliers = db.prepare(`
-            SELECT id, quantite, prix_total 
-            FROM product_paliers 
-            WHERE product_id = ? AND company_id = ?
-            ORDER BY quantite ASC
-        `).all(id, companyId);
+        const paliers = await CloudProductPalier.find({ product_id: id, company_id: companyId.toString() }).sort({ quantite: 1 }).lean();
 
         const coeff = Number(product.unite_coefficient) || 1;
         const stockBrut = parseFloat(product.stock_brut_base || 0);
@@ -402,13 +485,14 @@ class ProductService {
 
         return {
             ...product,
+            id: product.localId,
             stock: stockBrut,
             stock_actuel: stockBrut,
             stock_physique_formate: stockTexteFormate,
             stock_virtuel: stockTexteFormate,
             stock_formate: stockTexteFormate,                                     
             paliers: paliers.map(p => ({
-                id_temp: p.id, 
+                id_temp: p.localId, 
                 quantite: coeff > 1 ? cleanNum(Number(p.quantite || 0) / coeff) : Number(p.quantite || 0),
                 prix_total: Number(p.prix_total || 0)
             }))
@@ -417,200 +501,325 @@ class ProductService {
 
     // --- CHANGEMENT STATUT ---
     async updateStatus(id, is_active, user, io) {
-        const db = getDb();
-        const companyId = user?.companyId?.toString();
-        if (!companyId) throw new Error("Session invalide");
-
-        const productInfo = db.prepare(`
-            SELECT p.nom, p.stock_actuel, 
-                   g.is_active as grp_active, g.nom as grp_nom,
-                   c.is_active as cat_active, c.nom as cat_nom,
-                   f.is_active as fam_active, f.nom as fam_nom
-            FROM products p
-            LEFT JOIN product_groups g ON p.group_id = g.id
-            LEFT JOIN categories c ON g.category_id = c.id
-            LEFT JOIN familles f ON c.famille_id = f.id
-            WHERE p.id = ? AND p.company_id = ?
-        `).get(id, companyId);
-
-        if (!productInfo) throw new Error("Article non trouvé");
-
-        if (is_active) {
-            if (productInfo.fam_active === 0) {
-                throw new Error(`🚫 Action bloquée : Le Grand-parent (Famille "${productInfo.fam_nom}") est encore enfermé.`);
-            }
-            if (productInfo.cat_active === 0) {
-                throw new Error(`🚫 Action bloquée : Le Parent (Catégorie "${productInfo.cat_nom}") est encore enfermé.`);
-            }
-            if (productInfo.grp_active === 0) {
-                throw new Error(`🚫 Action bloquée : Le Groupe (Petit-enfant "${productInfo.grp_nom}") est encore enfermé.`);
-            }
-        }
-
-        if (!is_active && Number(productInfo.stock_actuel) > 0) {
-            throw new Error(`Impossible d'archiver "${productInfo.nom}" : il reste ${productInfo.stock_actuel} unité(s) en stock.`);
-        }
-
-        db.transaction(() => {
-            db.prepare(`UPDATE products SET is_active = ?, sync_status = 'pending' WHERE id = ? AND company_id = ?`)
-              .run(is_active ? 1 : 0, id, companyId);
-            
-            db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('products', ?, 'UPDATE', ?)`)
-              .run(id, companyId);
-            
-            logAction({
-                userId: user.userId, userName: user.username, actionType: 'MODIFICATION',
-                tableConcernee: 'products', referenceId: id,
-                description: `${is_active ? 'RESTAURATION' : 'ARCHIVAGE'} du produit : ${productInfo.nom}`,
-                companyId
-            });
-        })();
-
-        if (io) {
-            const room = companyId.toString();
-            io.to(room).emit('PRODUCT_STATUS_CHANGED', { id, is_active: is_active ? 1 : 0 });
-            io.to(room).emit('STOCK_UPDATED', { companyId: room });
-        }
-        return true;
-    }
-
-    // --- IMPORTATION MASSIVE ---
-    async processMassiveImport(items, user) {
-        const db = getDb();
-        const companyId = user.companyId;
-
-        const formatSqlError = (err, itemNom) => {
-            const msg = err.message;
-            if (msg.includes("FOREIGN KEY constraint failed")) 
-                return `L'unité ou le groupe spécifié pour "${itemNom}" n'existe pas en base.`;
-            if (msg.includes("UNIQUE constraint failed")) 
-                return `Le nom ou le code barre de l'article "${itemNom}" existe déjà.`;
-            if (msg.includes("CHECK constraint failed")) 
-                return `Les données de l'article "${itemNom}" ne respectent pas les règles de validation (ex: stock négatif).`;
-            return msg;
-        };
-
+        const session = await mongoose.startSession();
+        session.startTransaction();
         try {
-            return db.transaction(() => {
-                let count = 0;
-                
-                const checkGroupStmt = db.prepare("SELECT id FROM product_groups WHERE UPPER(nom) = ? AND company_id = ?");
-                const checkUniteStmt = db.prepare("SELECT id, coefficient FROM unites WHERE (UPPER(libelle) = ? OR UPPER(code) = ?) AND company_id = ?");
-                const checkNameStmt = db.prepare("SELECT id FROM products WHERE UPPER(nom) = ? AND company_id = ?");
-                
-                const insertProductStmt = db.prepare(`
-                    INSERT INTO products (
-                        id, nom, company_id, group_id, unite_id, codeBarre, prixVente, cmp, 
-                        taxeActive, taxeTaux, stockAlerte, remiseActive, is_active,
-                        r1Active, r1Seuil, r1Montant, r1Taux,
-                        r2Active, r2Seuil, r2Montant, r2Taux,
-                        r3Active, r3Multiple, r3Montant, r3Taux,
-                        r4Active, r4A_Max, r4A_Montant, r4B_Max, r4B_Montant, r4C_Montant,
-                        sync_status
-                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, 'pending')
-                `);
+            const companyId = user?.companyId?.toString();
+            if (!companyId) throw new Error("Session invalide");
 
-                for (const i of items) {
-                    const nomUpper = i.nom ? i.nom.toUpperCase().trim() : "NOM_INCONNU";
-
-                    try {
-                        const existingProduct = checkNameStmt.get(nomUpper, companyId);
-                        if (existingProduct) continue; 
-
-                        const group = checkGroupStmt.get(i.groupeNom ? i.groupeNom.toUpperCase().trim() : '', companyId);
-                        if (!group) {
-                            throw new Error(`Groupe "${i.groupeNom}" introuvable.`);
-                        }
-
-                        let uniteId = null;
-                        if (i.uniteLibelle) {
-                            const searchVal = i.uniteLibelle.toUpperCase().trim();
-                            const unite = checkUniteStmt.get(searchVal, searchVal, companyId);
-                            if (unite) {
-                                uniteId = unite.id;
-                            }
-                        }
-
-                        const productId = `ART-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 100)}`;
-
-                        const finalStockAlerte = conversestock.calculerUnitesNatives(db, productId, i.stockAlerte || 0);
-                        
-                        let r1SeuilFinal = i.r1Active === 1 ? conversestock.calculerUnitesNatives(db, productId, i.r1Seuil || 0) : 0;
-                        let r2SeuilFinal = i.is_active === 1 || i.r2Active === 1 ? conversestock.calculerUnitesNatives(db, productId, i.r2Seuil || 0) : 0;
-                        let r3MultipleFinal = i.r3Active === 1 ? conversestock.calculerUnitesNatives(db, productId, i.r3Multiple || 0) : 0;
-                        
-                        let r4A_MaxFinal = i.r4Active === 1 ? conversestock.calculerUnitesNatives(db, productId, i.r4A_Max || 0) : 0;
-                        let r4B_MaxFinal = i.r4Active === 1 ? conversestock.calculerUnitesNatives(db, productId, i.r4B_Max || 0) : 0;
-                        let r4C_MontantFinal = cleanNum(parseFloat(i.r4C_Montant) || 0);
-
-                        insertProductStmt.run(
-                            productId, 
-                            nomUpper, 
-                            companyId, 
-                            group.id, 
-                            uniteId,
-                            i.codeBarre || null, 
-                            cleanNum(i.prixVente), 
-                            cleanNum(i.cmp),
-                            i.taxeActive || 0, 
-                            cleanNum(i.taxeTaux), 
-                            finalStockAlerte, 
-                            i.remiseActive || 0, 
-                            i.is_active ?? 1,
-                            i.r1Active || 0, r1SeuilFinal, cleanNum(i.r1Montant), cleanNum(i.r1Taux),
-                            i.r2Active || 0, r2SeuilFinal, cleanNum(i.r2Montant), cleanNum(i.r2Taux),
-                            i.r3Active || 0, r3MultipleFinal, cleanNum(i.r3Montant), cleanNum(i.r3Taux),
-                            i.r4Active || 0, r4A_MaxFinal, cleanNum(i.r4A_Montant), r4B_MaxFinal, cleanNum(i.r4B_Montant), r4C_MontantFinal
-                        );
-
-                        db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('products', ?, 'INSERT', ?)`).run(productId, companyId);
-                        
-                        count++;
-                    } catch (err) {
-                        throw new Error(formatSqlError(err, nomUpper));
+            const productQuery = await CloudProduct.aggregate([
+                { $match: { localId: id, company_id: companyId } },
+                {
+                    $lookup: {
+                        from: 'cloud_product_groups',
+                        localField: 'group_id',
+                        foreignField: 'localId',
+                        as: 'group'
+                    }
+                },
+                { $unwind: { path: '$group', preserveNullAndEmptyArrays: true } },
+                {
+                    $lookup: {
+                        from: 'cloud_categories',
+                        localField: 'group.category_id',
+                        foreignField: 'localId',
+                        as: 'category'
+                    }
+                },
+                { $unwind: { path: '$category', preserveNullAndEmptyArrays: true } },
+                {
+                    $lookup: {
+                        from: 'cloud_familles',
+                        localField: 'category.famille_id',
+                        foreignField: 'localId',
+                        as: 'famille'
+                    }
+                },
+                { $unwind: { path: '$famille', preserveNullAndEmptyArrays: true } },
+                {
+                    $project: {
+                        nom: 1,
+                        stock_actuel: 1,
+                        grp_active: '$group.is_active',
+                        grp_nom: '$group.nom',
+                        cat_active: '$category.is_active',
+                        cat_nom: '$category.nom',
+                        fam_active: '$famille.is_active',
+                        fam_nom: '$famille.nom'
                     }
                 }
-                return count;
-            })();
+            ]).session(session);
+
+            if (!productQuery || productQuery.length === 0) throw new Error("Article non trouvé");
+            const productInfo = productQuery[0];
+
+            if (is_active) {
+                if (productInfo.fam_active === 0) {
+                    throw new Error(`🚫 Action bloquée : Le Grand-parent (Famille "${productInfo.fam_nom}") est encore enfermé.`);
+                }
+                if (productInfo.cat_active === 0) {
+                    throw new Error(`🚫 Action bloquée : Le Parent (Catégorie "${productInfo.cat_nom}") est encore enfermé.`);
+                }
+                if (productInfo.grp_active === 0) {
+                    throw new Error(`🚫 Action bloquée : Le Groupe (Petit-enfant "${productInfo.grp_nom}") est encore enfermé.`);
+                }
+            }
+
+            if (!is_active && Number(productInfo.stock_actuel) > 0) {
+                throw new Error(`Impossible d'archiver "${productInfo.nom}" : il reste ${productInfo.stock_actuel} unité(s) en stock.`);
+            }
+
+            await CloudProduct.updateOne(
+                { localId: id, company_id: companyId },
+                { $set: { is_active: is_active ? 1 : 0, sync_status: 'synced', updated_at: new Date() } },
+                { session }
+            );
+
+            const logId = `LOG-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+            await CloudAuditLog.create([{
+                localId: logId,
+                user_id: user.userId,
+                user_name: user.username,
+                action_type: 'MODIFICATION',
+                table_concernee: 'products',
+                reference_id: id,
+                description: `${is_active ? 'RESTAURATION' : 'ARCHIVAGE'} du produit : ${productInfo.nom}`,
+                date_action: new Date(),
+                company_id: companyId,
+                sync_status: 'synced'
+            }], { session });
+
+            await session.commitTransaction();
+            session.endSession();
+
+            if (io) {
+                const room = companyId.toString();
+                io.to(room).emit('PRODUCT_STATUS_CHANGED', { id, is_active: is_active ? 1 : 0 });
+                io.to(room).emit('STOCK_UPDATED', { companyId: room });
+            }
+            return true;
         } catch (error) {
+            await session.abortTransaction();
+            session.endSession();
             throw error;
         }
     }
 
+    // --- IMPORTATION MASSIVE ---
+    async processMassiveImport(items, user) {
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            const companyId = user.companyId;
+
+            const formatSqlError = (err, itemNom) => {
+                const msg = err.message;
+                if (msg.includes("FOREIGN KEY")) 
+                    return `L'unité ou le groupe spécifié pour "${itemNom}" n'existe pas en base.`;
+                if (msg.includes("UNIQUE")) 
+                    return `Le nom ou le code barre de l'article "${itemNom}" existe déjà.`;
+                return msg;
+            };
+
+            let count = 0;
+
+            for (const i of items) {
+                const nomUpper = i.nom ? i.nom.toUpperCase().trim() : "NOM_INCONNU";
+
+                try {
+                    const existingProduct = await CloudProduct.findOne({ nom: nomUpper, company_id: companyId.toString() }).session(session).lean();
+                    if (existingProduct) continue; 
+
+                    const group = await CloudProductGroup.findOne({ nom: new RegExp(`^${i.groupeNom?.trim()}$`, 'i'), company_id: companyId.toString() }).session(session).lean();
+                    if (!group) {
+                        throw new Error(`Groupe "${i.groupeNom}" introuvable.`);
+                    }
+
+                    let uniteId = null;
+                    if (i.uniteLibelle) {
+                        const searchVal = i.uniteLibelle.toUpperCase().trim();
+                        const unite = await CloudUnite.findOne({ 
+                            $or: [{ libelle: new RegExp(`^${searchVal}$`, 'i') }, { code: new RegExp(`^${searchVal}$`, 'i') }],
+                            company_id: companyId.toString()
+                        }).session(session).lean();
+                        if (unite) {
+                            uniteId = unite.localId;
+                        }
+                    }
+
+                    const productId = `ART-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 100)}`;
+                    let coeffUnite = 1;
+                    if (uniteId) {
+                        const uRef = await CloudUnite.findOne({ localId: uniteId }).session(session).lean();
+                        if (uRef) coeffUnite = Number(uRef.coefficient) || 1;
+                    }
+
+                    const chaineAlerte = String(i.stockAlerte || 0).trim();
+                    let finalStockAlerte = 0;
+                    if (chaineAlerte.includes('+')) {
+                        const parts = chaineAlerte.split('+');
+                        finalStockAlerte = Math.round((parseFloat(parts[0]) || 0) * coeffUnite) + Math.round(parseFloat(parts[1]) || 0);
+                    } else {
+                        finalStockAlerte = Math.round((parseFloat(chaineAlerte) || 0) * coeffUnite);
+                    }
+
+                    let r1SeuilFinal = i.r1Active === 1 ? Math.round((parseFloat(i.r1Seuil) || 0) * coeffUnite) : 0;
+                    let r2SeuilFinal = i.is_active === 1 || i.r2Active === 1 ? Math.round((parseFloat(i.r2Seuil) || 0) * coeffUnite) : 0;
+                    let r3MultipleFinal = i.r3Active === 1 ? Math.round((parseFloat(i.r3Multiple) || 0) * coeffUnite) : 0;
+                    let r4A_MaxFinal = i.r4Active === 1 ? Math.round((parseFloat(i.r4A_Max) || 0) * coeffUnite) : 0;
+                    let r4B_MaxFinal = i.r4Active === 1 ? Math.round((parseFloat(i.r4B_Max) || 0) * coeffUnite) : 0;
+                    let r4C_MontantFinal = cleanNum(parseFloat(i.r4C_Montant) || 0);
+
+                    await CloudProduct.create([{
+                        localId: productId,
+                        nom: nomUpper,
+                        company_id: companyId.toString(),
+                        group_id: group.localId,
+                        unite_id: uniteId,
+                        codeBarre: i.codeBarre || null,
+                        prixVente: cleanNum(i.prixVente),
+                        cmp: cleanNum(i.cmp),
+                        taxeActive: i.taxeActive || 0,
+                        taxeTaux: cleanNum(i.taxeTaux),
+                        stockAlerte: finalStockAlerte,
+                        remiseActive: i.remiseActive || 0,
+                        is_active: i.is_active ?? 1,
+                        r1Active: i.r1Active || 0, r1Seuil: r1SeuilFinal, r1Montant: cleanNum(i.r1Montant), r1Taux: cleanNum(i.r1Taux),
+                        r2Active: i.r2Active || 0, r2Seuil: r2SeuilFinal, r2Montant: cleanNum(i.r2Montant), r2Taux: cleanNum(i.r2Taux),
+                        r3Active: i.r3Active || 0, r3Multiple: r3MultipleFinal, r3Montant: cleanNum(i.r3Montant), r3Taux: cleanNum(i.r3Taux),
+                        r4Active: i.r4Active || 0, r4A_Max: r4A_MaxFinal, r4A_Montant: cleanNum(i.r4A_Montant), r4B_Max: r4B_MaxFinal, r4B_Montant: cleanNum(i.r4B_Montant), r4C_Montant: r4C_MontantFinal,
+                        sync_status: 'synced',
+                        updated_at: new Date()
+                    }], { session });
+
+                    count++;
+                } catch (err) {
+                    throw new Error(formatSqlError(err, nomUpper));
+                }
+            }
+
+            await session.commitTransaction();
+            session.endSession();
+            return count;
+        } catch (error) {
+            await session.abortTransaction();
+            session.endSession();
+            throw error;
+        }
+    }
+
+    // --- HISTORIQUE PRODUIT ---
+    async getProductHistory(companyId, productId, dStart, dEnd, isAll) {
+        const queryFilter = { 
+            company_id: companyId.toString(),
+            date: { $gte: new Date(dStart), $lte: new Date(dEnd + 'T23:59:59.999Z') }
+        };
+        if (!isAll) queryFilter.product_id = productId;
+
+        // Récupération combinée via les collections d'achats, ventes et inventaires pour l'historique
+        const purchases = await CloudPurchaseItem.find({ company_id: companyId.toString(), ...(isAll ? {} : { product_id: productId }) }).lean();
+        const sales = await CloudSaleItem.find({ company_id: companyId.toString(), ...(isAll ? {} : { product_id: productId }) }).lean();
+        const inventories = await CloudInventoryItem.find({ company_id: companyId.toString(), ...(isAll ? {} : { product_id: productId }) }).lean();
+
+        // Transformation et formatage unifiés pour correspondre au format d'historique attendu
+        let combined = [];
+
+        purchases.forEach(pi => {
+            const isRetour = pi.type_ligne === 'RETOUR';
+            combined.push({
+                product_id: pi.product_id,
+                article_nom: pi.nom_article_snap,
+                type: isRetour ? 'RETOUR_FOURNISSEUR' : (pi.type_ligne || 'ACHAT'),
+                date: pi.created_at,
+                reference: pi.num_facture,
+                tiers: pi.nom_article_snap,
+                qte_entree: isRetour ? 0 : (pi.qte_achetee || 0),
+                qte_sortie: isRetour ? (pi.qte_achetee || 0) : 0,
+                PU: pi.prix_achat_unitaire || 0,
+                montant: pi.montant_facture_ligne || 0,
+                stock_av: pi.stock_avant_achat || 0,
+                stock_ap: pi.stock_apres_achat || 0,
+                lot_id: pi.lot_id,
+                operateur_nom: 'UTILISATEUR',
+                company_id: pi.company_id,
+                coefficient: 1,
+                unit_code_gros: 'CS',
+                unit_ref_detail: 'UNITÉ'
+            });
+        });
+
+        sales.forEach(si => {
+            const isRetour = si.type_ligne === 'RETOUR';
+            combined.push({
+                product_id: si.product_id,
+                article_nom: si.nom_article_snap,
+                type: isRetour ? 'RETOUR_CLIENT' : 'VENTE',
+                date: si.created_at,
+                reference: si.id_vente,
+                tiers: si.nom_article_snap,
+                qte_entree: isRetour ? (si.quantite || 0) : 0,
+                qte_sortie: !isRetour ? (si.quantite || 0) : 0,
+                PU: si.prix_vente_unitaire || 0,
+                montant: si.montant_ttc_ligne || 0,
+                stock_av: si.stock_avant_vente || 0,
+                stock_ap: si.stock_apres_vente || 0,
+                lot_id: si.lot_id,
+                operateur_nom: 'UTILISATEUR',
+                company_id: si.company_id,
+                coefficient: 1,
+                unit_code_gros: 'CS',
+                unit_ref_detail: 'UNITÉ'
+            });
+        });
+
+        inventories.forEach(iv => {
+            const qteEntree = iv.stock_reel > iv.stock_theorique ? (iv.stock_reel - iv.stock_theorique) : 0;
+            const qteSortie = iv.stock_reel < iv.stock_theorique ? (iv.stock_theorique - iv.stock_reel) : 0;
+            combined.push({
+                product_id: iv.product_id,
+                article_nom: 'INVENTAIRE',
+                type: 'INVENTAIRE',
+                date: iv.created_at,
+                reference: iv.id_inventaire,
+                tiers: 'SYSTEME',
+                qte_entree: qteEntree,
+                qte_sortie: qteSortie,
+                PU: iv.prix_achat_snap || 0,
+                montant: Math.abs((iv.stock_reel - iv.stock_theorique) * (iv.prix_achat_snap || 0)),
+                stock_av: iv.stock_theorique || 0,
+                stock_ap: iv.stock_reel || 0,
+                lot_id: null,
+                operateur_nom: 'SYSTÈME',
+                company_id: iv.company_id,
+                coefficient: 1,
+                unit_code_gros: 'CS',
+                unit_ref_detail: 'UNITÉ'
+            });
+        });
+
+        return combined.sort((a, b) => new Date(b.date) - new Date(a.date));
+    }
+
     // --- RÉSERVATION DE STOCK ---
     async reserveStock(productId, qte, companyId) {
-        const db = getDb();
-        db.prepare(`
-            UPDATE products 
-            SET stock_actuel = stock_actuel - ?, 
-                stock_reserve = stock_reserve + ?,
-                sync_status = 'pending'
-            WHERE id = ? AND company_id = ?
-        `).run(qte, qte, productId, companyId);
-
-        // 🔄 Synchronisation Cloud (UPDATE)
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('products', ?, 'UPDATE', ?)
-        `).run(productId, companyId);
+        await CloudProduct.updateOne(
+            { localId: productId, company_id: companyId.toString() },
+            { 
+                $inc: { stock_actuel: -qte, stock_reserve: qte },
+                $set: { sync_status: 'synced', updated_at: new Date() }
+            }
+        );
     }
 
     // --- RESTITUTION DE STOCK ---
     async releaseStock(productId, qte, companyId) {
-        const db = getDb();
-        db.prepare(`
-            UPDATE products 
-            SET stock_actuel = stock_actuel + ?, 
-                stock_reserve = stock_reserve - ?,
-                sync_status = 'pending'
-            WHERE id = ? AND company_id = ?
-        `).run(qte, qte, productId, companyId);
-
-        // 🔄 Synchronisation Cloud (UPDATE)
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('products', ?, 'UPDATE', ?)
-        `).run(productId, companyId);
+        await CloudProduct.updateOne(
+            { localId: productId, company_id: companyId.toString() },
+            { 
+                $inc: { stock_actuel: qte, stock_reserve: -qte },
+                $set: { sync_status: 'synced', updated_at: new Date() }
+            }
+        );
     }
 }
 

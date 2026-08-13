@@ -1,10 +1,11 @@
-const { getDb } = require('../config/database');
+// backend/services/user.service.js
+const { CloudUser } = require('../models/cloud.model');
 const { hashPassword } = require('../utils/helpers');
 const { logAction } = require('../utils/auditHelper');
 
 class UserService {
     /**
-     * Génère un ID utilisateur (Léon Style)
+     * Génère un ID utilisateur
      */
     genererIdUser() {
         return `USR-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 100)}`;
@@ -30,75 +31,76 @@ class UserService {
     /**
      * Récupère un utilisateur pour vérification
      */
-    getUserById(id, companyId) {
-        const db = getDb();
-        return db.prepare('SELECT * FROM users WHERE id = ? AND company_id = ?').get(id, companyId);
+    async getUserById(id, companyId) {
+        return await CloudUser.findOne({ 
+            localId: id.toString(), 
+            company_id: companyId.toString() 
+        }).lean();
     }
 
     /**
      * Crée un utilisateur avec traçabilité Cloud et audit
      */
     async create(data, userContext) {
-        const db = getDb();
         const { companyId, id: creatorId, username: creatorName } = userContext;
         
         const userId = this.genererIdUser();
         const { tempPassword, hashedPassword } = await this.prepareTempPassword();
         const perms = this.formatPermissions(data.permissions);
 
-        const result = db.transaction(() => {
-            db.prepare(`
-                INSERT INTO users (
-                    id, company_id, username, email, password, role, fonction, permissions, sync_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-            `).run(
-                userId, companyId, data.username, data.email, hashedPassword, 
-                data.role || 'USER', data.fonction || '', perms
-            );
+        await CloudUser.create({
+            localId: userId,
+            company_id: companyId.toString(),
+            username: data.username,
+            email: data.email,
+            password: hashedPassword,
+            role: data.role || 'USER',
+            fonction: data.fonction || '',
+            permissions: perms,
+            is_temp_password: true,
+            is_active: true,
+            sync_status: 'synced'
+        });
 
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('users', ?, 'INSERT', ?)").run(userId, companyId);
-            
-            return { userId, tempPassword };
-        })();
-
-        logAction({
+        await logAction({
             userId: creatorId,
             userName: creatorName,
             actionType: 'CREATE',
             tableConcernee: 'users',
             referenceId: userId,
-            description: `Création utilisateur : ${data.username} (Role: ${data.role})`,
-            companyId
+            description: `Création utilisateur : ${data.username} (Role: ${data.role || 'USER'})`,
+            companyId: companyId.toString()
         });
 
-        return result;
+        return { userId, tempPassword };
     }
 
     /**
      * Supprime un utilisateur (Désactivation avec traçabilité)
      */
     async delete(id, userContext) {
-        const db = getDb();
         const { companyId, id: creatorId, username: creatorName } = userContext;
 
-        const userName = db.transaction(() => {
-            const user = db.prepare('SELECT username FROM users WHERE id = ? AND company_id = ?').get(id, companyId);
-            if (!user) throw new Error("Utilisateur introuvable.");
+        const user = await CloudUser.findOne({ 
+            localId: id.toString(), 
+            company_id: companyId.toString() 
+        });
+        if (!user) throw new Error("Utilisateur introuvable.");
 
-            db.prepare('DELETE FROM users WHERE id = ? AND company_id = ?').run(id, companyId);
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('users', ?, 'DELETE', ?)").run(id, companyId);
-            
-            return user.username;
-        })();
+        const userName = user.username;
+        await CloudUser.deleteOne({ 
+            localId: id.toString(), 
+            company_id: companyId.toString() 
+        });
 
-        logAction({
+        await logAction({
             userId: creatorId,
             userName: creatorName,
             actionType: 'DELETE',
             tableConcernee: 'users',
-            referenceId: id,
+            referenceId: id.toString(),
             description: `Suppression utilisateur : ${userName}`,
-            companyId
+            companyId: companyId.toString()
         });
 
         return { success: true };

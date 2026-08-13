@@ -1,3 +1,4 @@
+// backend/models/cloud.model.js
 const mongoose = require('mongoose');
 const schemaOptions = { timestamps: true, strict: false };
 
@@ -28,11 +29,28 @@ const CompanySchema = new mongoose.Schema({
     sync_status: { type: String, enum: ['pending', 'synced', 'error'], default: 'pending' } 
 }, { versionKey: false, timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' }, collection: 'cloud_companies' });
 
-const UserSchema = new mongoose.Schema({ localId: String, username: String, email: String, role: String, company_id: String, fonction: String, nif: String, cnss: String, adresse: String, permissions: Object, token_version: { type: Number, default: 1 }, sync_status: String }, schemaOptions);
+// backend/models/cloud.model.js (Extrait UserSchema)
+const UserSchema = new mongoose.Schema({ 
+    localId: String, 
+    username: String, 
+    email: String, 
+    role: String, 
+    company_id: String, 
+    fonction: String, 
+    nif: String, 
+    cnss: String, 
+    adresse: String, 
+    permissions: Object, 
+    token_version: { type: Number, default: 1 }, 
+    sync_status: String,
+    preferences: {
+        theme: { type: String, default: 'light' },
+        layout: { type: String, default: 'default' }
+    }
+}, schemaOptions);
 const StaffSchema = new mongoose.Schema({ localId: String, name: { type: String, required: true }, phone: String, email: String, adresse: String, nif: String, cnss: String, fonction: String, company_id: String, is_active: { type: Number, default: 1 }, sync_status: { type: String, default: 'pending' } }, schemaOptions);
 const ProductSchema = new mongoose.Schema({ localId: String, nom: String, company_id: String, codeBarre: String, unite_id: String, image_path: String, group_id: String, cmp: { type: Number, default: 0 }, prixVente: { type: Number, default: 0 }, taxeActive: { type: Number, default: 0 }, taxeTaux: { type: Number, default: 0 }, stock_actuel: { type: Number, default: 0 }, stock_reserve: { type: Number, default: 0 }, stockAlerte: { type: Number, default: 0 }, is_active: { type: Number, default: 1 }, remiseActive: { type: Number, default: 0 }, r1Active: { type: Number, default: 0 }, r1Seuil: Number, r1Montant: Number, r1Taux: Number, r1IsPromo: Number, r1DateDebut: String, r1DateFin: String, r2Active: { type: Number, default: 0 }, r2Seuil: Number, r2Montant: Number, r2Taux: Number, r2IsPromo: Number, r2DateDebut: String, r2DateFin: String, r3Active: { type: Number, default: 0 }, r3Multiple: Number, r3Montant: Number, r3Taux: Number, r3IsPromo: Number, r3DateDebut: String, r3DateFin: String, r4Active: { type: Number, default: 0 }, r4A_Max: Number, r4A_Montant: Number, r4A_Taux: Number, r4B_Max: Number, r4B_Montant: Number, r4B_Taux: Number, r4C_Montant: Number, r4C_Taux: Number, r4IsPromo: Number, r4DateDebut: String, r4DateFin: String, sync_status: String }, schemaOptions);
 
-// 🛠️ CORRECTION : Ajout de localId pour homogénéiser avec SQLite
 const FamilleSchema = new mongoose.Schema({ localId: { type: String, required: true }, id: { type: String }, nom: { type: String, required: true }, company_id: { type: String, required: true }, is_active: { type: Number, default: 1 }, sync_status: { type: String, default: 'synced' } }, schemaOptions);
 const CategorieSchema = new mongoose.Schema({ localId: { type: String, required: true }, id: { type: String }, nom: { type: String, required: true }, famille_id: { type: String, required: true }, company_id: { type: String, required: true }, is_active: { type: Number, default: 1 }, sync_status: { type: String, default: 'synced' } }, schemaOptions);
 const ProductGroupSchema = new mongoose.Schema({ localId: { type: String, required: true }, id: { type: String }, nom: { type: String, required: true }, category_id: { type: String, required: true }, company_id: { type: String, required: true }, is_active: { type: Number, default: 1 }, sync_status: { type: String, default: 'synced' } }, schemaOptions);
@@ -230,7 +248,7 @@ AnalytiqueAutoRepartitionSchema.index({ config_id: 1 });
 AnalytiqueConfigCompteSchema.index({ compte_general_id: 1, company_id: 1 });
 PaymentMethodSchema.index({ company_id: 1, code: 1 });
 
-module.exports = {
+const models = {
     CloudCompany: mongoose.models.CloudCompany || mongoose.model('CloudCompany', CompanySchema, 'cloud_companies'),
     CloudUser: mongoose.models.CloudUser || mongoose.model('CloudUser', UserSchema, 'cloud_users'),
     CloudStaff: mongoose.models.CloudStaff || mongoose.model('CloudStaff', StaffSchema, 'cloud_staff'),
@@ -291,5 +309,35 @@ module.exports = {
     CloudStockAdjustment: mongoose.models.CloudStockAdjustment || mongoose.model('CloudStockAdjustment', StockAdjustmentSchema, 'cloud_stock_adjustments'),
     CloudStockAdjustmentItem: mongoose.models.CloudStockAdjustmentItem || mongoose.model('CloudStockAdjustmentItem', StockAdjustmentItemSchema, 'cloud_stock_adjustment_items'),
     CloudPurchaseOrder: mongoose.models.CloudPurchaseOrder || mongoose.model('CloudPurchaseOrder', PurchaseOrderSchema, 'cloud_purchase_orders'),
-    CloudPurchaseOrderItem: mongoose.models.CloudPurchaseOrderItem || mongoose.model('CloudPurchaseOrderItem', PurchaseOrderItemSchema, 'cloud_purchase_order_items')
+    CloudPurchaseOrderItem: mongoose.models.CloudCloudPurchaseOrderItem || mongoose.model('CloudPurchaseOrderItem', PurchaseOrderItemSchema, 'cloud_purchase_order_items'),
+
+    /**
+     * Fabrique dynamique pour le service générique (table.service.js)
+     */
+    dynamicModel: (tableName) => {
+        const mapping = {
+            'products': models.CloudProduct,
+            'unites': models.CloudUnite,
+            'familles': models.CloudFamille,
+            'categories': models.CloudCategorie,
+            'product_groups': models.CloudProductGroup,
+            'suppliers': models.CloudSupplier,
+            'customers': models.CloudCustomer,
+            'staff': models.CloudStaff,
+            'restaurant_tables': mongoose.models.CloudRestaurantTable || mongoose.model('CloudRestaurantTable', new mongoose.Schema({}, schemaOptions), 'cloud_restaurant_tables')
+        };
+
+        if (mapping[tableName]) {
+            return mapping[tableName];
+        }
+
+        // Fallback dynamique si la collection existe dans mongoose ou création générique à la volée
+        if (mongoose.models[tableName]) {
+            return mongoose.models[tableName];
+        }
+
+        return mongoose.model(tableName, new mongoose.Schema({}, schemaOptions), `cloud_${tableName}`);
+    }
 };
+
+module.exports = models;

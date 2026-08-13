@@ -1,3 +1,4 @@
+// backend/controllers/Rap_BalanceAnalytique.controller.js
 const BalanceAnalytiqueService = require('../services/Rap_BalanceAnalytique.service');
 
 /**
@@ -7,6 +8,9 @@ exports.getBalanceAnalytique = async (req, res) => {
     const companyId = req.user?.companyId || req.user?.company_id;
     const { exerciceId, dateDebut, dateFin } = req.query;
 
+    if (!companyId) {
+        return res.status(401).json({ success: false, error: "Session invalide." });
+    }
     if (!exerciceId || !dateDebut || !dateFin) {
         return res.status(400).json({ success: false, error: "Paramètres de recherche incomplets." });
     }

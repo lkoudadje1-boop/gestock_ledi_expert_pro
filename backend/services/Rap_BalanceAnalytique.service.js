@@ -1,46 +1,158 @@
-const { getDb } = require('../config/database');
+// backend/services/Rap_BalanceAnalytique.service.js
+const { CloudLigneAnalytique } = require('../models/cloud.model');
+const mongoose = require('mongoose');
 
 class BalanceAnalytiqueService {
     /**
-     * Calcule la balance analytique avec totaux par section
+     * Calcule la balance analytique avec totaux par section (MongoDB Pipeline)
      */
     async getBalanceData(filters, companyId) {
-        const db = getDb();
         const { exerciceId, dateDebut, dateFin } = filters;
+        const cid = companyId.toString();
 
-        const sql = `
-            SELECT 
-                pa.code as code_section,
-                pa.libelle as intitule_section,
-                la.num_compte,
-                pc.intitule as intitule_compte,
-                SUM(la.montant) as mouv_debit, 
-                0 as mouv_credit, 
-                SUM(la.montant) as solde,
-                (
-                    SELECT SUM(la2.montant) 
-                    FROM lignes_analytiques la2
-                    JOIN lignes_ecritures le2 ON la2.ligne_ecriture_id = le2.id
-                    JOIN exercices ex ON le2.exercice_id = ex.id
-                    WHERE la2.plan_analytique_id = pa.id 
-                      AND la2.num_compte = la.num_compte
-                      AND ex.date_debut < (SELECT date_debut FROM exercices WHERE id = ?)
-                      AND la2.company_id = ?
-                      AND le2.is_deleted = 0
-                ) as solde_prec
-            FROM lignes_analytiques la
-            JOIN plan_analytique pa ON la.plan_analytique_id = pa.id
-            LEFT JOIN plan_comptable pc ON la.num_compte = pc.numero_compte AND pc.company_id = ?
-            JOIN lignes_ecritures le ON la.ligne_ecriture_id = le.id
-            WHERE la.company_id = ? 
-              AND le.exercice_id = ?
-              AND le.date_ecriture BETWEEN ? AND ?
-              AND le.is_deleted = 0
-            GROUP BY pa.id, la.num_compte
-            ORDER BY pa.code ASC, la.num_compte ASC
-        `;
+        // Récupération de la date de début de l'exercice cible pour le calcul du solde précédent
+        const targetExercice = await mongoose.model('CloudExercice').findOne({ localId: exerciceId.toString(), company_id: cid }).lean();
+        const dateDebutExercice = targetExercice ? new Date(targetExercice.date_debut) : new Date(dateDebut);
 
-        const rows = db.prepare(sql).all(exerciceId, companyId, companyId, companyId, exerciceId, dateDebut, dateFin);
+        const pipeline = [
+            { $match: { company_id: cid } },
+            // Jointure avec les lignes d'écritures
+            {
+                $lookup: {
+                    from: 'cloud_ligne_ecritures',
+                    localField: 'ligne_ecriture_id',
+                    foreignField: 'localId',
+                    as: 'ecriture_ligne'
+                }
+            },
+            { $unwind: '$ecriture_ligne' },
+            {
+                $match: {
+                    'ecriture_ligne.company_id': cid,
+                    'ecriture_ligne.exercice_id': exerciceId.toString(),
+                    'ecriture_ligne.date_ecriture': {
+                        $gte: new Date(dateDebut),
+                        $lte: new Date(dateFin + 'T23:59:59.999Z')
+                    },
+                    'ecriture_ligne.is_deleted': { $ne: 1 }
+                }
+            },
+            // Jointure avec le plan analytique
+            {
+                $lookup: {
+                    from: 'cloud_plan_analytique',
+                    localField: 'plan_analytique_id',
+                    foreignField: 'localId',
+                    as: 'plan'
+                }
+            },
+            { $unwind: '$plan' },
+            // Jointure avec le plan comptable
+            {
+                $lookup: {
+                    from: 'cloud_plan_comptable',
+                    let: { numCpt: '$num_compte', cid: cid },
+                    pipeline: [
+                        {
+                            $match: {
+                                $expr: {
+                                    $and: [
+                                        { $eq: ['$numero_compte', '$$numCpt'] },
+                                        { $eq: ['$company_id', '$$cid'] }
+                                    ]
+                                }
+                            }
+                        }
+                    ],
+                    as: 'compte'
+                }
+            },
+            { $unwind: { path: '$compte', preserveNullAndEmptyArrays: true } },
+            // Lookup pour les soldes précédents (exercices antérieurs)
+            {
+                $lookup: {
+                    from: 'cloud_ligne_analytiques',
+                    let: { planId: '$plan_analytique_id', cptNum: '$num_compte', cid: cid, limitDate: dateDebutExercice },
+                    pipeline: [
+                        {
+                            $lookup: {
+                                from: 'cloud_ligne_ecritures',
+                                localField: 'ligne_ecriture_id',
+                                foreignField: 'localId',
+                                as: 'le2'
+                            }
+                        },
+                        { $unwind: '$le2' },
+                        {
+                            $lookup: {
+                                from: 'cloud_exercices',
+                                localField: 'le2.exercice_id',
+                                foreignField: 'localId',
+                                as: 'ex'
+                            }
+                        },
+                        { $unwind: '$ex' },
+                        {
+                            $match: {
+                                $expr: {
+                                    $and: [
+                                        { $eq: ['$plan_analytique_id', '$$planId'] },
+                                        { $eq: ['$num_compte', '$$cptNum'] },
+                                        { $eq: ['$company_id', '$$cid'] },
+                                        { $lt: ['$ex.date_debut', '$$limitDate'] },
+                                        { $ne: ['$le2.is_deleted', 1] }
+                                    ]
+                                }
+                            }
+                        },
+                        {
+                            $group: {
+                                _id: null,
+                                total: { $sum: '$montant' }
+                            }
+                        }
+                    ],
+                    as: 'solde_prec_calc'
+                }
+            },
+            {
+                $addFields: {
+                    solde_prec: {
+                        $ifNull: [{ $arrayElemAt: ['$solde_prec_calc.total', 0] }, 0]
+                    }
+                }
+            },
+            // Groupement par section et numéro de compte
+            {
+                $group: {
+                    _id: {
+                        code_section: '$plan.code',
+                        intitule_section: '$plan.libelle',
+                        num_compte: '$num_compte'
+                    },
+                    intitule_compte: { $first: '$compte.intitule' },
+                    mouv_debit: { $sum: '$montant' },
+                    solde: { $sum: '$montant' },
+                    solde_prec: { $first: '$solde_prec' }
+                }
+            },
+            {
+                $project: {
+                    _id: 0,
+                    code_section: '$_id.code_section',
+                    intitule_section: '$_id.intitule_section',
+                    num_compte: '$_id.num_compte',
+                    intitule_compte: { $ifNull: ['$intitule_compte', ''] },
+                    mouv_debit: 1,
+                    mouv_credit: 0,
+                    solde: 1,
+                    solde_prec: 1
+                }
+            },
+            { $sort: { code_section: 1, num_compte: 1 } }
+        ];
+
+        const rows = await CloudLigneAnalytique.aggregate(pipeline);
 
         // --- Structuration des données avec lignes de totaux par section ---
         const finalData = [];

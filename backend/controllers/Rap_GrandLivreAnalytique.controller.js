@@ -1,8 +1,13 @@
+// backend/controllers/Rap_GrandLivreAnalytique.controller.js
 const AnalytiqueService = require('../services/Rap_GrandLivreAnalytique.service');
 
 exports.getGrandLivreAnalytique = async (req, res) => {
     const companyId = req.user?.company_id || req.user?.companyId;
     const { exerciceId, dateDebut, dateFin, deSection, aSection } = req.query;
+
+    if (!companyId) {
+        return res.status(401).json({ success: false, error: "Session invalide." });
+    }
 
     // Validation minimale
     if (!exerciceId || !dateDebut || !dateFin) {

@@ -1,169 +1,193 @@
-const { getDb } = require('../config/database');
-const { logAction } = require('../utils/auditHelper');
+// backend/services/client.service.js
+const mongoose = require('mongoose');
+const { CloudCustomer, CloudAuditLog } = require('../models/cloud.model');
 
 function genererIdClient() {
     return `CUS-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 100)}`;
 }
 
 // 📌 GET ALL
-exports.getAllCustomers = (companyId) => {
-    const db = getDb();
-
-    return db.prepare(`
-        SELECT * FROM customers 
-        WHERE company_id = ? 
-        ORDER BY nom ASC
-    `).all(companyId);
+exports.getAllCustomers = async (companyId) => {
+    return await CloudCustomer.find({ company_id: companyId.toString() })
+        .sort({ nom: 1 })
+        .lean();
 };
 
 // 📌 CREATE
-exports.createCustomer = ({ companyId, userId, userName, data }) => {
-    const db = getDb();
+exports.createCustomer = async ({ companyId, userId, userName, data }) => {
     const { nom, nif, telephone, email, adresse } = data;
-
     const customerId = genererIdClient();
 
-    db.transaction(() => {
-        db.prepare(`
-            INSERT INTO customers (
-                id, company_id, nom, nif, contact, telephone, email, adresse, is_active, sync_status
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending')
-        `).run(
-            customerId,
-            companyId,
-            nom.toUpperCase(),
-            nif || '0',
-            nom.toUpperCase(),
-            telephone || '',
-            email || '',
-            adresse || ''
-        );
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('customers', ?, 'INSERT', ?)
-        `).run(customerId, companyId);
+    try {
+        await CloudCustomer.create([{
+            localId: customerId,
+            company_id: companyId.toString(),
+            nom: nom.toUpperCase(),
+            nif: nif || '0',
+            contact: nom.toUpperCase(),
+            telephone: telephone || '',
+            email: email || '',
+            adresse: adresse || '',
+            is_active: 1,
+            sync_status: 'synced'
+        }], { session });
 
-        logAction({
-            userId,
-            userName,
-            actionType: 'INSERTION',
-            tableConcernee: 'customers',
-            referenceId: customerId,
+        await CloudAuditLog.create([{
+            localId: `LOG-${Date.now()}`,
+            user_id: userId ? userId.toString() : null,
+            user_name: userName || "user",
+            action_type: 'INSERTION',
+            table_concernee: 'customers',
+            reference_id: customerId,
             description: `Création du client: ${nom.toUpperCase()}`,
-            companyId
-        });
-    })();
+            company_id: companyId.toString(),
+            sync_status: 'synced'
+        }], { session });
 
-    return customerId;
+        await session.commitTransaction();
+        session.endSession();
+
+        return customerId;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
 // 📌 UPDATE
-exports.updateCustomer = ({ id, companyId, userId, userName, data }) => {
-    const db = getDb();
+exports.updateCustomer = async ({ id, companyId, userId, userName, data }) => {
     const { nom, nif, telephone, email, adresse } = data;
 
-    let result;
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    db.transaction(() => {
-        result = db.prepare(`
-            UPDATE customers 
-            SET nom = ?, nif = ?, contact = ?, telephone = ?, email = ?, adresse = ?, sync_status = 'pending'
-            WHERE id = ? AND company_id = ?
-        `).run(
-            nom.toUpperCase(),
-            nif || '0',
-            nom.toUpperCase(),
-            telephone || '',
-            email || '',
-            adresse || '',
-            id,
-            companyId
-        );
+    try {
+        const result = await CloudCustomer.updateOne(
+            { 
+                $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }], 
+                company_id: companyId.toString() 
+            },
+            { 
+                $set: { 
+                    nom: nom.toUpperCase(), 
+                    nif: nif || '0', 
+                    contact: nom.toUpperCase(), 
+                    telephone: telephone || '', 
+                    email: email || '', 
+                    adresse: adresse || '', 
+                    sync_status: 'synced',
+                    updated_at: new Date()
+                } 
+            }
+        ).session(session);
 
-        if (result.changes > 0) {
-            db.prepare(`
-                INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-                VALUES ('customers', ?, 'UPDATE', ?)
-            `).run(id, companyId);
-
-            logAction({
-                userId,
-                userName,
-                actionType: 'MODIFICATION',
-                tableConcernee: 'customers',
-                referenceId: id,
+        if (result.matchedCount > 0) {
+            await CloudAuditLog.create([{
+                localId: `LOG-${Date.now()}`,
+                user_id: userId ? userId.toString() : null,
+                user_name: userName || "user",
+                action_type: 'MODIFICATION',
+                table_concernee: 'customers',
+                reference_id: id,
                 description: `Mise à jour du client: ${nom.toUpperCase()}`,
-                companyId
-            });
+                company_id: companyId.toString(),
+                sync_status: 'synced'
+            }], { session });
         }
-    })();
 
-    return result;
+        await session.commitTransaction();
+        session.endSession();
+
+        return result;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
 // 📌 STATUS
-exports.updateStatus = ({ id, companyId, userId, userName, is_active }) => {
-    const db = getDb();
-    let result;
+exports.updateStatus = async ({ id, companyId, userId, userName, is_active }) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    db.transaction(() => {
-        result = db.prepare(`
-            UPDATE customers 
-            SET is_active = ?, sync_status = 'pending'
-            WHERE id = ? AND company_id = ?
-        `).run(is_active ? 1 : 0, id, companyId);
+    try {
+        const activeVal = is_active ? 1 : 0;
+        const result = await CloudCustomer.updateOne(
+            { 
+                $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }], 
+                company_id: companyId.toString() 
+            },
+            { 
+                $set: { 
+                    is_active: activeVal, 
+                    sync_status: 'synced',
+                    updated_at: new Date() 
+                } 
+            }
+        ).session(session);
 
-        if (result.changes > 0) {
-            db.prepare(`
-                INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-                VALUES ('customers', ?, 'UPDATE', ?)
-            `).run(id, companyId);
-
-            logAction({
-                userId,
-                userName,
-                actionType: 'MODIFICATION',
-                tableConcernee: 'customers',
-                referenceId: id,
+        if (result.matchedCount > 0) {
+            await CloudAuditLog.create([{
+                localId: `LOG-${Date.now()}`,
+                user_id: userId ? userId.toString() : null,
+                user_name: userName || "user",
+                action_type: 'MODIFICATION',
+                table_concernee: 'customers',
+                reference_id: id,
                 description: `Statut client ${id} → ${is_active ? 'Actif' : 'Archivé'}`,
-                companyId
-            });
+                company_id: companyId.toString(),
+                sync_status: 'synced'
+            }], { session });
         }
-    })();
 
-    return result;
+        await session.commitTransaction();
+        session.endSession();
+
+        return result;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
 // 📌 DELETE
-exports.deleteCustomer = ({ id, companyId, userId, userName }) => {
-    const db = getDb();
-    let result;
+exports.deleteCustomer = async ({ id, companyId, userId, userName }) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    db.transaction(() => {
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('customers', ?, 'DELETE', ?)
-        `).run(id, companyId);
+    try {
+        const result = await CloudCustomer.deleteOne({ 
+            $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }], 
+            company_id: companyId.toString() 
+        }).session(session);
 
-        result = db.prepare(`
-            DELETE FROM customers 
-            WHERE id = ? AND company_id = ?
-        `).run(id, companyId);
-
-        if (result.changes > 0) {
-            logAction({
-                userId,
-                userName,
-                actionType: 'SUPPRESSION',
-                tableConcernee: 'customers',
-                referenceId: id,
+        if (result.deletedCount > 0) {
+            await CloudAuditLog.create([{
+                localId: `LOG-${Date.now()}`,
+                user_id: userId ? userId.toString() : null,
+                user_name: userName || "user",
+                action_type: 'SUPPRESSION',
+                table_concernee: 'customers',
+                reference_id: id,
                 description: `Suppression client ${id}`,
-                companyId
-            });
+                company_id: companyId.toString(),
+                sync_status: 'synced'
+            }], { session });
         }
-    })();
 
-    return result;
+        await session.commitTransaction();
+        session.endSession();
+
+        return result;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };

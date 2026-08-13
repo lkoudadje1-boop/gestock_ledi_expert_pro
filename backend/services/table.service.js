@@ -1,80 +1,72 @@
-const { getDb } = require('../config/database');
+// backend/services/table.service.js
+const { dynamicModel } = require('../models/cloud.model');
 const { logAction } = require('../utils/auditHelper');
+const crypto = require('crypto');
 
 class TableService {
     /**
-     * Valide le nom de la table pour éviter les injections SQL et protéger les tables systèmes
+     * Valide le nom de la table pour protéger les collections systèmes
      */
     _validateTableName(tableName) {
         if (!/^[a-z0-9_]+$/i.test(tableName)) {
             throw new Error("Nom de table invalide ou non autorisé.");
         }
-        // Blocage de sécurité pour empêcher la manipulation des tables système critiques via ce service générique
-        const forbiddenTables = ['companies', 'users', 'sync_queue', 'audit_logs'];
+        // Blocage des collections système
+        const forbiddenTables = ['companies', 'users', 'sync_queues', 'audit_logs', 'cloud_staff'];
         if (forbiddenTables.includes(tableName.toLowerCase())) {
-            throw new Error(`Accès refusé : La table '${tableName}' est protégée et ne peut être modifiée par le service générique.`);
+            throw new Error(`Accès refusé : La collection '${tableName}' est protégée.`);
         }
     }
 
     /**
-     * Récupère toutes les lignes actives d'une table pour une entreprise
+     * Récupère toutes les lignes actives d'une collection
      */
-    findAll(tableName, companyId) {
+    async findAll(tableName, companyId) {
         this._validateTableName(tableName);
-        const db = getDb();
+        const Model = dynamicModel(tableName);
         
-        try {
-            return db.prepare(`
-                SELECT * FROM ${tableName} 
-                WHERE (company_id = ? OR company_id IS NULL) AND is_active = 1
-            `).all(companyId);
-        } catch (err) {
-            return db.prepare(`
-                SELECT * FROM ${tableName} 
-                WHERE company_id = ? OR company_id IS NULL
-            `).all(companyId);
-        }
+        // Recherche avec filtre entreprise et statut actif
+        return await Model.find({ 
+            company_id: companyId,
+            $or: [{ is_active: true }, { is_active: { $exists: false } }] 
+        }).lean();
     }
 
     /**
-     * Crée un enregistrement dynamique avec audit et file de synchronisation
+     * Crée un enregistrement dynamique
      */
     async create(tableName, data, user) {
         this._validateTableName(tableName);
-        const db = getDb();
         const { companyId, id: userId, username: userName } = user;
-        
-        // Verrous métiers
+        const Model = dynamicModel(tableName);
+
+        // Verrous métiers spécifiques
         if (tableName === 'restaurant_tables') {
             if (data.name) {
-                const nomExiste = db.prepare(`SELECT id FROM restaurant_tables WHERE LOWER(name) = LOWER(?) AND company_id = ? AND is_active = 1`).get(data.name.trim(), companyId);
+                const nomExiste = await Model.findOne({ name: { $regex: new RegExp(`^${data.name.trim()}$`, 'i') }, company_id: companyId });
                 if (nomExiste) throw new Error(`Le nom de table "${data.name}" est déjà utilisé.`);
-            }
-            if (data.numero) {
-                const numeroExiste = db.prepare(`SELECT id FROM restaurant_tables WHERE numero = ? AND company_id = ? AND is_active = 1`).get(data.numero, companyId);
-                if (numeroExiste) throw new Error(`Le numéro de table "${data.numero}" est déjà attribué.`);
             }
         }
 
         if (tableName === 'unites' && data.code) {
-            const codeExiste = db.prepare(`SELECT id FROM unites WHERE LOWER(code) = LOWER(?) AND company_id = ? AND is_active = 1`).get(data.code.trim(), companyId);
+            const codeExiste = await Model.findOne({ code: { $regex: new RegExp(`^${data.code.trim()}$`, 'i') }, company_id: companyId });
             if (codeExiste) throw new Error(`Le code unité "${data.code.toUpperCase()}" existe déjà.`);
         }
 
-        const prefix = tableName.substring(0, 3).toUpperCase();
-        const id = `${prefix}-${Date.now().toString().slice(-6)}`;
+        const id = `${tableName.substring(0, 3).toUpperCase()}-${Date.now().toString().slice(-6)}`;
+        
+        const newDoc = await Model.create({
+            ...data,
+            localId: id,
+            company_id: companyId,
+            sync_status: 'synced'
+        });
 
-        const rowData = { id, ...data, company_id: companyId, sync_status: 'pending' };
-        const keys = Object.keys(rowData);
-        const placeholders = keys.map(() => '?').join(', ');
-        const values = Object.values(rowData);
+        await logAction({ 
+            userId, userName, actionType: 'CREATE', tableConcernee: tableName, 
+            referenceId: id, description: `Insertion dynamique collection [${tableName}]`, companyId 
+        });
 
-        db.transaction(() => {
-            db.prepare(`INSERT INTO ${tableName} (${keys.join(', ')}) VALUES (${placeholders})`).run(values);
-            db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES (?, ?, 'INSERT', ?)`).run(tableName, id, companyId);
-        })();
-
-        logAction({ userId, userName, actionType: 'CREATE', tableConcernee: tableName, referenceId: id, description: `Insertion dynamique table [${tableName}]`, companyId });
         return id;
     }
 
@@ -83,33 +75,34 @@ class TableService {
      */
     async update(tableName, id, data, user) {
         this._validateTableName(tableName);
-        const db = getDb();
         const { companyId, id: userId, username: userName } = user;
+        const Model = dynamicModel(tableName);
 
         if (tableName === 'unites' && data.code) {
-            const codeExiste = db.prepare(`SELECT id FROM unites WHERE LOWER(code) = LOWER(?) AND company_id = ? AND id != ? AND is_active = 1`).get(data.code.trim(), companyId, id);
+            const codeExiste = await Model.findOne({ 
+                code: { $regex: new RegExp(`^${data.code.trim()}$`, 'i') }, 
+                company_id: companyId, 
+                localId: { $ne: id } 
+            });
             if (codeExiste) throw new Error(`Le code unité "${data.code.toUpperCase()}" est déjà attribué.`);
         }
 
-        const rowData = { ...data };
-        delete rowData.id;
-        delete rowData.company_id;
+        const updateData = { ...data, updated_at: new Date(), sync_status: 'synced' };
+        delete updateData.localId;
+        delete updateData.company_id;
 
-        const keys = Object.keys(rowData);
-        if (keys.length === 0) throw new Error("Aucune donnée à mettre à jour.");
+        const result = await Model.updateOne(
+            { localId: id.toString(), company_id: companyId },
+            { $set: updateData }
+        );
 
-        const setClause = keys.map(key => `${key} = ?`).join(', ') + ", sync_status = 'pending', updated_at = CURRENT_TIMESTAMP";
-        const values = [...Object.values(rowData), id, companyId];
+        if (result.matchedCount === 0) throw new Error("Enregistrement introuvable.");
 
-        db.transaction(() => {
-            const existing = db.prepare(`SELECT id FROM ${tableName} WHERE id = ? AND company_id = ?`).get(id, companyId);
-            if (!existing) throw new Error(`Enregistrement introuvable.`);
+        await logAction({ 
+            userId, userName, actionType: 'UPDATE', tableConcernee: tableName, 
+            referenceId: id, description: `Mise à jour dynamique collection [${tableName}]`, companyId 
+        });
 
-            db.prepare(`UPDATE ${tableName} SET ${setClause} WHERE id = ? AND company_id = ?`).run(values);
-            db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES (?, ?, 'UPDATE', ?)`).run(tableName, id, companyId);
-        })();
-
-        logAction({ userId, userName, actionType: 'UPDATE', tableConcernee: tableName, referenceId: id, description: `Mise à jour dynamique table [${tableName}]`, companyId });
         return { success: true };
     }
 
@@ -118,18 +111,18 @@ class TableService {
      */
     async delete(tableName, id, user) {
         this._validateTableName(tableName);
-        const db = getDb();
         const { companyId, id: userId, username: userName } = user;
+        const Model = dynamicModel(tableName);
 
-        db.transaction(() => {
-            const current = db.prepare(`SELECT id FROM ${tableName} WHERE id = ? AND company_id = ?`).get(id, companyId);
-            if (!current) throw new Error("Enregistrement introuvable.");
+        const result = await Model.deleteOne({ localId: id.toString(), company_id: companyId });
+        
+        if (result.deletedCount === 0) throw new Error("Enregistrement introuvable.");
 
-            db.prepare(`DELETE FROM ${tableName} WHERE id = ? AND company_id = ?`).run(id, companyId);
-            db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES (?, ?, 'DELETE', ?)`).run(tableName, id, companyId);
-        })();
+        await logAction({ 
+            userId, userName, actionType: 'DELETE', tableConcernee: tableName, 
+            referenceId: id, description: `Suppression enregistrement ${id} [${tableName}]`, companyId 
+        });
 
-        logAction({ userId, userName, actionType: 'DELETE', tableConcernee: tableName, referenceId: id, description: `Suppression enregistrement ${id} [${tableName}]`, companyId });
         return { success: true };
     }
 }

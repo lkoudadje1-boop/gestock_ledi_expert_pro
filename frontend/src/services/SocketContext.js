@@ -1,3 +1,4 @@
+// frontend/src/services/SocketContext.js
 import React, { createContext, useContext, useEffect, useState } from 'react';
 import { io } from 'socket.io-client';
 
@@ -7,9 +8,8 @@ export const SocketProvider = ({ children }) => {
   const [socket, setSocket] = useState(null);
 
   useEffect(() => {
-    const SOCKET_URL = window.location.hostname === 'localhost' 
-      ? "http://localhost:3030" 
-      : "https://erp-ledi-expert-backend-v1.onrender.com";
+    // 🌐 URL du backend sur Railway (ou variable d'environnement React)
+    const SOCKET_URL = process.env.REACT_APP_WS_URL || 'https://ton-projet.railway.app';
 
     const newSocket = io(SOCKET_URL, {
       transports: ['websocket'],
@@ -21,7 +21,6 @@ export const SocketProvider = ({ children }) => {
       const userData = localStorage.getItem('user');
       if (userData) {
         const user = JSON.parse(userData);
-        // Attention : vérifie si c'est company_id ou companyId dans ton objet user
         const cid = user.company_id || user.companyId; 
         if (cid) {
           console.log("🏢 Tentative de rejoindre la salle :", cid);
@@ -31,7 +30,7 @@ export const SocketProvider = ({ children }) => {
     };
 
     newSocket.on('connect', () => {
-      console.log("✅ Socket connecté");
+      console.log("✅ Socket connecté au Cloud");
       joinRoom();
     });
 
@@ -44,7 +43,7 @@ export const SocketProvider = ({ children }) => {
         window.dispatchEvent(event);
     });
 
-    // Écouter si l'utilisateur se connecte (si tu stockes le user après le login)
+    // Écouter si l'utilisateur se connecte (changement dans le localStorage)
     window.addEventListener('storage', joinRoom);
 
     setSocket(newSocket);

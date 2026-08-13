@@ -1,35 +1,40 @@
+// backend/controllers/client.controller.js
 const clientService = require('../services/client.service');
 
 // 📌 GET - Récupérer tous les clients
-exports.getAllCustomers = (req, res) => {
+exports.getAllCustomers = async (req, res) => {
     try {
-        const companyId = req.user?.companyId;
+        const companyId = req.user?.companyId || req.user?.company_id;
         if (!companyId) return res.status(401).json({ error: "Non autorisé." });
 
-        const customers = clientService.getAllCustomers(companyId);
-        res.json(customers);
+        const customers = await clientService.getAllCustomers(companyId);
+        return res.json(customers);
 
     } catch (err) {
         console.error(err.message);
-        res.status(500).json({ error: "Erreur récupération clients." });
+        return res.status(500).json({ error: "Erreur récupération clients." });
     }
 };
 
 // 📌 CREATE - Création d'un client
-exports.createCustomer = (req, res) => {
+exports.createCustomer = async (req, res) => {
     try {
+        const companyId = req.user?.companyId || req.user?.company_id;
+        const userId = req.user?.userId || req.user?.id;
         const { nom } = req.body;
+        
         if (!nom) return res.status(400).json({ error: "Nom obligatoire." });
+        if (!companyId) return res.status(401).json({ error: "Non autorisé." });
 
-        const id = clientService.createCustomer({
-            companyId: req.user.companyId,
-            userId: req.user.userId,
-            userName: req.user.username,
+        const id = await clientService.createCustomer({
+            companyId: companyId,
+            userId: userId,
+            userName: req.user?.username || "user",
             data: req.body
         });
 
         if (req.io) {
-            const room = req.user.companyId.toString();
+            const room = companyId.toString();
 
             // 🔥 SIGNAL UNIVERSEL (Pour ton SocketContext)
             req.io.to(room).emit('DATA_EVENT', { 
@@ -43,33 +48,37 @@ exports.createCustomer = (req, res) => {
             req.io.to(room).emit('REFRESH_UI', { module: 'CUSTOMERS', action: 'CREATE' });
         }
 
-        res.status(201).json({ success: true, id });
+        return res.status(201).json({ success: true, id });
 
     } catch (err) {
-        if (err.message?.includes("UNIQUE")) {
+        if (err.code === 11000 || err.message?.includes("UNIQUE") || err.message?.includes("déjà")) {
             return res.status(400).json({ error: "Téléphone ou NIF déjà utilisé." });
         }
-        res.status(500).json({ error: "Erreur création client." });
+        return res.status(500).json({ error: "Erreur création client : " + err.message });
     }
 };
 
 // 📌 UPDATE - Modification d'un client
-exports.updateCustomer = (req, res) => {
+exports.updateCustomer = async (req, res) => {
     try {
-        const result = clientService.updateCustomer({
+        const companyId = req.user?.companyId || req.user?.company_id;
+        const userId = req.user?.userId || req.user?.id;
+        if (!companyId) return res.status(401).json({ error: "Non autorisé." });
+
+        const result = await clientService.updateCustomer({
             id: req.params.id,
-            companyId: req.user.companyId,
-            userId: req.user.userId,
-            userName: req.user.username,
+            companyId: companyId,
+            userId: userId,
+            userName: req.user?.username || "user",
             data: req.body
         });
 
-        if (!result || result.changes === 0) {
+        if (!result || result.modifiedCount === 0 && result.matchedCount === 0) {
             return res.status(404).json({ error: "Client introuvable." });
         }
 
         if (req.io) {
-            const room = req.user.companyId.toString();
+            const room = companyId.toString();
 
             // 🔥 SIGNAL UNIVERSEL
             req.io.to(room).emit('DATA_EVENT', { 
@@ -85,33 +94,37 @@ exports.updateCustomer = (req, res) => {
             });
         }
 
-        res.json({ success: true });
+        return res.json({ success: true });
 
     } catch (err) {
-        if (err.message?.includes("UNIQUE")) {
+        if (err.code === 11000 || err.message?.includes("UNIQUE")) {
             return res.status(400).json({ error: "Téléphone déjà utilisé par un autre client." });
         }
-        res.status(500).json({ error: "Erreur modification." });
+        return res.status(500).json({ error: "Erreur modification : " + err.message });
     }
 };
 
 // 📌 STATUS - Activer/Archiver un client
-exports.updateStatus = (req, res) => {
+exports.updateStatus = async (req, res) => {
     try {
-        const result = clientService.updateStatus({
+        const companyId = req.user?.companyId || req.user?.company_id;
+        const userId = req.user?.userId || req.user?.id;
+        if (!companyId) return res.status(401).json({ error: "Non autorisé." });
+
+        const result = await clientService.updateStatus({
             id: req.params.id,
-            companyId: req.user.companyId,
-            userId: req.user.userId,
-            userName: req.user.username,
+            companyId: companyId,
+            userId: userId,
+            userName: req.user?.username || "user",
             is_active: req.body.is_active
         });
 
-        if (!result || result.changes === 0) {
+        if (!result || result.modifiedCount === 0 && result.matchedCount === 0) {
             return res.status(404).json({ error: "Client introuvable." });
         }
 
         if (req.io) {
-            const room = req.user.companyId.toString();
+            const room = companyId.toString();
 
             // 🔥 SIGNAL UNIVERSEL
             req.io.to(room).emit('DATA_EVENT', { 
@@ -127,29 +140,33 @@ exports.updateStatus = (req, res) => {
             });
         }
 
-        res.json({ success: true });
+        return res.json({ success: true });
 
     } catch (err) {
-        res.status(500).json({ error: "Erreur lors du changement de statut." });
+        return res.status(500).json({ error: "Erreur lors du changement de statut : " + err.message });
     }
 };
 
 // 📌 DELETE - Supprimer un client
-exports.deleteCustomer = (req, res) => {
+exports.deleteCustomer = async (req, res) => {
     try {
-        const result = clientService.deleteCustomer({
+        const companyId = req.user?.companyId || req.user?.company_id;
+        const userId = req.user?.userId || req.user?.id;
+        if (!companyId) return res.status(401).json({ error: "Non autorisé." });
+
+        const result = await clientService.deleteCustomer({
             id: req.params.id,
-            companyId: req.user.companyId,
-            userId: req.user.userId,
-            userName: req.user.username
+            companyId: companyId,
+            userId: userId,
+            userName: req.user?.username || "user"
         });
 
-        if (!result || result.changes === 0) {
+        if (!result || result.deletedCount === 0) {
             return res.status(404).json({ error: "Client introuvable." });
         }
 
         if (req.io) {
-            const room = req.user.companyId.toString();
+            const room = companyId.toString();
 
             // 🔥 SIGNAL UNIVERSEL
             req.io.to(room).emit('DATA_EVENT', { 
@@ -165,9 +182,9 @@ exports.deleteCustomer = (req, res) => {
             });
         }
 
-        res.json({ success: true });
+        return res.json({ success: true });
 
     } catch (err) {
-        res.status(500).json({ error: "Erreur lors de la suppression." });
+        return res.status(500).json({ error: "Erreur lors de la suppression : " + err.message });
     }
 };

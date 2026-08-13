@@ -2,103 +2,34 @@
   "name": "erp-ledi-expert-pro",
   "version": "1.1.0",
   "type": "commonjs",
-  "main": "electron/main.js",
-  "description": "ERP LEDI EXPERT PRO - Offline First Electron + SQLite",
+  "main": "backend/index.js",
+  "description": "ERP LEDI EXPERT PRO - 100% Cloud Web App",
   "engines": {
     "node": "22.x"
   },
-"scripts": {
+  "scripts": {
     "start": "node backend/index.js",
-    "backend": "node backend/index.js",
-    "ui": "npm start --prefix frontend",
-    "desktop": "wait-on http://localhost:3000 && electron .",
-    "rebuild": "electron-rebuild -v 30.5.1 -f -w better-sqlite3-multiple-ciphers",
-    "postinstall": "npm rebuild better-sqlite3-multiple-ciphers --update-binary",
-    "build": "npm install --prefix frontend && npm run prod:build-ui",
-    "prod:build-ui": "npm run build --prefix frontend",
-    "prod:bundle-backend": "ncc build backend/index.js -o backend_dist --no-cache --external better-sqlite3-multiple-ciphers",
-    "prod:obfuscate-backend": "javascript-obfuscator backend_dist/index.js --output backend_dist/index.js --compact true --string-array true --string-array-encoding base64 --string-array-threshold 1.0",
-    "prod:dist": "npm run prod:build-ui && npm run prod:bundle-backend && npm run prod:obfuscate-backend && npm run rebuild && electron-builder --win"
-  },
-  "build": {
-    "appId": "com.lediexpert.pro",
-    "productName": "Ledi Expert Pro",
-    "copyright": "Copyright © 2026 Léon Koudadje",
-    "npmRebuild": false,
-    "directories": {
-      "output": "dist_electron"
-    },
-    "files": [
-      "package.json",
-      "electron/**/*",
-      "backend_dist/**/*",
-      "frontend/build/**/*",
-      "node_modules/**/*",
-      "!frontend/src/**/*",
-      "!frontend/public/**/*",
-      "!backend/**/*",
-      "!backend_dist/.env",
-      "!.env",
-      "!dist_electron/**/*",
-      "!**/*.map"
-    ],
-    "asar": true,
-    "asarUnpack": [
-      "backend_dist/**/*",
-      "**/node_modules/better-sqlite3-multiple-ciphers/**",
-      "**/node_modules/electron-store/**"
-    ],
-    "win": {
-      "target": "nsis",
-      "icon": "assets/icon.ico"
-    },
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true,
-      "shortcutName": "Ledi Expert Pro",
-      "createDesktopShortcut": true
-    }
+    "dev": "node backend/index.js"
   },
   "dependencies": {
     "axios": "^1.16.0",
-    "bcrypt": "^6.0.0",
     "bcryptjs": "^3.0.3",
-    "better-sqlite3-multiple-ciphers": "^12.9.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
-    "electron-store": "^8.1.0",
     "express": "^4.22.1",
     "express-rate-limit": "^8.2.1",
-    "html2canvas": "^1.4.1",
-    "i18next": "^23.x.x",
-    "i18next-browser-languagedetector": "^8.x.x",
     "jsonwebtoken": "^9.0.3",
-    "jspdf": "^4.1.0",
-    "jspdf-autotable": "^5.0.7",
     "mongoose": "^9.6.2",
     "multer": "^2.1.1",
     "node-cache": "^5.1.2",
-    "node-machine-id": "^1.1.12",
     "nodemailer": "^8.0.1",
-    "pdf-to-printer": "^5.8.0",
-    "react-i18next": "^14.x.x",
-    "recharts": "^3.9.0",
     "socket.io": "^4.8.3",
-    "socket.io-client": "^4.8.3",
-    "tweetnacl": "^1.0.3",
-    "tweetnacl-util": "^0.15.1",
     "uuid": "^13.0.0",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
-    "@vercel/ncc": "^0.38.4",
     "concurrently": "^8.2.2",
-    "cross-env": "^10.1.0",
-    "electron": "^30.5.1",
-    "electron-builder": "^26.8.1",
-    "electron-rebuild": "^3.2.9",
-    "javascript-obfuscator": "^4.1.1",
-    "wait-on": "^9.0.3"
+    "cross-env": "^10.1.0"
   },
   "author": "Léon Koudadje",
   "license": "MIT"

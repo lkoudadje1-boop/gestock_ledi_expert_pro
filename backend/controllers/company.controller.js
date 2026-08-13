@@ -1,8 +1,9 @@
+// backend/controllers/company.controller.js
 const companyService = require('../services/company.service');
-const { getDb } = require('../config/database');
+const { CloudCompany } = require('../models/cloud.model');
 const { tokenCache } = require('../middlewares/auth.middleware');
 
-// ✅ TON UTILITAIRE DE CONTEXTE HARMONISÉ
+// Utilitaires de contexte harmonisé
 const getContext = (req) => {
     const user = req.user || {};
     const companyId = user.companyId || user.company_id;
@@ -11,7 +12,7 @@ const getContext = (req) => {
     return {
         companyId: companyId,
         userId: userId || 'USR-SYSTEM',
-        userName: user.username || 'Utilisateur'
+        userName: 'user' // Respect de la consigne [2026-02-08]
     };
 };
 
@@ -21,54 +22,54 @@ exports.getCompanySettings = async (req, res) => {
     if (!context.companyId) return res.status(400).json({ error: "ID Entreprise manquant" });
 
     try {
-        const settings = companyService.fetchSettings(context.companyId);
+        const settings = await companyService.fetchSettings(context.companyId);
         if (!settings) return res.status(404).json({ error: "Réglages non trouvés" });
-        res.json(settings);
+        return res.json(settings);
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        return res.status(500).json({ error: err.message });
     }
 };
 
 // 2. Création initiale de société (signup)
-// MODIFIÉ : Retourne maintenant l'objet complet (ID technique + Code court)
 exports.createCompany = async (req, res) => {
     try {
-        const result = companyService.initCompany(req.body); 
+        const result = await companyService.initCompany(req.body); 
         
         console.log(`✅ SYSTÈME INITIALISÉ POUR : ${result.companyId} (${result.companyCode})`);
         
-        res.status(201).json({ 
+        return res.status(201).json({ 
             success: true, 
-            data: result // Contient companyId, companyCode, adminId, exerciceId
+            data: result 
         });
     } catch (error) {
         console.error("🚨 ERREUR CRITIQUE SIGNUP :", error.message);
-        res.status(500).json({ error: "Échec complet : " + error.message });
+        return res.status(500).json({ error: "Échec complet : " + error.message });
     }
 };
 
 // 3. Récupérer les données d'une société par ID
-exports.getCompany = (req, res) => {
-    const db = getDb();
+exports.getCompany = async (req, res) => {
     const { id } = req.params;
     try {
-        const company = db.prepare("SELECT * FROM companies WHERE id = ?").get(id);
+        const company = await CloudCompany.findOne({ 
+            $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }] 
+        }).lean();
+
         if (!company) return res.status(404).json({ error: "Société non trouvée" });
-        res.json({ success: true, data: company });
+        return res.json({ success: true, data: company });
     } catch (err) {
-        res.status(500).json({ error: "Erreur récupération." });
+        return res.status(500).json({ error: "Erreur récupération : " + err.message });
     }
 };
 
 // 4. Mettre à jour les infos et options
-exports.updateCompany = (req, res) => {
+exports.updateCompany = async (req, res) => {
     const { id } = req.params; 
     const context = getContext(req);
 
     try {
-        companyService.modifyCompany(id, req.body, context);
+        await companyService.modifyCompany(id, req.body, context);
 
-        // Nettoyage du cache pour forcer la prise en compte des nouveaux réglages
         if (tokenCache && context.userId) {
             tokenCache.del(context.userId);
             console.log(`🧹 Cache vidé pour l'utilisateur ${context.userId}`);
@@ -83,19 +84,19 @@ exports.updateCompany = (req, res) => {
             });
         }
 
-        res.json({ success: true, message: "Mis à jour avec succès" });
+        return res.json({ success: true, message: "Mis à jour avec succès" });
     } catch (err) {
-        res.status(err.message === "Société non trouvée" ? 404 : 500).json({ error: err.message });
+        return res.status(err.message === "Société non trouvée" ? 404 : 500).json({ error: err.message });
     }
 };
 
 // 5. Mettre à jour la précision
-exports.updatePrecision = (req, res) => {
+exports.updatePrecision = async (req, res) => {
     const { id } = req.params;
     const context = getContext(req);
 
     try {
-        companyService.modifyPrecision(id, req.body, context);
+        await companyService.modifyPrecision(id, req.body, context);
 
         if (req.io) {
             const room = id.toString();
@@ -105,8 +106,8 @@ exports.updatePrecision = (req, res) => {
             });
         }
 
-        res.json({ success: true, message: "Structure mise à jour." });
+        return res.json({ success: true, message: "Structure mise à jour." });
     } catch (err) {
-        res.status(500).json({ error: err.message });
+        return res.status(500).json({ error: err.message });
     }
 };

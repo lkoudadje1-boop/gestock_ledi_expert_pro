@@ -1,39 +1,68 @@
-const { getDb } = require('../config/database');
-// Import de la fonction d'audit (adapte le chemin si nécessaire)
-const { logAction } = require('../utils/auditHelper'); 
+// backend/services/Brouillard.saisie.service.js
+const mongoose = require('mongoose');
+
+// --- CONFIGURATION MODÈLES CLOUD ---
+const cloudSchema = new mongoose.Schema({}, { strict: false });
+const CloudBrouillardLigneTreso = mongoose.models.CloudBrouillardLigneTreso || mongoose.model('CloudBrouillardLigneTreso', cloudSchema, 'brouillard_lignes_treso');
+const CloudBrouillardTreso = mongoose.models.CloudBrouillardTreso || mongoose.model('CloudBrouillardTreso', cloudSchema, 'brouillards_treso');
+const CloudJournal = mongoose.models.CloudJournal || mongoose.model('CloudJournal', cloudSchema, 'journaux');
+const CloudExercice = mongoose.models.CloudExercice || mongoose.model('CloudExercice', cloudSchema, 'exercices');
+const CloudBrouillardAffectation = mongoose.models.CloudBrouillardAffectation || mongoose.model('CloudBrouillardAffectation', cloudSchema, 'brouillard_affectations');
+const CloudPlanComptable = mongoose.models.CloudPlanComptable || mongoose.model('CloudPlanComptable', cloudSchema, 'plan_comptable');
+const CloudBrouillonEcriture = mongoose.models.CloudBrouillonEcriture || mongoose.model('CloudBrouillonEcriture', cloudSchema, 'brouillon_ecritures');
+const CloudBrouillonLigne = mongoose.models.CloudBrouillonLigne || mongoose.model('CloudBrouillonLigne', cloudSchema, 'brouillon_lignes');
+const CloudBrouillonLigneAnalytique = mongoose.models.CloudBrouillonLigneAnalytique || mongoose.model('CloudBrouillonLigneAnalytique', cloudSchema, 'brouillon_lignes_analytiques');
+const CloudEcriture = mongoose.models.CloudEcriture || mongoose.model('CloudEcriture', cloudSchema, 'ecritures');
+const CloudLigneEcriture = mongoose.models.CloudLigneEcriture || mongoose.model('CloudLigneEcriture', cloudSchema, 'lignes_ecritures');
+const CloudLigneAnalytique = mongoose.models.CloudLigneAnalytique || mongoose.model('CloudLigneAnalytique', cloudSchema, 'lignes_analytiques');
+const CloudAuditLog = mongoose.models.CloudAuditLog || mongoose.model('CloudAuditLog', cloudSchema, 'audit_log');
 
 class BrouillardSaisieService {
     // 1. Créer une nouvelle opération
     async creerOperation({ companyId, userId, body }) {
-        const db = getDb();
         const { brouillard_id, date_mouvement, libelle, piece_ref, type_flux, montant } = body;
+        const session = await mongoose.startSession();
+        session.startTransaction();
 
-        return db.transaction(() => {
-            const affectation = db.prepare(`
-                SELECT peut_saisir FROM brouillard_affectations 
-                WHERE brouillard_id = ? AND user_id = ? AND company_id = ?
-            `).get(brouillard_id, userId, companyId);
+        try {
+            const affectation = await CloudBrouillardAffectation.findOne({
+                brouillard_id: brouillard_id,
+                user_id: userId,
+                company_id: companyId
+            }).session(session).lean();
 
             if (!affectation || affectation.peut_saisir !== 1) {
                 throw new Error("Accès refusé : Vous n'avez pas le droit de saisie sur ce brouillard.");
             }
 
-            const exercice = db.prepare(`SELECT id FROM exercices WHERE company_id = ? AND statut = 'OUVERT'`).get(companyId);
+            const exercice = await CloudExercice.findOne({ company_id: companyId, statut: 'OUVERT' }).session(session).lean();
             if (!exercice) throw new Error("Aucun exercice comptable OUVERT trouvé.");
 
-            const brouillard = db.prepare(`
-                SELECT b.*, j.code, j.compteur_piece, j.longueur_compteur, j.prefixe_piece 
-                FROM brouillards_treso b JOIN journaux j ON b.journal_id = j.id WHERE b.id = ?
-            `).get(brouillard_id);
+            const brouillard = await CloudBrouillardTreso.findOne({ localId: brouillard_id, company_id: companyId }).session(session).lean()
+                || await CloudBrouillardTreso.findOne({ _id: mongoose.isValidObjectId(brouillard_id) ? brouillard_id : null }).session(session).lean();
 
-            const montantNum = parseFloat(montant);
+            if (!brouillard) throw new Error("Brouillard de trésorerie introuvable.");
 
-            const s = db.prepare(`
-                SELECT SUM(CASE WHEN type_flux = 'ENCAISSEMENT' THEN montant ELSE -montant END) as reel
-                FROM brouillard_lignes_treso 
-                WHERE brouillard_id = ? AND statut = 'VALIDE' AND (v1_statut IS NULL OR v1_statut != 9)
-            `).get(brouillard_id);
-            const soldeReel = (brouillard.solde_initial || 0) + (s.reel || 0);
+            const journal = await CloudJournal.findOne({ localId: brouillard.journal_id, company_id: companyId }).session(session).lean()
+                || await CloudJournal.findOne({ _id: mongoose.isValidObjectId(brouillard.journal_id) ? brouillard.journal_id : null }).session(session).lean();
+
+            if (!journal) throw new Error("Journal associé introuvable.");
+
+            const montantNum = parseFloat(montant) || 0;
+
+            const lignesValides = await CloudBrouillardLigneTreso.find({
+                brouillard_id: brouillard_id,
+                company_id: companyId,
+                statut: 'VALIDE',
+                $or: [{ v1_statut: { $exists: false } }, { v1_statut: null }, { v1_statut: { $ne: 9 } }]
+            }).session(session).lean();
+
+            let sumReel = 0;
+            lignesValides.forEach(l => {
+                sumReel += (l.type_flux === 'ENCAISSEMENT' ? Number(l.montant || 0) : -Number(l.montant || 0));
+            });
+
+            const soldeReel = (Number(brouillard.solde_initial) || 0) + sumReel;
 
             let statutInitial = 'VALIDE';
             if (type_flux === 'DECAISSEMENT') {
@@ -44,428 +73,732 @@ class BrouillardSaisieService {
                 }
             }
 
-            const sequence = String(brouillard.compteur_piece).padStart(brouillard.longueur_compteur || 4, '0');
-            const pieceChrono = `${brouillard.prefixe_piece || brouillard.code}-${sequence}`;
+            const compteurPiece = Number(journal.compteur_piece || 1);
+            const longueurCompteur = Number(journal.longueur_compteur || 4);
+            const sequence = String(compteurPiece).padStart(longueurCompteur, '0');
+            const pieceChrono = `${journal.prefixe_piece || journal.code}-${sequence}`;
             
-            // Mise à jour du compteur journal avec marquage sync_status
-            db.prepare(`UPDATE journaux SET compteur_piece = compteur_piece + 1, sync_status = 'pending' WHERE id = ?`).run(brouillard.journal_id);
-            db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('journaux', ?, 'UPDATE', ?)`).run(brouillard.journal_id, companyId);
+            // Mise à jour du compteur journal
+            await CloudJournal.updateOne(
+                { _id: journal._id },
+                { $inc: { compteur_piece: 1 }, $set: { sync_status: 'synced', updated_at: new Date() } },
+                { session }
+            );
 
             const id = `OPTR-${Date.now()}`;
-            db.prepare(`
-                INSERT INTO brouillard_lignes_treso (
-                    id, company_id, brouillard_id, journal_id, exercice_id, user_id, 
-                    date_mouvement, libelle, piece_ref, piece_comptable, type_flux, montant, statut,
-                    v1_statut, v2_statut, v3_statut, v4_statut, sync_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'pending')
-            `).run(id, companyId, brouillard_id, brouillard.journal_id, exercice.id, userId, date_mouvement, libelle.toUpperCase(), piece_ref || null, pieceChrono, type_flux, montantNum, statutInitial);
-
-            // Synchronisation de la nouvelle ligne de trésorerie
-            db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillard_lignes_treso', ?, 'INSERT', ?)`).run(id, companyId);
+            await CloudBrouillardLigneTreso.create([{
+                localId: id,
+                id: id,
+                company_id: companyId,
+                brouillard_id: brouillard_id,
+                journal_id: brouillard.journal_id,
+                exercice_id: exercice.localId || exercice._id.toString(),
+                user_id: userId,
+                date_mouvement: date_mouvement,
+                libelle: libelle ? libelle.toUpperCase() : '',
+                piece_ref: piece_ref || null,
+                piece_comptable: pieceChrono,
+                type_flux: type_flux,
+                montant: montantNum,
+                statut: statutInitial,
+                v1_statut: 0,
+                v2_statut: 0,
+                v3_statut: 0,
+                v4_statut: 0,
+                sync_status: 'synced'
+            }], { session });
 
             // ─── AUDIT DE CRÉATION ───────────────────────────────────────────
-            logAction({
-                userId,
-                actionType: 'CREATION',
-                tableConcernee: 'brouillard_lignes_treso',
-                referenceId: id,
+            await CloudAuditLog.create([{
+                localId: `LOG-${Date.now()}`,
+                user_id: userId,
+                user_name: "user",
+                action_type: 'CREATION',
+                table_concernee: 'brouillard_lignes_treso',
+                reference_id: id,
                 description: `Création opération de trésorerie (${type_flux}) - Pièce ${pieceChrono} - Montant : ${montantNum} F - Statut : ${statutInitial}`,
-                companyId
-            });
+                company_id: companyId,
+                sync_status: 'synced'
+            }], { session });
 
+            await session.commitTransaction();
+            session.endSession();
             return { id, pieceChrono, statutInitial };
-        })();
+        } catch (err) {
+            await session.abortTransaction();
+            session.endSession();
+            throw err;
+        }
     }
 
     // 2. Modifier une opération
     async modifierOperation(id, { libelle, piece_ref, montant, userId, companyId }) {
-        const db = getDb();
-        const op = db.prepare('SELECT * FROM brouillard_lignes_treso WHERE id = ?').get(id);
-        if (!op) throw new Error("Opération introuvable.");
+        const session = await mongoose.startSession();
+        session.startTransaction();
 
-        if (!['BROUILLON', 'EN_ATTENTE'].includes(op.statut)) {
-            throw new Error("Modification interdite : opération déjà validée.");
-        }
+        try {
+            const op = await CloudBrouillardLigneTreso.findOne({ $or: [{ localId: id }, { id: id }], company_id: companyId }).session(session).lean();
+            if (!op) throw new Error("Opération introuvable.");
 
-        db.transaction(() => {
-            db.prepare(`
-                UPDATE brouillard_lignes_treso 
-                SET libelle = ?, piece_ref = ?, montant = ?, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP 
-                WHERE id = ?
-            `).run(libelle.toUpperCase(), piece_ref, montant, id);
+            if (!['BROUILLON', 'EN_ATTENTE'].includes(op.statut)) {
+                throw new Error("Modification interdite : opération déjà validée.");
+            }
 
-            db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillard_lignes_treso', ?, 'UPDATE', ?)`).run(id, companyId);
+            const nouveauMontant = parseFloat(montant) || 0;
+
+            await CloudBrouillardLigneTreso.updateOne(
+                { _id: op._id },
+                { 
+                    $set: { 
+                        libelle: libelle ? libelle.toUpperCase() : '', 
+                        piece_ref: piece_ref, 
+                        montant: nouveauMontant, 
+                        sync_status: 'synced', 
+                        updated_at: new Date() 
+                    } 
+                },
+                { session }
+            );
             
             // ─── AUDIT DE MODIFICATION ───────────────────────────────────────
-            logAction({
-                userId,
-                actionType: 'MODIFICATION',
-                tableConcernee: 'brouillard_lignes_treso',
-                referenceId: id,
-                description: `Modification opé. ${op.piece_comptable}. Ancien montant: ${op.montant} F -> Nouveau: ${montant} F`,
-                companyId
-            });
-        });
+            await CloudAuditLog.create([{
+                localId: `LOG-${Date.now()}`,
+                user_id: userId,
+                user_name: "user",
+                action_type: 'MODIFICATION',
+                table_concernee: 'brouillard_lignes_treso',
+                reference_id: id,
+                description: `Modification opé. ${op.piece_comptable}. Ancien montant: ${op.montant} F -> Nouveau: ${nouveauMontant} F`,
+                company_id: companyId,
+                sync_status: 'synced'
+            }], { session });
 
-        return { success: true };
+            await session.commitTransaction();
+            session.endSession();
+            return { success: true };
+        } catch (err) {
+            await session.abortTransaction();
+            session.endSession();
+            throw err;
+        }
     }
 
     // 3. Supprimer / Annuler
     async supprimerOperation(id, motif, userId, companyId) {
-        const db = getDb();
-        const op = db.prepare(`
-            SELECT l.*, b.mode_fonctionnement, b.seuil_validation, b.niv1_user_id 
-            FROM brouillard_lignes_treso l
-            JOIN brouillards_treso b ON l.brouillard_id = b.id
-            WHERE l.id = ? AND l.company_id = ?
-        `).get(id, companyId);
+        const session = await mongoose.startSession();
+        session.startTransaction();
 
-        if (!op) throw new Error("Opération introuvable.");
+        try {
+            const op = await CloudBrouillardLigneTreso.findOne({ $or: [{ localId: id }, { id: id }], company_id: companyId }).session(session).lean();
+            if (!op) throw new Error("Opération introuvable.");
 
-        if (op.comptabilise === 1) {
-            throw new Error("Action impossible : Cette opération a déjà été ventilée en comptabilité.");
-        }
+            if (op.comptabilise === 1) {
+                throw new Error("Action impossible : Cette opération a déjà été ventilée en comptabilité.");
+            }
 
-        const affectation = db.prepare(`
-            SELECT peut_saisir FROM brouillard_affectations 
-            WHERE brouillard_id = ? AND user_id = ? AND company_id = ?
-        `).get(op.brouillard_id, userId, companyId);
+            const affectation = await CloudBrouillardAffectation.findOne({
+                brouillard_id: op.brouillard_id,
+                user_id: userId,
+                company_id: companyId
+            }).session(session).lean();
 
-        if (!affectation || affectation.peut_saisir !== 1) {
-            throw new Error("Accès refusé : Vous n'avez pas le droit de modifier ce brouillard.");
-        }
+            if (!affectation || affectation.peut_saisir !== 1) {
+                throw new Error("Accès refusé : Vous n'avez pas le droit de modifier ce brouillard.");
+            }
 
-        if (['BROUILLON', 'EN_ATTENTE', 'APPROUVE'].includes(op.statut)) {
-            db.transaction(() => {
-                if (op.id.includes('ANNUL')) {
-                    db.prepare(`UPDATE brouillard_lignes_treso SET v1_statut = NULL, sync_status = 'pending' WHERE piece_comptable = ? AND v1_statut = 9`).run(op.piece_comptable);
-                    // Récupération de la ligne impactée pour la synchro
-                    const affected = db.prepare(`SELECT id FROM brouillard_lignes_treso WHERE piece_comptable = ? AND v1_statut IS NULL`).get(op.piece_comptable);
-                    if (affected) {
-                        db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillard_lignes_treso', ?, 'UPDATE', ?)`).run(affected.id, companyId);
-                    }
+            const brouillard = await CloudBrouillardTreso.findOne({ localId: op.brouillard_id, company_id: companyId }).session(session).lean()
+                || await CloudBrouillardTreso.findOne({ _id: mongoose.isValidObjectId(op.brouillard_id) ? op.brouillard_id : null }).session(session).lean();
+
+            if (['BROUILLON', 'EN_ATTENTE', 'APPROUVE'].includes(op.statut)) {
+                if (op.id?.includes('ANNUL') || op.localId?.includes('ANNUL')) {
+                    await CloudBrouillardLigneTreso.updateMany(
+                        { piece_comptable: op.piece_comptable, company_id: companyId, v1_statut: 9 },
+                        { $set: { v1_statut: null, sync_status: 'synced' } },
+                        { session }
+                    );
                 }
-                db.prepare(`DELETE FROM brouillard_lignes_treso WHERE id = ?`).run(id);
-                db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillard_lignes_treso', ?, 'DELETE', ?)`).run(id, companyId);
+                
+                await CloudBrouillardLigneTreso.deleteOne({ _id: op._id }).session(session);
 
                 // ─── AUDIT DE SUPPRESSION PHYSIQUE ───────────────────────────
-                logAction({
-                    userId,
-                    actionType: 'SUPPRESSION',
-                    tableConcernee: 'brouillard_lignes_treso',
-                    referenceId: id,
+                await CloudAuditLog.create([{
+                    localId: `LOG-${Date.now()}`,
+                    user_id: userId,
+                    user_name: "user",
+                    action_type: 'SUPPRESSION',
+                    table_concernee: 'brouillard_lignes_treso',
+                    reference_id: id,
                     description: `Suppression définitive de la ligne d'opération en statut ${op.statut} (Pièce: ${op.piece_comptable})`,
-                    companyId
-                });
-            });
-            return { deleted: true };
-        }
+                    company_id: companyId,
+                    sync_status: 'synced'
+                }], { session });
 
-        if (op.statut === 'VALIDE') {
-            if (!motif) throw new Error("Le motif d'annulation est obligatoire.");
+                await session.commitTransaction();
+                session.endSession();
+                return { deleted: true };
+            }
 
-            const idAnnul = `OPTR-ANNUL-${Date.now()}`;
-            const fluxInverse = op.type_flux === 'ENCAISSEMENT' ? 'DECAISSEMENT' : 'ENCAISSEMENT';
-            const aBesoinDeValidation = (op.seuil_validation > 0 && op.niv1_user_id !== null);
-            const statutAnnulation = aBesoinDeValidation ? 'EN_ATTENTE' : 'VALIDE';
+            if (op.statut === 'VALIDE') {
+                if (!motif) throw new Error("Le motif d'annulation est obligatoire.");
 
-            db.transaction(() => {
-                db.prepare(`
-                    INSERT INTO brouillard_lignes_treso (
-                        id, company_id, brouillard_id, journal_id, exercice_id, user_id,
-                        date_mouvement, libelle, piece_ref, piece_comptable, type_flux, montant, 
-                        statut, motif_annulation, v1_statut, v2_statut, v3_statut, v4_statut, sync_status
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, 0, 0, 'pending')
-                `).run(idAnnul, op.company_id, op.brouillard_id, op.journal_id, op.exercice_id, userId, op.date_mouvement, `ANNULATION PIECE ${op.piece_comptable}`.toUpperCase(), op.piece_ref, op.piece_comptable, fluxInverse, op.montant, statutAnnulation, motif.toUpperCase());
+                const idAnnul = `OPTR-ANNUL-${Date.now()}`;
+                const fluxInverse = op.type_flux === 'ENCAISSEMENT' ? 'DECAISSEMENT' : 'ENCAISSEMENT';
+                const aBesoinDeValidation = brouillard && brouillard.seuil_validation > 0 && brouillard.niv1_user_id !== null && brouillard.niv1_user_id !== undefined;
+                const statutAnnulation = aBesoinDeValidation ? 'EN_ATTENTE' : 'VALIDE';
 
-                db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillard_lignes_treso', ?, 'INSERT', ?)`).run(idAnnul, companyId);
+                await CloudBrouillardLigneTreso.create([{
+                    localId: idAnnul,
+                    id: idAnnul,
+                    company_id: companyId,
+                    brouillard_id: op.brouillard_id,
+                    journal_id: op.journal_id,
+                    exercice_id: op.exercice_id,
+                    user_id: userId,
+                    date_mouvement: op.date_mouvement,
+                    libelle: `ANNULATION PIECE ${op.piece_comptable}`.toUpperCase(),
+                    piece_ref: op.piece_ref,
+                    piece_comptable: op.piece_comptable,
+                    type_flux: fluxInverse,
+                    montant: op.montant,
+                    statut: statutAnnulation,
+                    motif_annulation: motif.toUpperCase(),
+                    v1_statut: 0,
+                    v2_statut: 0,
+                    v3_statut: 0,
+                    v4_statut: 0,
+                    sync_status: 'synced'
+                }], { session });
 
-                db.prepare(`UPDATE brouillard_lignes_treso SET v1_statut = 9, sync_status = 'pending' WHERE id = ?`).run(id);
-                db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillard_lignes_treso', ?, 'UPDATE', ?)`).run(id, companyId);
+                await CloudBrouillardLigneTreso.updateOne(
+                    { _id: op._id },
+                    { $set: { v1_statut: 9, sync_status: 'synced' } },
+                    { session }
+                );
 
                 // ─── AUDIT DE GÉNÉRATION D'ANNULATION ────────────────────────
-                logAction({
-                    userId,
-                    actionType: 'ANNULATION',
-                    tableConcernee: 'brouillard_lignes_treso',
-                    referenceId: idAnnul,
+                await CloudAuditLog.create([{
+                    localId: `LOG-${Date.now()}`,
+                    user_id: userId,
+                    user_name: "user",
+                    action_type: 'ANNULATION',
+                    table_concernee: 'brouillard_lignes_treso',
+                    reference_id: idAnnul,
                     description: `Demande d'annulation pour la pièce ${op.piece_comptable}. Motif : ${motif.toUpperCase()}. Statut généré : ${statutAnnulation}`,
-                    companyId
-                });
-            });
+                    company_id: companyId,
+                    sync_status: 'synced'
+                }], { session });
 
-            return { 
-                cancelled: true, 
-                message: aBesoinDeValidation ? "Demande d'annulation créée (en attente)." : "Opération annulée immédiatement." 
-            };
+                await session.commitTransaction();
+                session.endSession();
+                return { 
+                    cancelled: true, 
+                    message: aBesoinDeValidation ? "Demande d'annulation créée (en attente)." : "Opération annulée immédiatement." 
+                };
+            }
+
+            await session.commitTransaction();
+            session.endSession();
+            return { success: true };
+        } catch (err) {
+            await session.abortTransaction();
+            session.endSession();
+            throw err;
         }
     }
 
     // 4. Liste + Soldes
     async getOperationsBrouillard(brouillardId, companyId) {
-        const db = getDb();
-        const rows = db.prepare(`
-            SELECT l.*, u.username as auteur FROM brouillard_lignes_treso l
-            LEFT JOIN users u ON l.user_id = u.id
-            WHERE l.brouillard_id = ? AND l.company_id = ?
-            ORDER BY l.created_at DESC LIMIT 100
-        `).all(brouillardId, companyId);
+        const rows = await CloudBrouillardLigneTreso.aggregate([
+            { $match: { brouillard_id: brouillardId.toString(), company_id: companyId.toString() } },
+            {
+                $lookup: {
+                    from: 'utilisateurs du cloud',
+                    localField: 'user_id',
+                    foreignField: 'localId',
+                    as: 'auteurObj'
+                }
+            },
+            { $unwind: { path: '$auteurObj', preserveNullAndEmptyArrays: true } },
+            {
+                $addFields: {
+                    auteur: '$auteurObj.username'
+                }
+            },
+            { $sort: { createdAt: -1, date_mouvement: -1 } },
+            { $limit: 100 }
+        ]);
 
-        const soldes = db.prepare(`
-            SELECT b.solde_initial,
-            SUM(CASE WHEN l.statut = 'VALIDE' THEN (CASE WHEN l.type_flux = 'ENCAISSEMENT' THEN l.montant ELSE -l.montant END) ELSE 0 END) as total_flux,
-            SUM(CASE WHEN l.statut IN ('VALIDE', 'EN_ATTENTE', 'APPROUVE') THEN (CASE WHEN l.type_flux = 'ENCAISSEMENT' THEN l.montant ELSE -l.montant END) ELSE 0 END) as total_provisoire
-            FROM brouillards_treso b
-            LEFT JOIN brouillard_lignes_treso l ON b.id = l.brouillard_id
-            WHERE b.id = ?
-        `).get(brouillardId);
+        const brouillard = await CloudBrouillardTreso.findOne({ localId: brouillardId, company_id: companyId }).lean()
+            || await CloudBrouillardTreso.findOne({ _id: mongoose.isValidObjectId(brouillardId) ? brouillardId : null }).lean();
+
+        const allLignes = await CloudBrouillardLigneTreso.find({ brouillard_id: brouillardId.toString(), company_id: companyId.toString() }).lean();
+
+        let totalFlux = 0;
+        let totalProvisoire = 0;
+
+        allLignes.forEach(l => {
+            const mnt = Number(l.montant || 0);
+            const fluxVal = l.type_flux === 'ENCAISSEMENT' ? mnt : -mnt;
+            if (l.statut === 'VALIDE') {
+                totalFlux += fluxVal;
+            }
+            if (['VALIDE', 'EN_ATTENTE', 'APPROUVE'].includes(l.statut)) {
+                totalProvisoire += fluxVal;
+            }
+        });
+
+        const soldeInitial = brouillard ? (Number(brouillard.solde_initial) || 0) : 0;
 
         return {
             operations: rows,
-            solde_reel: (soldes.solde_initial || 0) + (soldes.total_flux || 0),
-            solde_provisoire: (soldes.solde_initial || 0) + (soldes.total_provisoire || 0)
+            solde_reel: soldeInitial + totalFlux,
+            solde_provisoire: soldeInitial + totalProvisoire
         };
     }
 
     // 5. Liste Centre Validation
     async getOperationsAValider(companyId) {
-        const db = getDb();
-        return db.prepare(`
-            SELECT l.*, u.username, b.libelle as brouillard_libelle, b.type as brouillard_type, b.solde_initial
-            FROM brouillard_lignes_treso l
-            JOIN users u ON l.user_id = u.id
-            JOIN brouillards_treso b ON l.brouillard_id = b.id
-            WHERE l.company_id = ? AND l.statut IN ('EN_ATTENTE', 'APPROUVE', 'VALIDE', 'REJETE')
-            AND (l.id NOT LIKE 'OPTR-ANNUL-%' OR (b.seuil_validation > 0 AND b.niv1_user_id IS NOT NULL))
-            ORDER BY l.created_at DESC LIMIT 200
-        `).all(companyId);
+        const rows = await CloudBrouillardLigneTreso.aggregate([
+            { $match: { company_id: companyId.toString(), statut: { $in: ['EN_ATTENTE', 'APPROUVE', 'VALIDE', 'REJETE'] } } },
+            {
+                $lookup: {
+                    from: 'utilisateurs du cloud',
+                    localField: 'user_id',
+                    foreignField: 'localId',
+                    as: 'userObj'
+                }
+            },
+            { $unwind: { path: '$userObj', preserveNullAndEmptyArrays: true } },
+            {
+                $lookup: {
+                    from: 'brouillards_treso',
+                    localField: 'brouillard_id',
+                    foreignField: 'localId',
+                    as: 'brouillardObj'
+                }
+            },
+            { $unwind: { path: '$brouillardObj', preserveNullAndEmptyArrays: true } },
+            {
+                $addFields: {
+                    username: '$userObj.username',
+                    brouillard_libelle: '$brouillardObj.libelle',
+                    brouillard_type: '$brouillardObj.type',
+                    solde_initial: '$brouillardObj.solde_initial',
+                    seuil_validation: '$brouillardObj.seuil_validation',
+                    niv1_user_id: '$brouillardObj.niv1_user_id'
+                }
+            },
+            {
+                $match: {
+                    $expr: {
+                        $or: [
+                            { $not: { $regexMatch: { input: '$id', regex: '^OPTR-ANNUL-' } } },
+                            {
+                                $and: [
+                                    { $gt: [{ $ifNull: ['$seuil_validation', 0] }, 0] },
+                                    { $ne: ['$niv1_user_id', null] }
+                                ]
+                            }
+                        ]
+                    }
+                }
+            },
+            { $sort: { createdAt: -1 } },
+            { $limit: 200 }
+        ]);
+
+        return rows;
     }
 
     // 6. Décider (APPROUVER/REJETER)
     async deciderOperation(id, action, userId, companyId) {
-        const db = getDb();
-        return db.transaction(() => {
-            const op = db.prepare(`
-                SELECT l.*, b.seuil_validation, b.niv1_user_id, b.niv2_user_id, b.niv3_user_id, b.niv4_user_id
-                FROM brouillard_lignes_treso l
-                JOIN brouillards_treso b ON l.brouillard_id = b.id
-                WHERE l.id = ? AND l.company_id = ?
-            `).get(id, companyId);
+        const session = await mongoose.startSession();
+        session.startTransaction();
 
+        try {
+            const op = await CloudBrouillardLigneTreso.findOne({ $or: [{ localId: id }, { id: id }], company_id: companyId }).session(session).lean();
             if (!op) throw new Error("Opération introuvable.");
 
-            const affectation = db.prepare(`
-                SELECT peut_valider FROM brouillard_affectations 
-                WHERE brouillard_id = ? AND user_id = ? AND company_id = ?
-            `).get(op.brouillard_id, userId, companyId);
+            const brouillard = await CloudBrouillardTreso.findOne({ localId: op.brouillard_id, company_id: companyId }).session(session).lean()
+                || await CloudBrouillardTreso.findOne({ _id: mongoose.isValidObjectId(op.brouillard_id) ? op.brouillard_id : null }).session(session).lean();
+
+            const affectation = await CloudBrouillardAffectation.findOne({
+                brouillard_id: op.brouillard_id,
+                user_id: userId,
+                company_id: companyId
+            }).session(session).lean();
 
             if (!affectation || affectation.peut_valider !== 1) throw new Error("Accès refusé : Droits de validation insuffisants.");
             if (op.statut === 'VALIDE') throw new Error("Déjà validée.");
 
             if (action === 'REJETER') {
-                db.prepare(`UPDATE brouillard_lignes_treso SET statut = 'REJETE', sync_status = 'pending' WHERE id = ?`).run(id);
-                db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillard_lignes_treso', ?, 'UPDATE', ?)`).run(id, companyId);
+                await CloudBrouillardLigneTreso.updateOne(
+                    { _id: op._id },
+                    { $set: { statut: 'REJETE', sync_status: 'synced', updated_at: new Date() } },
+                    { session }
+                );
 
-                if (id.includes('ANNUL')) {
-                    db.prepare(`UPDATE brouillard_lignes_treso SET v1_statut = NULL, sync_status = 'pending' WHERE piece_comptable = ? AND company_id = ? AND v1_statut = 9`).run(op.piece_comptable, companyId);
-                    const affected = db.prepare(`SELECT id FROM brouillard_lignes_treso WHERE piece_comptable = ? AND company_id = ? AND v1_statut IS NULL`).get(op.piece_comptable, companyId);
-                    if (affected) {
-                        db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillard_lignes_treso', ?, 'UPDATE', ?)`).run(affected.id, companyId);
-                    }
+                if (op.id?.includes('ANNUL') || op.localId?.includes('ANNUL')) {
+                    await CloudBrouillardLigneTreso.updateMany(
+                        { piece_comptable: op.piece_comptable, company_id: companyId, v1_statut: 9 },
+                        { $set: { v1_statut: null, sync_status: 'synced' } },
+                        { session }
+                    );
                 }
 
                 // ─── AUDIT DE REJET ──────────────────────────────────────────
-                logAction({
-                    userId,
-                    actionType: 'VALIDATION_REJET',
-                    tableConcernee: 'brouillard_lignes_treso',
-                    referenceId: id,
+                await CloudAuditLog.create([{
+                    localId: `LOG-${Date.now()}`,
+                    user_id: userId,
+                    user_name: "user",
+                    action_type: 'VALIDATION_REJET',
+                    table_concernee: 'brouillard_lignes_treso',
+                    reference_id: id,
                     description: `Rejet de l'opération (Pièce: ${op.piece_comptable}, Montant: ${op.montant} F)`,
-                    companyId
-                });
+                    company_id: companyId,
+                    sync_status: 'synced'
+                }], { session });
 
+                await session.commitTransaction();
+                session.endSession();
                 return { success: true };
             }
 
             let visaColumn = null;
-            if (userId === op.niv1_user_id) visaColumn = 'v1';
-            else if (userId === op.niv2_user_id) visaColumn = 'v2';
-            else if (userId === op.niv3_user_id) visaColumn = 'v3';
-            else if (userId === op.niv4_user_id) visaColumn = 'v4';
+            if (brouillard) {
+                if (userId === brouillard.niv1_user_id) visaColumn = 'v1';
+                else if (userId === brouillard.niv2_user_id) visaColumn = 'v2';
+                else if (userId === brouillard.niv3_user_id) visaColumn = 'v3';
+                else if (userId === brouillard.niv4_user_id) visaColumn = 'v4';
+            }
 
             if (!visaColumn) throw new Error("Vous n'êtes pas dans le circuit de signature.");
             if (op[`${visaColumn}_statut`] === 1) throw new Error("Déjà signé.");
 
-            db.prepare(`
-                UPDATE brouillard_lignes_treso 
-                SET ${visaColumn}_statut = 1, ${visaColumn}_date = CURRENT_TIMESTAMP, ${visaColumn}_user_id = ?, sync_status = 'pending'
-                WHERE id = ?
-            `).run(userId, id);
+            const updateVisa = {
+                [`${visaColumn}_statut`]: 1,
+                [`${visaColumn}_date`]: new Date(),
+                [`${visaColumn}_user_id`]: userId,
+                sync_status: 'synced',
+                updated_at: new Date()
+            };
 
-            const upd = db.prepare(`SELECT v1_statut, v2_statut, v3_statut, v4_statut FROM brouillard_lignes_treso WHERE id = ?`).get(id);
-            const totalVisas = (upd.v1_statut || 0) + (upd.v2_statut || 0) + (upd.v3_statut || 0) + (upd.v4_statut || 0);
+            await CloudBrouillardLigneTreso.updateOne({ _id: op._id }, { $set: updateVisa }, { session });
 
-            const nouveauStatut = totalVisas >= op.seuil_validation ? 'VALIDE' : 'APPROUVE';
-            db.prepare(`UPDATE brouillard_lignes_treso SET statut = ? WHERE id = ?`).run(nouveauStatut, id);
-            
-            db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillard_lignes_treso', ?, 'UPDATE', ?)`).run(id, companyId);
+            const updatedOp = await CloudBrouillardLigneTreso.findById(op._id).session(session).lean();
+            const totalVisas = (updatedOp.v1_statut || 0) + (updatedOp.v2_statut || 0) + (updatedOp.v3_statut || 0) + (updatedOp.v4_statut || 0);
+            const seuil = brouillard ? (Number(brouillard.seuil_validation) || 1) : 1;
+
+            const nouveauStatut = totalVisas >= seuil ? 'VALIDE' : 'APPROUVE';
+            await CloudBrouillardLigneTreso.updateOne(
+                { _id: op._id },
+                { $set: { statut: nouveauStatut, updated_at: new Date() } },
+                { session }
+            );
 
             // ─── AUDIT D'APPROBATION / VISA ──────────────────────────────────
-            logAction({
-                userId,
-                actionType: 'VALIDATION_APPROBATION',
-                tableConcernee: 'brouillard_lignes_treso',
-                referenceId: id,
+            await CloudAuditLog.create([{
+                localId: `LOG-${Date.now()}`,
+                user_id: userId,
+                user_name: "user",
+                action_type: 'VALIDATION_APPROBATION',
+                table_concernee: 'brouillard_lignes_treso',
+                reference_id: id,
                 description: `Signature niveau (${visaColumn.toUpperCase()}) appliquée sur la pièce ${op.piece_comptable}. Statut actuel passe à : ${nouveauStatut}`,
-                companyId
-            });
+                company_id: companyId,
+                sync_status: 'synced'
+            }], { session });
 
+            await session.commitTransaction();
+            session.endSession();
             return { success: true };
-        })();
+        } catch (err) {
+            await session.abortTransaction();
+            session.endSession();
+            throw err;
+        }
     }
 
     // 7. Ventilation (Analytique et Comptable)
     async getDepensesAVentiler(companyId) {
-        const db = getDb();
-        return db.prepare(`
-            SELECT l.*, u.username as auteur, b.libelle as brouillard_libelle, j.compte_treso_id,
-            -- 🛡️ RÉCUPÉRATION DU MOTIF DE REJET COMPTA
-            (SELECT observation FROM brouillon_lignes bl 
-             WHERE bl.piece_provisoire = 'BR-' || l.piece_comptable 
-             AND bl.statut = 'REJETE' 
-             ORDER BY bl.created_at DESC LIMIT 1) as motif_rejet_compta
-            FROM brouillard_lignes_treso l
-            JOIN brouillards_treso b ON l.brouillard_id = b.id
-            JOIN journaux j ON l.journal_id = j.id
-            LEFT JOIN users u ON l.user_id = u.id
-            WHERE l.company_id = ? 
-              AND l.statut = 'VALIDE' 
-              AND l.type_flux = 'DECAISSEMENT' 
-              AND l.comptabilise = 0 
-              AND (l.v1_statut IS NULL OR l.v1_statut != 9) 
-              AND l.id NOT LIKE 'OPTR-ANNUL-%'
-            ORDER BY l.date_mouvement DESC
-        `).all(companyId);
+        const rows = await CloudBrouillardLigneTreso.aggregate([
+            {
+                $match: {
+                    company_id: companyId.toString(),
+                    statut: 'VALIDE',
+                    type_flux: 'DECAISSEMENT',
+                    comptabilise: { $ne: 1 },
+                    $or: [{ v1_statut: { $exists: false } }, { v1_statut: null }, { v1_statut: { $ne: 9 } }],
+                    id: { $not: /^OPTR-ANNUL-/ }
+                }
+            },
+            {
+                $lookup: {
+                    from: 'brouillards_treso',
+                    localField: 'brouillard_id',
+                    foreignField: 'localId',
+                    as: 'brouillardObj'
+                }
+            },
+            { $unwind: { path: '$brouillardObj', preserveNullAndEmptyArrays: true } },
+            {
+                $lookup: {
+                    from: 'journaux',
+                    localField: 'journal_id',
+                    foreignField: 'localId',
+                    as: 'journalObj'
+                }
+            },
+            { $unwind: { path: '$journalObj', preserveNullAndEmptyArrays: true } },
+            {
+                $lookup: {
+                    from: 'utilisateurs du cloud',
+                    localField: 'user_id',
+                    foreignField: 'localId',
+                    as: 'userObj'
+                }
+            },
+            { $unwind: { path: '$userObj', preserveNullAndEmptyArrays: true } },
+            {
+                $addFields: {
+                    brouillard_libelle: '$brouillardObj.libelle',
+                    compte_treso_id: '$journalObj.compte_treso_id',
+                    auteur: '$userObj.username'
+                }
+            },
+            { $sort: { date_mouvement: -1 } }
+        ]);
+        return rows;
     }
 
     async ventilerOperation({ operation_id, lignes, companyId, userId }) {
-        const db = getDb();
-        const userName = 'utilisateurs_systeme';
+        const session = await mongoose.startSession();
+        session.startTransaction();
 
-        const totalVentile = lignes.reduce((sum, l) => sum + parseFloat(l.montant || 0), 0);
-        const opCheck = db.prepare("SELECT montant, v1_statut FROM brouillard_lignes_treso WHERE id = ?").get(operation_id);
-        
-        if (!opCheck) throw new Error("Opération introuvable.");
+        try {
+            const userName = 'utilisateurs_systeme';
+            const totalVentile = lignes.reduce((sum, l) => sum + parseFloat(l.montant || 0), 0);
+            
+            const opCheck = await CloudBrouillardLigneTreso.findOne({ $or: [{ localId: operation_id }, { id: operation_id }], company_id: companyId }).session(session).lean();
+            if (!opCheck) throw new Error("Opération introuvable.");
 
-        // 🛡️ VERROU CRITIQUE : Bloquer si annulation demandée
-        if (opCheck.v1_statut === 9) throw new Error("Ventilation impossible : Une demande d'annulation est en cours.");
-        
-        if (Math.abs(totalVentile - opCheck.montant) > 0.01) throw new Error("Déséquilibre montant.");
+            if (opCheck.v1_statut === 9) throw new Error("Ventilation impossible : Une demande d'annulation est en cours.");
+            if (Math.abs(totalVentile - Number(opCheck.montant || 0)) > 0.01) throw new Error("Déséquilibre montant.");
 
-        return db.transaction(() => {
-            const op = db.prepare(`
-                SELECT l.*, b.mode_ecriture, j.compte_treso_id, j.compte_contrepartie_id
-                FROM brouillard_lignes_treso l 
-                JOIN brouillards_treso b ON l.brouillard_id = b.id 
-                JOIN journaux j ON l.journal_id = j.id 
-                WHERE l.id = ? AND l.company_id = ?
-            `).get(operation_id, companyId);
-
+            const op = await CloudBrouillardLigneTreso.findOne({ $or: [{ localId: operation_id }, { id: operation_id }], company_id: companyId }).session(session).lean();
             if (!op || op.comptabilise === 1) throw new Error("Déjà comptabilisée.");
 
-            const sourceId = op.compte_treso_id || op.compte_contrepartie_id;
-            const cpteCaisse = db.prepare("SELECT numero_compte FROM plan_comptable WHERE id = ?").get(sourceId);
+            const brouillard = await CloudBrouillardTreso.findOne({ localId: op.brouillard_id, company_id: companyId }).session(session).lean()
+                || await CloudBrouillardTreso.findOne({ _id: mongoose.isValidObjectId(op.brouillard_id) ? op.brouillard_id : null }).session(session).lean();
+
+            const journal = await CloudJournal.findOne({ localId: op.journal_id, company_id: companyId }).session(session).lean()
+                || await CloudJournal.findOne({ _id: mongoose.isValidObjectId(op.journal_id) ? op.journal_id : null }).session(session).lean();
+
+            const sourceId = journal?.compte_treso_id || journal?.compte_contrepartie_id;
+            const compteCaisse = await CloudPlanComptable.findOne({ localId: sourceId, company_id: companyId }).session(session).lean()
+                || await CloudPlanComptable.findOne({ _id: mongoose.isValidObjectId(sourceId) ? sourceId : null }).session(session).lean();
+
             const dateRef = Date.now();
             const pieceRef = op.piece_comptable || `T-${dateRef.toString().slice(-6)}`;
             const pieceProvisoire = `BR-${pieceRef}`;
+            const modeEcriture = brouillard?.mode_ecriture || 'BROUILLON';
 
-            if (op.mode_ecriture === 'BROUILLON') {
-                db.prepare(`DELETE FROM brouillon_lignes WHERE piece_provisoire = ? AND company_id = ?`).run(pieceProvisoire, companyId);
-                db.prepare(`DELETE FROM brouillon_ecritures WHERE piece_provisoire = ? AND company_id = ?`).run(pieceProvisoire, companyId);
+            if (modeEcriture === 'BROUILLON') {
+                await CloudBrouillonLigne.deleteMany({ piece_provisoire: pieceProvisoire, company_id: companyId }).session(session);
+                await CloudBrouillonEcriture.deleteMany({ piece_provisoire: pieceProvisoire, company_id: companyId }).session(session);
 
                 const brId = `BR-ECR-${dateRef}`;
-                db.prepare(`INSERT INTO brouillon_ecritures (id, company_id, journal_id, exercice_id, date_ecriture, piece_provisoire, libelle, user_saisie, statut, sync_status) VALUES (?,?,?,?,?,?,?,?,?,'pending')`)
-                  .run(brId, companyId, op.journal_id, op.exercice_id, op.date_mouvement, pieceProvisoire, op.libelle, userName);
-                db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillon_ecritures', ?, 'INSERT', ?)`).run(brId, companyId);
+                await CloudBrouillonEcriture.create([{
+                    localId: brId,
+                    id: brId,
+                    company_id: companyId,
+                    journal_id: op.journal_id,
+                    exercice_id: op.exercice_id,
+                    date_ecriture: op.date_mouvement,
+                    piece_provisoire: pieceProvisoire,
+                    libelle: op.libelle,
+                    user_saisie: userName,
+                    statut: 'EN_ATTENTE',
+                    sync_status: 'synced'
+                }], { session });
 
-                const stmtLig = db.prepare(`INSERT INTO brouillon_lignes (id, company_id, brouillon_id, journal_id, exercice_id, date_ecriture, piece_provisoire, compte_id, num_compte, num_tiers, libelle, debit, credit, statut, sync_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'EN_ATTENTE','pending')`);
-                const stmtSyncLig = db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillon_lignes', ?, 'INSERT', ?)`);
-                
                 // Ligne Trésorerie (Crédit)
                 const ligTrId = `BRLIG-${dateRef}-C`;
-                stmtLig.run(ligTrId, companyId, brId, op.journal_id, op.exercice_id, op.date_mouvement, pieceProvisoire, sourceId, cpteCaisse.numero_compte, null, op.libelle, 0, op.montant);
-                stmtSyncLig.run(ligTrId, companyId);
+                await CloudBrouillonLigne.create([{
+                    localId: ligTrId,
+                    id: ligTrId,
+                    company_id: companyId,
+                    brouillon_id: brId,
+                    journal_id: op.journal_id,
+                    exercice_id: op.exercice_id,
+                    date_ecriture: op.date_mouvement,
+                    piece_provisoire: pieceProvisoire,
+                    compte_id: sourceId,
+                    num_compte: compteCaisse?.numero_compte || '',
+                    num_tiers: null,
+                    libelle: op.libelle,
+                    debit: 0,
+                    credit: op.montant,
+                    statut: 'EN_ATTENTE',
+                    sync_status: 'synced'
+                }], { session });
 
-                // Nouvelles lignes de ventilation (Débit)
-                lignes.forEach((l, idx) => {
+                for (let idx = 0; idx < lignes.length; idx++) {
+                    const l = lignes[idx];
                     const ligId = `BRLIG-${dateRef}-D${idx}`;
-                    const cpteInfo = db.prepare("SELECT numero_compte FROM plan_comptable WHERE id = ?").get(l.compte_id);
-                    stmtLig.run(ligId, companyId, brId, op.journal_id, op.exercice_id, op.date_mouvement, pieceProvisoire, l.compte_id, cpteInfo.numero_compte, l.num_tiers || null, op.libelle, l.montant, 0);
-                    stmtSyncLig.run(ligId, companyId);
+                    const cpteInfo = await CloudPlanComptable.findOne({ localId: l.compte_id, company_id: companyId }).session(session).lean()
+                        || await CloudPlanComptable.findOne({ _id: mongoose.isValidObjectId(l.compte_id) ? l.compte_id : null }).session(session).lean();
+
+                    await CloudBrouillonLigne.create([{
+                        localId: ligId,
+                        id: ligId,
+                        company_id: companyId,
+                        brouillon_id: brId,
+                        journal_id: op.journal_id,
+                        exercice_id: op.exercice_id,
+                        date_ecriture: op.date_mouvement,
+                        piece_provisoire: pieceProvisoire,
+                        compte_id: l.compte_id,
+                        num_compte: cpteInfo?.numero_compte || '',
+                        num_tiers: l.num_tiers || null,
+                        libelle: op.libelle,
+                        debit: l.montant,
+                        credit: 0,
+                        statut: 'EN_ATTENTE',
+                        sync_status: 'synced'
+                    }], { session });
 
                     if (l.is_analytique && l.repartitions) {
-                        const stmtAna = db.prepare(`INSERT INTO brouillon_lignes_analytiques (id, company_id, ligne_brouillon_id, plan_analytique_id, departement_id, num_compte, montant, sync_status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`);
-                        const stmtSyncAna = db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillon_lignes_analytiques', ?, 'INSERT', ?)`);
-                        
-                        l.repartitions.forEach((rep, rIdx) => {
+                        for (let rIdx = 0; rIdx < l.repartitions.length; rIdx++) {
+                            const rep = l.repartitions[rIdx];
                             const anaId = `BRANA-${dateRef}-${idx}-${rIdx}`;
-                            stmtAna.run(anaId, companyId, ligId, rep.plan_analytique_id, rep.dept_id || rep.departement_id, cpteInfo.numero_compte, rep.montant);
-                            stmtSyncAna.run(anaId, companyId);
-                        });
+                            await CloudBrouillonLigneAnalytique.create([{
+                                localId: anaId,
+                                id: anaId,
+                                company_id: companyId,
+                                ligne_brouillon_id: ligId,
+                                plan_analytique_id: rep.plan_analytique_id,
+                                departement_id: rep.dept_id || rep.departement_id,
+                                num_compte: cpteInfo?.numero_compte || '',
+                                montant: rep.montant,
+                                sync_status: 'synced'
+                            }], { session });
+                        }
                     }
-                });
-                
-                db.prepare(`UPDATE brouillard_lignes_treso SET comptabilise = 1, brouillon_ecriture_id = ?, sync_status = 'pending' WHERE id = ?`).run(brId, operation_id);
-                db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillard_lignes_treso', ?, 'UPDATE', ?)`).run(operation_id, companyId);
+                }
+
+                await CloudBrouillardLigneTreso.updateOne(
+                    { _id: op._id },
+                    { $set: { comptabilise: 1, brouillon_ecriture_id: brId, sync_status: 'synced', updated_at: new Date() } },
+                    { session }
+                );
             } else {
-                // Logique Grand Livre (Ecriture directe)
+                // Écriture directe Grand Livre
                 const ecrId = `ECR-${dateRef}`;
-                db.prepare(`INSERT INTO ecritures (id, company_id, journal_id, exercice_id, date_ecriture, piece, libelle, user_saisie, sync_status) VALUES (?,?,?,?,?,?,?,?,'pending')`)
-                  .run(ecrId, companyId, op.journal_id, op.exercice_id, op.date_mouvement, pieceRef, op.libelle, userName);
-                db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('ecritures', ?, 'INSERT', ?)`).run(ecrId, companyId);
+                await CloudEcriture.create([{
+                    localId: ecrId,
+                    id: ecrId,
+                    company_id: companyId,
+                    journal_id: op.journal_id,
+                    exercice_id: op.exercice_id,
+                    date_ecriture: op.date_mouvement,
+                    piece: pieceRef,
+                    libelle: op.libelle,
+                    user_saisie: userName,
+                    sync_status: 'synced'
+                }], { session });
 
-                const stmtLig = db.prepare(`INSERT INTO lignes_ecritures (id, company_id, ecriture_id, journal_id, exercice_id, date_ecriture, piece, compte_id, num_compte, num_tiers, libelle, debit, credit, sync_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'pending')`);
-                const stmtSyncLig = db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('lignes_ecritures', ?, 'INSERT', ?)`);
-                
                 const ligTrId = `LIG-${dateRef}-C`;
-                stmtLig.run(ligTrId, companyId, ecrId, op.journal_id, op.exercice_id, op.date_mouvement, pieceRef, sourceId, cpteCaisse.numero_compte, null, op.libelle, 0, op.montant);
-                stmtSyncLig.run(ligTrId, companyId);
+                await CloudLigneEcriture.create([{
+                    localId: ligTrId,
+                    id: ligTrId,
+                    company_id: companyId,
+                    ecriture_id: ecrId,
+                    journal_id: op.journal_id,
+                    exercice_id: op.exercice_id,
+                    date_ecriture: op.date_mouvement,
+                    piece: pieceRef,
+                    compte_id: sourceId,
+                    num_compte: compteCaisse?.numero_compte || '',
+                    num_tiers: null,
+                    libelle: op.libelle,
+                    debit: 0,
+                    credit: op.montant,
+                    sync_status: 'synced'
+                }], { session });
 
-                lignes.forEach((l, idx) => {
+                for (let idx = 0; idx < lignes.length; idx++) {
+                    const l = lignes[idx];
                     const ligId = `LIG-${dateRef}-D${idx}`;
-                    const cpteInfo = db.prepare("SELECT numero_compte FROM plan_comptable WHERE id = ?").get(l.compte_id);
-                    stmtLig.run(ligId, companyId, ecrId, op.journal_id, op.exercice_id, op.date_mouvement, pieceRef, l.compte_id, cpteInfo.numero_compte, l.num_tiers || null, op.libelle, l.montant, 0);
-                    stmtSyncLig.run(ligId, companyId);
+                    const cpteInfo = await CloudPlanComptable.findOne({ localId: l.compte_id, company_id: companyId }).session(session).lean()
+                        || await CloudPlanComptable.findOne({ _id: mongoose.isValidObjectId(l.compte_id) ? l.compte_id : null }).session(session).lean();
+
+                    await CloudLigneEcriture.create([{
+                        localId: ligId,
+                        id: ligId,
+                        company_id: companyId,
+                        ecriture_id: ecrId,
+                        journal_id: op.journal_id,
+                        exercice_id: op.exercice_id,
+                        date_ecriture: op.date_mouvement,
+                        piece: pieceRef,
+                        compte_id: l.compte_id,
+                        num_compte: cpteInfo?.numero_compte || '',
+                        num_tiers: l.num_tiers || null,
+                        libelle: op.libelle,
+                        debit: l.montant,
+                        credit: 0,
+                        sync_status: 'synced'
+                    }], { session });
 
                     if (l.is_analytique && l.repartitions) {
-                        const stmtAna = db.prepare(`INSERT INTO lignes_analytiques (id, company_id, ligne_ecriture_id, plan_analytique_id, departement_id, num_compte, montant, sync_status) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')`);
-                        const stmtSyncAna = db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('lignes_analytiques', ?, 'INSERT', ?)`);
-                        
-                        l.repartitions.forEach((rep, rIdx) => {
+                        for (let rIdx = 0; rIdx < l.repartitions.length; rIdx++) {
+                            const rep = l.repartitions[rIdx];
                             const anaId = `ANA-${dateRef}-${idx}-${rIdx}`;
-                            stmtAna.run(anaId, companyId, ligId, rep.plan_analytique_id, rep.dept_id || rep.departement_id, cpteInfo.numero_compte, rep.montant);
-                            stmtSyncAna.run(anaId, companyId);
-                        });
-                        db.prepare(`UPDATE lignes_ecritures SET is_ventilated = 1, sync_status = 'pending' WHERE id = ?`).run(ligId);
-                        db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('lignes_ecritures', ?, 'UPDATE', ?)`).run(ligId, companyId);
+                            await CloudLigneAnalytique.create([{
+                                localId: anaId,
+                                id: anaId,
+                                company_id: companyId,
+                                ligne_ecriture_id: ligId,
+                                plan_analytique_id: rep.plan_analytique_id,
+                                departement_id: rep.dept_id || rep.departement_id,
+                                num_compte: cpteInfo?.numero_compte || '',
+                                montant: rep.montant,
+                                sync_status: 'synced'
+                            }], { session });
+                        }
+                        await CloudLigneEcriture.updateOne({ _id: ligId }, { $set: { is_ventilated: 1 } }, { session });
                     }
-                });
-                db.prepare(`UPDATE brouillard_lignes_treso SET comptabilise = 1, ecriture_id = ?, sync_status = 'pending' WHERE id = ?`).run(ecrId, operation_id);
-                db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('brouillard_lignes_treso', ?, 'UPDATE', ?)`).run(operation_id, companyId);
+                }
+
+                await CloudBrouillardLigneTreso.updateOne(
+                    { _id: op._id },
+                    { $set: { comptabilise: 1, ecriture_id: ecrId, sync_status: 'synced', updated_at: new Date() } },
+                    { session }
+                );
             }
 
             // ─── AUDIT DE VENTILATION ────────────────────────────────────────
-            logAction({
-                userId,
-                actionType: 'VENTILATION',
-                tableConcernee: 'brouillard_lignes_treso',
-                referenceId: operation_id,
-                description: `Ventilation de la pièce ${op.piece_comptable} en comptabilité (Mode: ${op.mode_ecriture}). Éclatée en ${lignes.length} imputation(s) de charges.`,
-                companyId
-            });
+            await CloudAuditLog.create([{
+                localId: `LOG-${Date.now()}`,
+                user_id: userId,
+                user_name: "user",
+                action_type: 'VENTILATION',
+                table_concernee: 'brouillard_lignes_treso',
+                reference_id: operation_id,
+                description: `Ventilation de la pièce ${op.piece_comptable} en comptabilité (Mode: ${modeEcriture}). Éclatée en ${lignes.length} imputation(s) de charges.`,
+                company_id: companyId,
+                sync_status: 'synced'
+            }], { session });
 
+            await session.commitTransaction();
+            session.endSession();
             return { success: true };
-        })();
+        } catch (err) {
+            await session.abortTransaction();
+            session.endSession();
+            throw err;
+        }
     }
 }
 

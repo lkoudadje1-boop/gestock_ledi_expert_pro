@@ -1,4 +1,9 @@
-const { getDb } = require('../config/database');
+// backend/services/consignation.services.js
+const mongoose = require('mongoose');
+const { 
+    CloudFluxEmballage, CloudFluxEmballageDetail, CloudPackaging, 
+    CloudSale, CloudCustomer, CloudAuditLog 
+} = require('../models/cloud.model');
 const { logAction } = require('../utils/auditHelper');
 const consignationRules = require('./RegleConsignation.services');
 
@@ -6,36 +11,7 @@ const genererIdMouvement = (prefix) => {
     return `${prefix}-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 100)}`;
 };
 
-exports.createConsignation = ({ companyId, userId, userName, data }) => {
-    const db = getDb();
-    
-    const insertHeaderStmt = db.prepare(`
-        INSERT INTO flux_emballages (
-            id, company_id, sale_id, client_id, type_flux, montant_total, 
-            type_garantie, montant_recu, reste_a_payer, garantie_libelle, sync_status
-        ) VALUES (?, ?, ?, ?, 'CONSIGNE', ?, ?, ?, ?, ?, 'pending')
-    `);
-    
-    const insertDetailStmt = db.prepare(`
-        INSERT INTO flux_emballages_details 
-        (id, company_id, flux_id, packaging_id, quantite, quantite_restante, prix_unitaire, montant_ligne, montant_penalite_unitaire, regle_tarifaire_snapshot, sync_status) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-    `);
-    
-    const updateStockStmt = db.prepare(`
-        UPDATE packaging 
-        SET stock_actuel = stock_actuel - ?,
-            stock_consigne = stock_consigne + ?,
-            sync_status = 'pending',
-            updated_at = CURRENT_TIMESTAMP
-        WHERE id = ? AND company_id = ?
-    `);
-
-    const syncQueueStmt = db.prepare(`
-        INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-        VALUES (?, ?, ?, ?)
-    `);
-    
+exports.createConsignation = async ({ companyId, userId, userName, data }) => {
     const { 
         tiers_id, client_nom, sale_id, items, montant_total,
         type_garantie, montant_recu, garantie_libelle 
@@ -43,51 +19,57 @@ exports.createConsignation = ({ companyId, userId, userName, data }) => {
     
     if (!items || items.length === 0) throw new Error("La consignation doit contenir au moins un emballage.");
     
-    let saleData = db.prepare(`SELECT company_id, customer_id, id FROM sales WHERE id = ? OR lot_id = ?`).get(sale_id, sale_id);
+    let saleData = await CloudSale.findOne({ $or: [{ localId: sale_id }, { lot_id: sale_id }, { _id: mongoose.isValidObjectId(sale_id) ? sale_id : null }] }).lean();
     if (!saleData && client_nom) {
-        saleData = db.prepare(`SELECT company_id, customer_id, id FROM sales WHERE nom_client_snap = ? AND statut_vente = 'VALIDEE' ORDER BY date_vente DESC LIMIT 1`).get(client_nom);
+        saleData = await CloudSale.findOne({ nom_client_snap: client_nom, statut_vente: 'VALIDEE' }).sort({ date_vente: -1 }).lean();
     }
     if (!saleData) throw new Error(`Consignation refusée : Vente introuvable.`);
     
     const finalCompanyId = saleData.company_id || companyId;
     const finalTiersId = saleData.customer_id || tiers_id || null;
-    let fluxId;
-    
-    db.transaction(() => {
-        fluxId = genererIdMouvement('FLUX');
-        
-        let totalCalcule = 0;
-        for (const item of items) {
-            totalCalcule += (parseFloat(item.qte || item.quantite) || 0) * (parseFloat(item.prix_unitaire || item.prix_consigne) || 0);
-        }
-        const finalMontantTotal = montant_total || totalCalcule;
 
-        const finalTypeGarantie = type_garantie || 'ESPECES';
-        const finalMontantRecu = finalTypeGarantie === 'PHYSIQUE' ? 0 : (parseFloat(montant_recu) || 0);
-        const finalResteAPayer = finalTypeGarantie === 'PHYSIQUE' ? 0 : Math.max(0, finalMontantTotal - finalMontantRecu);
-        const finalGarantieLibelle = finalTypeGarantie === 'PHYSIQUE' ? (garantie_libelle || "Pièce d'identité") : null;
+    let totalCalcule = 0;
+    for (const item of items) {
+        totalCalcule += (parseFloat(item.qte || item.quantite) || 0) * (parseFloat(item.prix_unitaire || item.prix_consigne) || 0);
+    }
+    const finalMontantTotal = montant_total || totalCalcule;
 
-        insertHeaderStmt.run(
-            fluxId, 
-            finalCompanyId, 
-            saleData.id, 
-            finalTiersId, 
-            finalMontantTotal, 
-            finalTypeGarantie, 
-            finalMontantRecu, 
-            finalResteAPayer, 
-            finalGarantieLibelle
-        );
+    const finalTypeGarantie = type_garantie || 'ESPECES';
+    const finalMontantRecu = finalTypeGarantie === 'PHYSIQUE' ? 0 : (parseFloat(montant_recu) || 0);
+    const finalResteAPayer = finalTypeGarantie === 'PHYSIQUE' ? 0 : Math.max(0, finalMontantTotal - finalMontantRecu);
+    const finalGarantieLibelle = finalTypeGarantie === 'PHYSIQUE' ? (garantie_libelle || "Pièce d'identité") : null;
 
-        syncQueueStmt.run('flux_emballages', fluxId, 'INSERT', finalCompanyId);
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const fluxId = genererIdMouvement('FLUX');
+
+        await CloudFluxEmballage.create([{
+            localId: fluxId,
+            company_id: finalCompanyId.toString(),
+            sale_id: saleData.localId || saleData._id.toString(),
+            client_id: finalTiersId,
+            type_flux: 'CONSIGNE',
+            montant_total: finalMontantTotal,
+            type_garantie: finalTypeGarantie,
+            montant_recu: finalMontantRecu,
+            reste_a_payer: finalResteAPayer,
+            garantie_libelle: finalGarantieLibelle,
+            statut: 'EN COURS',
+            sync_status: 'synced'
+        }], { session });
 
         for (const item of items) {
             const targetPackagingId = item.packaging_id || item.id;
-            const packaging = db.prepare('SELECT rule_id FROM packaging WHERE id = ?').get(targetPackagingId);
+            const packaging = await CloudPackaging.findOne({ 
+                $or: [{ localId: targetPackagingId }, { _id: mongoose.isValidObjectId(targetPackagingId) ? targetPackagingId : null }],
+                company_id: finalCompanyId.toString() 
+            }).lean();
             
             let regleComplete = null;
             if (packaging && packaging.rule_id) {
-                regleComplete = consignationRules.getRuleById(packaging.rule_id, finalCompanyId);
+                regleComplete = await consignationRules.getRuleById(packaging.rule_id, finalCompanyId);
             }
 
             const calculs = consignationRules.simulerPrixRemboursement(
@@ -99,19 +81,33 @@ exports.createConsignation = ({ companyId, userId, userName, data }) => {
             const pxUnit = parseFloat(item.prix_unitaire || item.prix_consigne) || 0;
             const detailId = genererIdMouvement('DET');
 
-            insertDetailStmt.run(
-                detailId, finalCompanyId, fluxId, targetPackagingId,
-                qte, qte, pxUnit, (qte * pxUnit), calculs.montant_penalite_unitaire,
-                regleComplete ? JSON.stringify(regleComplete) : null
-            );
-            
-            syncQueueStmt.run('flux_emballages_details', detailId, 'INSERT', finalCompanyId);
+            await CloudFluxEmballageDetail.create([{
+                localId: detailId,
+                company_id: finalCompanyId.toString(),
+                flux_id: fluxId,
+                packaging_id: targetPackagingId,
+                quantite: qte,
+                quantite_restante: qte,
+                prix_unitaire: pxUnit,
+                montant_ligne: qte * pxUnit,
+                montant_penalite_unitaire: calculs.montant_penalite_unitaire,
+                regle_tarifaire_snapshot: regleComplete ? JSON.stringify(regleComplete) : null,
+                sync_status: 'synced'
+            }], { session });
 
-            updateStockStmt.run(qte, qte, targetPackagingId, finalCompanyId);
-            syncQueueStmt.run('packaging', targetPackagingId, 'UPDATE', finalCompanyId);
+            await CloudPackaging.updateOne(
+                { 
+                    $or: [{ localId: targetPackagingId }, { _id: mongoose.isValidObjectId(targetPackagingId) ? targetPackagingId : null }],
+                    company_id: finalCompanyId.toString() 
+                },
+                { 
+                    $inc: { stock_actuel: -qte, stock_consigne: qte }, 
+                    $set: { updated_at: new Date(), sync_status: 'synced' } 
+                }
+            ).session(session);
         }
 
-        logAction({ 
+        await logAction({ 
             userId, 
             userName: userName || 'user', 
             actionType: 'INSERTION', 
@@ -120,30 +116,38 @@ exports.createConsignation = ({ companyId, userId, userName, data }) => {
             description: finalTypeGarantie === 'PHYSIQUE' 
                 ? `Consignation créée avec Garantie Physique : ${finalGarantieLibelle}` 
                 : `Consignation créée (Reçu: ${finalMontantRecu} F, Reste: ${finalResteAPayer} F)`, 
-            companyId: finalCompanyId 
+            companyId: finalCompanyId.toString() 
         });
-    })();
 
-    return fluxId;
+        await session.commitTransaction();
+        session.endSession();
+        return fluxId;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
-exports.createDeconsignation = ({ companyId, userId, userName, data }) => {
-    const db = getDb();
+exports.createDeconsignation = async ({ companyId, userId, userName, data }) => {
     const { flux_id, qte_retournee } = data; 
     const qteRetour = parseFloat(qte_retournee);
 
     if (isNaN(qteRetour) || qteRetour <= 0) throw new Error("Quantité invalide.");
 
-    db.transaction(() => {
-        const flux = db.prepare(`SELECT * FROM flux_emballages WHERE id = ? AND company_id = ?`).get(flux_id, companyId);
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const flux = await CloudFluxEmballage.findOne({ localId: flux_id, company_id: companyId.toString() }).session(session);
         if (!flux) throw new Error("Flux de consignation introuvable.");
 
-        const detailOrigine = db.prepare(`
-            SELECT id, packaging_id, quantite_restante, prix_unitaire, regle_tarifaire_snapshot 
-            FROM flux_emballages_details 
-            WHERE flux_id = ? AND company_id = ? AND quantite > 0 AND quantite_restante > 0
-            LIMIT 1
-        `).get(flux_id, companyId);
+        const detailOrigine = await CloudFluxEmballageDetail.findOne({
+            flux_id: flux_id,
+            company_id: companyId.toString(),
+            quantite: { $gt: 0 },
+            quantite_restante: { $gt: 0 }
+        }).session(session);
 
         if (!detailOrigine) throw new Error("Aucun emballage actif restant à déconsigner pour ce flux.");
         
@@ -172,234 +176,197 @@ exports.createDeconsignation = ({ companyId, userId, userName, data }) => {
 
         const detailRetourId = genererIdMouvement('DET-RET');
         
-        db.prepare(`
-            INSERT INTO flux_emballages_details 
-            (id, company_id, flux_id, packaging_id, quantite, quantite_restante, prix_unitaire, montant_ligne, montant_penalite_unitaire, sync_status) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-        `).run(
-            detailRetourId, 
-            companyId, 
-            flux_id, 
-            detailOrigine.packaging_id, 
-            -qteRetour,       
-            0,                 
-            prixUnitaire,      
-            montantLigneRetour,
-            penaliteUnitaireAuRetour
-        );
+        await CloudFluxEmballageDetail.create([{
+            localId: detailRetourId,
+            company_id: companyId.toString(),
+            flux_id: flux_id,
+            packaging_id: detailOrigine.packaging_id,
+            quantite: -qteRetour,
+            quantite_restante: 0,
+            prix_unitaire: prixUnitaire,
+            montant_ligne: montantLigneRetour,
+            montant_penalite_unitaire: penaliteUnitaireAuRetour,
+            sync_status: 'synced'
+        }], { session });
 
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('flux_emballages_details', ?, 'INSERT', ?)
-        `).run(detailRetourId, companyId);
-
-        db.prepare(`
-            UPDATE flux_emballages_details 
-            SET quantite_restante = quantite_restante - ?, sync_status = 'pending'
-            WHERE id = ? AND company_id = ?
-        `).run(qteRetour, detailOrigine.id, companyId);
-
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('flux_emballages_details', ?, 'UPDATE', ?)
-        `).run(detailOrigine.id, companyId);
+        await CloudFluxEmballageDetail.updateOne(
+            { _id: detailOrigine._id },
+            { $inc: { quantite_restante: -qteRetour }, $set: { sync_status: 'synced' } }
+        ).session(session);
 
         const ajustementSoldeGlobal = montantLigneRetour - totalPenaliteRetour; 
 
-        db.prepare(`
-            UPDATE flux_emballages 
-            SET reste_a_payer = reste_a_payer + ?, updated_at = CURRENT_TIMESTAMP, sync_status = 'pending'
-            WHERE id = ? AND company_id = ?
-        `).run(ajustementSoldeGlobal, flux_id, companyId);
+        await CloudFluxEmballage.updateOne(
+            { _id: flux._id },
+            { $inc: { reste_a_payer: ajustementSoldeGlobal }, $set: { updated_at: new Date(), sync_status: 'synced' } }
+        ).session(session);
 
-        const verifSoldeStricte = db.prepare(`
-            SELECT SUM(quantite) as solde_quantite 
-            FROM flux_emballages_details 
-            WHERE flux_id = ? AND company_id = ?
-        `).get(flux_id, companyId);
+        // Vérification du solde global des quantités
+        const remainingDetails = await CloudFluxEmballageDetail.find({ flux_id: flux_id, company_id: companyId.toString() }).session(session);
+        const soldeQuantite = remainingDetails.reduce((sum, d) => sum + d.quantite, 0);
 
-        if (verifSoldeStricte && parseFloat(verifSoldeStricte.solde_quantite) <= 0) {
-            db.prepare(`
-                UPDATE flux_emballages 
-                SET statut = 'SOLDE', sync_status = 'pending' 
-                WHERE id = ? AND company_id = ?
-            `).run(flux_id, companyId);
-        } else {
-            db.prepare(`
-                UPDATE flux_emballages 
-                SET statut = 'EN COURS', sync_status = 'pending' 
-                WHERE id = ? AND company_id = ?
-            `).run(flux_id, companyId);
-        }
+        const nouveauStatut = soldeQuantite <= 0 ? 'SOLDE' : 'EN COURS';
+        await CloudFluxEmballage.updateOne({ _id: flux._id }, { $set: { statut: nouveauStatut } }).session(session);
 
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('flux_emballages', ?, 'UPDATE', ?)
-        `).run(flux_id, companyId);
+        await CloudPackaging.updateOne(
+            { 
+                $or: [{ localId: detailOrigine.packaging_id }, { _id: mongoose.isValidObjectId(detailOrigine.packaging_id) ? detailOrigine.packaging_id : null }],
+                company_id: companyId.toString() 
+            },
+            { 
+                $inc: { stock_actuel: qteRetour, stock_consigne: -qteRetour }, 
+                $set: { updated_at: new Date(), sync_status: 'synced' } 
+            }
+        ).session(session);
 
-        db.prepare(`
-            UPDATE packaging 
-            SET stock_actuel = stock_actuel + ?, 
-                stock_consigne = stock_consigne - ?,
-                sync_status = 'pending',
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND company_id = ?
-        `).run(qteRetour, qteRetour, detailOrigine.packaging_id, companyId);
-
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('packaging', ?, 'UPDATE', ?)
-        `).run(detailOrigine.packaging_id, companyId);
-
-        logAction({
+        await logAction({
             userId,
             userName: userName || 'user',
             actionType: 'UPDATE',
             tableConcernee: 'flux_emballages',
             referenceId: flux_id,
             description: `Déconsignation de ${qteRetour} unités (Remboursement: ${montantLigneRetour} F, Pénalité Retenu: ${totalPenaliteRetour} F) ajoutée au flux ${flux_id}`,
-            companyId
+            companyId: companyId.toString()
         });
-    })();
+
+        await session.commitTransaction();
+        session.endSession();
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
-exports.getConsignations = (companyId, status = null) => {
-    const db = getDb();
-    
-    let query = `
-  SELECT 
-    d.*,
-    f.id AS id_flux,
-    f.company_id,
-    f.sale_id,
-    f.client_id,
-    c.nom AS client_nom,
-    f.type_flux,
-    f.montant_total,
-    f.reste_a_payer,
-    f.type_garantie,
-    f.montant_recu,
-    f.garantie_libelle,
-    f.statut,
-    f.created_at,
-    p.nom AS emballage,
-    COALESCE(d.prix_unitaire, 0) AS prix_unitaire,
-    COALESCE(d.montant_ligne, 0) AS montant_ligne,
-    COALESCE(d.montant_penalite_unitaire, 0) AS montant_penalite_unitaire,
-    COALESCE(s.lot_id, f.sale_id, '---') AS numero_facture,
-    CAST(JULIANDAY('now') - JULIANDAY(f.created_at) AS INTEGER) AS jours_ecoules_reel
-FROM flux_emballages_details d
-JOIN flux_emballages f ON d.flux_id = f.id
-LEFT JOIN packaging p ON d.packaging_id = p.id
-LEFT JOIN sales s ON f.sale_id = s.id
-LEFT JOIN customers c ON f.client_id = c.id
-WHERE f.company_id = ?
-    `;
-    
-    const params = [companyId];
-
+exports.getConsignations = async (companyId, status = null) => {
+    let matchQuery = { company_id: companyId.toString() };
     if (status === 'OUVERT') {
-        query += ` AND f.statut = 'EN COURS'`;
+        matchQuery.statut = 'EN COURS';
     } else if (status === 'SOLDE') {
-        query += ` AND f.statut = 'SOLDE'`;
+        matchQuery.statut = 'SOLDE';
     }
-    
-    query += ` ORDER BY f.created_at DESC`;
 
-    const rawResults = db.prepare(query).all(...params);
-    const totauxParFlux = {};
+    const details = await CloudFluxEmballageDetail.find({ company_id: companyId.toString() }).lean();
+    const result = [];
 
-    const lignesCalculees = rawResults.map(row => {
-        let penaliteUnitaire = row.montant_penalite_unitaire || 0;
-        let joursEcoules = row.jours_ecoules_reel;
+    for (const d of details) {
+        const flux = await CloudFluxEmballage.findOne({ localId: d.flux_id, ...matchQuery }).lean();
+        if (!flux) continue;
+
+        const packaging = await CloudPackaging.findOne({ 
+            $or: [{ localId: d.packaging_id }, { _id: mongoose.isValidObjectId(d.packaging_id) ? d.packaging_id : null }] 
+        }).lean();
+
+        const sale = await CloudSale.findOne({ 
+            $or: [{ localId: flux.sale_id }, { _id: mongoose.isValidObjectId(flux.sale_id) ? flux.sale_id : null }] 
+        }).lean();
+
+        const customer = await CloudCustomer.findOne({ 
+            $or: [{ localId: flux.client_id }, { _id: mongoose.isValidObjectId(flux.client_id) ? flux.client_id : null }] 
+        }).lean();
+
+        let penaliteUnitaire = d.montant_penalite_unitaire || 0;
+        let joursEcoules = Math.floor((new Date() - new Date(flux.created_at || Date.now())) / (1000 * 60 * 60 * 24));
         let totalLignePenalite = 0;
 
-        if (row.quantite > 0) {
-            if (row.regle_tarifaire_snapshot) {
+        if (d.quantite > 0) {
+            if (d.regle_tarifaire_snapshot) {
                 try {
                     const simulation = consignationRules.simulerPrixRemboursement(
-                        row.packaging_id, 
-                        row.created_at, 
+                        d.packaging_id, 
+                        flux.created_at, 
                         companyId, 
-                        row.regle_tarifaire_snapshot
+                        d.regle_tarifaire_snapshot
                     );
                     penaliteUnitaire = simulation.montant_penalite_unitaire;
                     joursEcoules = simulation.jours_ecoules;
                 } catch (err) {
-                    console.error(`Erreur recalcul pénalité flux ${row.id_flux}:`, err);
+                    console.error(`Erreur recalcul pénalité flux ${flux.localId}:`, err);
                 }
             }
-            const qtePourCalcul = row.quantite_restante !== undefined ? row.quantite_restante : row.quantite;
+            const qtePourCalcul = d.quantite_restante !== undefined ? d.quantite_restante : d.quantite;
             totalLignePenalite = (qtePourCalcul || 0) * penaliteUnitaire;
         } else {
-            const qteRetourneeBrute = Math.abs(row.quantite || 0);
+            const qteRetourneeBrute = Math.abs(d.quantite || 0);
             totalLignePenalite = qteRetourneeBrute * penaliteUnitaire;
         }
 
-        if (!totauxParFlux[row.id_flux]) {
-            totauxParFlux[row.id_flux] = 0;
-        }
-        totauxParFlux[row.id_flux] += totalLignePenalite;
-
-        return {
-            ...row,
-            montant_penalite_unitaire: row.quantite > 0 ? penaliteUnitaire : row.montant_penalite_unitaire,
+        result.push({
+            ...d,
+            id_flux: flux.localId || flux._id.toString(),
+            company_id: flux.company_id,
+            sale_id: flux.sale_id,
+            client_id: flux.client_id,
+            client_nom: customer?.nom || 'CLIENT AU COMPTANT',
+            type_flux: flux.type_flux,
+            montant_total: flux.montant_total,
+            reste_a_payer: flux.reste_a_payer,
+            type_garantie: flux.type_garantie,
+            montant_recu: flux.montant_recu,
+            garantie_libelle: flux.garantie_libelle,
+            statut: flux.statut,
+            created_at: flux.created_at,
+            emballage: packaging?.nom || 'Emballage',
+            prix_unitaire: d.prix_unitaire || 0,
+            montant_ligne: d.montant_ligne || 0,
+            montant_penalite_unitaire: d.quantite > 0 ? penaliteUnitaire : d.montant_penalite_unitaire,
+            numero_facture: sale?.lot_id || flux.sale_id || '---',
             jours_ecoules_reel: joursEcoules,
             montant_penalite_detail: totalLignePenalite
-        };
+        });
+    }
+
+    // Calcul des totaux par flux
+    const totauxParFlux = {};
+    result.forEach(row => {
+        if (!totauxParFlux[row.id_flux]) totauxParFlux[row.id_flux] = 0;
+        totauxParFlux[row.id_flux] += row.montant_penalite_detail;
     });
 
-    return lignesCalculees.map(row => {
+    return result.map(row => {
         const totalFlux = totauxParFlux[row.id_flux] || 0;
         return {
             ...row,
-            montant_penalite: totalFlux, 
+            montant_penalite: totalFlux,
             tot_penalite: totalFlux
         };
-    });
+    }).sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
 };
 
-exports.updateConsignation = ({ companyId, userId, userName, fluxId, data }) => {
-    const db = getDb();
-    
+exports.updateConsignation = async ({ companyId, userId, userName, fluxId, data }) => {
     const { items, montant_total, type_garantie, montant_recu, garantie_libelle } = data;
 
-    const aDesRetours = db.prepare(`
-        SELECT COUNT(*) as count 
-        FROM flux_emballages_details 
-        WHERE flux_id = ? AND company_id = ? AND quantite < 0
-    `).get(fluxId, companyId);
+    const aDesRetours = await CloudFluxEmballageDetail.countDocuments({
+        flux_id: fluxId,
+        company_id: companyId.toString(),
+        quantite: { $lt: 0 }
+    });
 
-    if (aDesRetours.count > 0) {
+    if (aDesRetours > 0) {
         throw new Error("Impossible de modifier cette consignation : des retours (déconsignations) ont déjà été enregistrés.");
     }
 
     if (!items || items.length === 0) throw new Error("La consignation doit contenir au moins un emballage.");
     
-    db.transaction(() => {
-        const anciensDetails = db.prepare(`SELECT id, packaging_id, quantite FROM flux_emballages_details WHERE flux_id = ?`).all(fluxId);
-        const syncQueueStmt = db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES (?, ?, ?, ?)`);
-        
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const anciensDetails = await CloudFluxEmballageDetail.find({ flux_id: fluxId }).session(session);
+
         for (const detail of anciensDetails) {
-            db.prepare(`
-                UPDATE packaging 
-                SET stock_actuel = stock_actuel + ?, stock_consigne = stock_consigne - ?, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP 
-                WHERE id = ? AND company_id = ?
-            `).run(detail.quantite, detail.quantite, detail.packaging_id, companyId);
-            syncQueueStmt.run('packaging', detail.packaging_id, 'UPDATE', companyId);
-            syncQueueStmt.run('flux_emballages_details', detail.id, 'DELETE', companyId);
+            await CloudPackaging.updateOne(
+                { 
+                    $or: [{ localId: detail.packaging_id }, { _id: mongoose.isValidObjectId(detail.packaging_id) ? detail.packaging_id : null }],
+                    company_id: companyId.toString() 
+                },
+                { $inc: { stock_actuel: detail.quantite, stock_consigne: -detail.quantite }, $set: { updated_at: new Date(), sync_status: 'synced' } }
+            ).session(session);
         }
 
-        db.prepare(`DELETE FROM flux_emballages_details WHERE flux_id = ?`).run(fluxId);
+        await CloudFluxEmballageDetail.deleteMany({ flux_id: fluxId }).session(session);
 
         let totalCalcule = 0;
-        
-        const insertDetailStmt = db.prepare(`
-            INSERT INTO flux_emballages_details 
-            (id, company_id, flux_id, packaging_id, quantite, quantite_restante, prix_unitaire, montant_ligne, montant_penalite_unitaire, regle_tarifaire_snapshot, sync_status) 
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-        `);
-
         for (const item of items) {
             const targetPackagingId = item.packaging_id || item.id;
             const qte = parseFloat(item.qte || item.quantite) || 0;
@@ -408,51 +375,61 @@ exports.updateConsignation = ({ companyId, userId, userName, fluxId, data }) => 
             
             totalCalcule += (qte * pxUnit);
 
-            const packaging = db.prepare('SELECT rule_id FROM packaging WHERE id = ?').get(targetPackagingId);
-            const regleComplete = packaging?.rule_id ? consignationRules.getRuleById(packaging.rule_id, companyId) : null;
+            const packaging = await CloudPackaging.findOne({ 
+                $or: [{ localId: targetPackagingId }, { _id: mongoose.isValidObjectId(targetPackagingId) ? targetPackagingId : null }] 
+            }).lean();
+
+            const regleComplete = packaging?.rule_id ? await consignationRules.getRuleById(packaging.rule_id, companyId) : null;
             const calculs = consignationRules.simulerPrixRemboursement(
                 targetPackagingId, new Date().toISOString(), companyId,
                 regleComplete ? JSON.stringify(regleComplete) : null
             );
 
-            insertDetailStmt.run(
-                detailId, companyId, fluxId, targetPackagingId,
-                qte, qte, pxUnit, (qte * pxUnit), calculs.montant_penalite_unitaire,
-                regleComplete ? JSON.stringify(regleComplete) : null
-            );
+            await CloudFluxEmballageDetail.create([{
+                localId: detailId,
+                company_id: companyId.toString(),
+                flux_id: fluxId,
+                packaging_id: targetPackagingId,
+                quantite: qte,
+                quantite_restante: qte,
+                prix_unitaire: pxUnit,
+                montant_ligne: qte * pxUnit,
+                montant_penalite_unitaire: calculs.montant_penalite_unitaire,
+                regle_tarifaire_snapshot: regleComplete ? JSON.stringify(regleComplete) : null,
+                sync_status: 'synced'
+            }], { session });
             
-            syncQueueStmt.run('flux_emballages_details', detailId, 'INSERT', companyId);
-            
-            db.prepare(`
-                UPDATE packaging 
-                SET stock_actuel = stock_actuel - ?, stock_consigne = stock_consigne + ?, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP 
-                WHERE id = ? AND company_id = ?
-            `).run(qte, qte, targetPackagingId, companyId);
-            syncQueueStmt.run('packaging', targetPackagingId, 'UPDATE', companyId);
+            await CloudPackaging.updateOne(
+                { 
+                    $or: [{ localId: targetPackagingId }, { _id: mongoose.isValidObjectId(targetPackagingId) ? targetPackagingId : null }],
+                    company_id: companyId.toString() 
+                },
+                { $inc: { stock_actuel: -qte, stock_consigne: qte }, $set: { updated_at: new Date(), sync_status: 'synced' } }
+            ).session(session);
         }
 
         const finalMontantTotal = montant_total || totalCalcule;
         const finalTypeGarantie = type_garantie || 'ESPECES';
-        
         const finalMontantRecu = finalTypeGarantie === 'PHYSIQUE' ? 0 : (parseFloat(montant_recu) || 0);
         const finalResteAPayer = finalTypeGarantie === 'PHYSIQUE' ? 0 : Math.max(0, finalMontantTotal - finalMontantRecu);
         const finalGarantieLibelle = finalTypeGarantie === 'PHYSIQUE' ? (garantie_libelle || "Pièce d'identité") : null;
 
-        db.prepare(`
-            UPDATE flux_emballages 
-            SET montant_total = ?, 
-                type_garantie = ?, 
-                montant_recu = ?, 
-                reste_a_payer = ?, 
-                garantie_libelle = ?, 
-                sync_status = 'pending',
-                updated_at = CURRENT_TIMESTAMP 
-            WHERE id = ? AND company_id = ?
-        `).run(finalMontantTotal, finalTypeGarantie, finalMontantRecu, finalResteAPayer, finalGarantieLibelle, fluxId, companyId);
+        await CloudFluxEmballage.updateOne(
+            { localId: fluxId, company_id: companyId.toString() },
+            {
+                $set: {
+                    montant_total: finalMontantTotal,
+                    type_garantie: finalTypeGarantie,
+                    montant_recu: finalMontantRecu,
+                    reste_a_payer: finalResteAPayer,
+                    garantie_libelle: finalGarantieLibelle,
+                    updated_at: new Date(),
+                    sync_status: 'synced'
+                }
+            }
+        ).session(session);
 
-        syncQueueStmt.run('flux_emballages', fluxId, 'UPDATE', companyId);
-
-        logAction({ 
+        await logAction({ 
             userId, 
             userName, 
             actionType: 'MODIFICATION', 
@@ -461,77 +438,85 @@ exports.updateConsignation = ({ companyId, userId, userName, fluxId, data }) => 
             description: finalTypeGarantie === 'PHYSIQUE'
                 ? `Consignation mise à jour avec Garantie Physique : ${finalGarantieLibelle}`
                 : `Consignation mise à jour (Reçu: ${finalMontantRecu} F, Reste: ${finalResteAPayer} F)`, 
-            companyId 
+            companyId: companyId.toString() 
         });
-    })();
 
-    return fluxId;
+        await session.commitTransaction();
+        session.endSession();
+        return fluxId;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
-exports.deleteConsignation = ({ companyId, userId, userName, fluxId }) => {
-    const db = getDb();
-    
-    const aDesRetours = db.prepare(`
-        SELECT COUNT(*) as count 
-        FROM flux_emballages_details 
-        WHERE flux_id = ? AND company_id = ? AND quantite < 0
-    `).get(fluxId, companyId);
+exports.deleteConsignation = async ({ companyId, userId, userName, fluxId }) => {
+    const aDesRetours = await CloudFluxEmballageDetail.countDocuments({
+        flux_id: fluxId,
+        company_id: companyId.toString(),
+        quantite: { $lt: 0 }
+    });
 
-    if (aDesRetours.count > 0) {
+    if (aDesRetours > 0) {
         throw new Error("Impossible de supprimer cette consignation : des retours (déconsignations) ont déjà été enregistrés.");
     }
 
-    db.transaction(() => {
-        const details = db.prepare(`SELECT id, packaging_id, quantite FROM flux_emballages_details WHERE flux_id = ?`).all(fluxId);
-        const syncQueueStmt = db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES (?, ?, ?, ?)`);
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const details = await CloudFluxEmballageDetail.find({ flux_id: fluxId }).session(session);
 
         for (const d of details) {
-            db.prepare(`
-                UPDATE packaging 
-                SET stock_actuel = stock_actuel + ?, stock_consigne = stock_consigne - ?, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP 
-                WHERE id = ? AND company_id = ?
-            `).run(d.quantite, d.quantite, d.packaging_id, companyId);
-            syncQueueStmt.run('packaging', d.packaging_id, 'UPDATE', companyId);
-            syncQueueStmt.run('flux_emballages_details', d.id, 'DELETE', companyId);
+            await CloudPackaging.updateOne(
+                { 
+                    $or: [{ localId: d.packaging_id }, { _id: mongoose.isValidObjectId(d.packaging_id) ? d.packaging_id : null }],
+                    company_id: companyId.toString() 
+                },
+                { $inc: { stock_actuel: d.quantite, stock_consigne: -d.quantite }, $set: { updated_at: new Date(), sync_status: 'synced' } }
+            ).session(session);
         }
         
-        db.prepare(`DELETE FROM flux_emballages_details WHERE flux_id = ?`).run(fluxId);
-        db.prepare(`DELETE FROM flux_emballages WHERE id = ? AND company_id = ?`).run(fluxId, companyId);
+        await CloudFluxEmballageDetail.deleteMany({ flux_id: fluxId }).session(session);
+        await CloudFluxEmballage.deleteOne({ localId: fluxId, company_id: companyId.toString() }).session(session);
         
-        syncQueueStmt.run('flux_emballages', fluxId, 'DELETE', companyId);
-        
-        logAction({ userId, userName, actionType: 'SUPPRESSION', tableConcernee: 'flux_emballages', referenceId: fluxId, description: `Consignation supprimée`, companyId });
-    })();
+        await logAction({ userId, userName, actionType: 'SUPPRESSION', tableConcernee: 'flux_emballages', referenceId: fluxId, description: `Consignation supprimée`, companyId: companyId.toString() });
+
+        await session.commitTransaction();
+        session.endSession();
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
-exports.getConsignationById = (companyId, fluxId) => {
-    const db = getDb();
-    
-    const header = db.prepare(`
-        SELECT 
-            f.*, 
-            f.type_garantie,
-            f.montant_recu,
-            f.garantie_libelle,
-            s.lot_id, 
-            s.id as numero_technique_vente
-        FROM flux_emballages f
-        LEFT JOIN sales s ON f.sale_id = s.id
-        WHERE f.id = ? AND f.company_id = ?
-    `).get(fluxId, companyId);
-
+exports.getConsignationById = async (companyId, fluxId) => {
+    const header = await CloudFluxEmballage.findOne({ localId: fluxId, company_id: companyId.toString() }).lean();
     if (!header) return null;
 
-    const items = db.prepare(`
-        SELECT d.*, p.nom as nom_emballage 
-        FROM flux_emballages_details d
-        LEFT JOIN packaging p ON d.packaging_id = p.id
-        WHERE d.flux_id = ? AND d.company_id = ?
-    `).all(fluxId, companyId);
+    const sale = await CloudSale.findOne({ 
+        $or: [{ localId: header.sale_id }, { _id: mongoose.isValidObjectId(header.sale_id) ? header.sale_id : null }] 
+    }).lean();
+
+    const items = await CloudFluxEmballageDetail.find({ flux_id: fluxId, company_id: companyId.toString() }).lean();
+
+    const enrichedItems = [];
+    for (const item of items) {
+        const packaging = await CloudPackaging.findOne({ 
+            $or: [{ localId: item.packaging_id }, { _id: mongoose.isValidObjectId(item.packaging_id) ? item.packaging_id : null }] 
+        }).lean();
+
+        enrichedItems.push({
+            ...item,
+            nom_emballage: packaging?.nom || 'Emballage'
+        });
+    }
 
     return {
         ...header,
-        numero_facture: header.lot_id || header.sale_id, 
-        items: items
+        numero_facture: sale?.lot_id || header.sale_id, 
+        items: enrichedItems
     };
 };

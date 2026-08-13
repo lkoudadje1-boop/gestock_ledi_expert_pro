@@ -1,4 +1,9 @@
-const { getDb } = require('../config/database');
+// backend/services/familleCategGroup.service.js
+const mongoose = require('mongoose');
+const { 
+    CloudFamille, CloudCategory, CloudProductGroup, 
+    CloudProduct, CloudInventory, CloudAuditLog 
+} = require('../models/cloud.model');
 const { logAction } = require('../utils/auditHelper');
 
 // Helper interne pour les IDs
@@ -7,276 +12,337 @@ function genererIdStructure(prefix) {
 }
 
 // Vérification de verrouillage (Inventaire)
-function checkInventoryLock(db, companyId) {
-    const activeInv = db.prepare(`
-        SELECT id FROM inventories 
-        WHERE company_id = ? AND statut = 'en_cours' 
-        LIMIT 1
-    `).get(companyId);
+async function checkInventoryLock(companyId) {
+    const activeInv = await CloudInventory.findOne({ 
+        company_id: companyId.toString(), 
+        statut: 'en_cours' 
+    }).lean();
     if (activeInv) throw new Error("Action bloquée : Un inventaire est en cours.");
 }
 
+// Sélection du modèle Mongoose approprié selon le type
+const getModelByType = (type) => {
+    if (type === 'familles') return CloudFamille;
+    if (type === 'categories') return CloudCategory;
+    if (type === 'groups' || type === 'product_groups') return CloudProductGroup;
+    throw new Error(`Type de structure inconnu: ${type}`);
+};
+
 // 📌 GET ALL
-exports.getAll = (type, companyId) => {
-    const db = getDb();
-    let sql = "";
+exports.getAll = async (type, companyId) => {
+    const companyStr = companyId.toString();
     if (type === 'familles') {
-        sql = "SELECT * FROM familles WHERE company_id = ? ORDER BY nom ASC";
+        return await CloudFamille.find({ company_id: companyStr }).sort({ nom: 1 }).lean();
     } else if (type === 'categories') {
-        sql = "SELECT c.*, f.nom as famille_nom FROM categories c LEFT JOIN familles f ON c.famille_id = f.id WHERE c.company_id = ? ORDER BY c.nom ASC";
+        const categories = await CloudCategory.find({ company_id: companyStr }).sort({ nom: 1 }).lean();
+        const result = [];
+        for (const cat of categories) {
+            const famille = await CloudFamille.findOne({ 
+                $or: [{ localId: cat.famille_id }, { _id: mongoose.isValidObjectId(cat.famille_id) ? cat.famille_id : null }] 
+            }).lean();
+            result.push({
+                ...cat,
+                famille_nom: famille?.nom || null
+            });
+        }
+        return result;
     } else {
-        sql = "SELECT g.*, c.nom as category_nom FROM product_groups g LEFT JOIN categories c ON g.category_id = c.id WHERE g.company_id = ? ORDER BY g.nom ASC";
+        const groups = await CloudProductGroup.find({ company_id: companyStr }).sort({ nom: 1 }).lean();
+        const result = [];
+        for (const grp of groups) {
+            const category = await CloudCategory.findOne({ 
+                $or: [{ localId: grp.category_id }, { _id: mongoose.isValidObjectId(grp.category_id) ? grp.category_id : null }] 
+            }).lean();
+            result.push({
+                ...grp,
+                category_nom: category?.nom || null
+            });
+        }
+        return result;
     }
-    return db.prepare(sql).all(companyId);
 };
 
 // 📌 CREATE
-exports.create = ({ type, data, companyId, userId, userName }) => {
-    const db = getDb();
+exports.create = async ({ type, data, companyId, userId, userName }) => {
     const { nom, famille_id, category_id } = data;
-    
-    checkInventoryLock(db, companyId);
+    const companyStr = companyId.toString();
+
+    await checkInventoryLock(companyStr);
 
     const prefix = type === 'familles' ? 'FAM' : (type === 'categories' ? 'CAT' : 'GRP');
     const table = type === 'groups' ? 'product_groups' : type;
+    const Model = getModelByType(type);
     const newId = genererIdStructure(prefix);
     const nomPropre = nom.toUpperCase().trim();
 
-    db.transaction(() => {
-        if (type === 'familles') {
-            db.prepare("INSERT INTO familles (id, nom, company_id, is_active, sync_status) VALUES (?, ?, ?, 1, 'pending')").run(newId, nomPropre, companyId);
-        } else if (type === 'categories') {
-            db.prepare("INSERT INTO categories (id, nom, famille_id, company_id, is_active, sync_status) VALUES (?, ?, ?, ?, 1, 'pending')").run(newId, nomPropre, famille_id, companyId);
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const docData = {
+            localId: newId,
+            nom: nomPropre,
+            company_id: companyStr,
+            is_active: 1,
+            sync_status: 'synced'
+        };
+
+        if (type === 'categories') {
+            docData.famille_id = famille_id;
         } else if (type === 'groups') {
-            db.prepare("INSERT INTO product_groups (id, nom, category_id, company_id, is_active, sync_status) VALUES (?, ?, ?, ?, 1, 'pending')").run(newId, nomPropre, category_id, companyId);
+            docData.category_id = category_id;
         }
 
-        db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES (?, ?, 'INSERT', ?)").run(table, newId, companyId);
+        await Model.create([docData], { session });
 
-        logAction({
-            userId, userName, actionType: 'INSERTION', tableConcernee: table, referenceId: newId,
-            description: `Création ${type}: ${nomPropre}`, companyId
+        await logAction({
+            userId, 
+            userName: userName || 'user', 
+            actionType: 'INSERTION', 
+            tableConcernee: table, 
+            referenceId: newId,
+            description: `Création ${type}: ${nomPropre}`, 
+            companyId: companyStr
         });
-    })();
-    return newId;
+
+        await session.commitTransaction();
+        session.endSession();
+        return newId;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
 // 📌 STATUS
-exports.updateStatus = ({ type, id, is_active, companyId, userId, userName }) => {
-    const db = getDb();
+exports.updateStatus = async ({ type, id, is_active, companyId, userId, userName }) => {
+    const companyStr = companyId.toString();
     const table = type === 'groups' ? 'product_groups' : type;
-    
-    checkInventoryLock(db, companyId);
+    const Model = getModelByType(type);
+
+    await checkInventoryLock(companyStr);
     const activeValue = Number(is_active) === 1 ? 1 : 0;
 
-    return db.transaction(() => {
-        // Liste pour mémoriser tous les enregistrements modifiés en cascade afin d'alimenter la sync_queue
-        let subCategories = [];
-        let subGroups = [];
-        let subProducts = [];
-        
-        // --- 🟢 CAS 1 : LIBÉRATION (RESTAURATION COHÉRENTE DE LA LIGNÉE) ---
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const targetDoc = await Model.findOne({ 
+            $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }],
+            company_id: companyStr 
+        }).session(session);
+
+        if (!targetDoc) throw new Error("Élément de structure introuvable.");
+
+        const targetLocalId = targetDoc.localId || targetDoc._id.toString();
+
         if (activeValue === 1) {
             if (type === 'categories') {
-                const gp = db.prepare(`SELECT f.is_active, f.nom FROM familles f JOIN categories c ON c.famille_id = f.id WHERE c.id = ? AND c.company_id = ?`).get(id, companyId);
-                if (gp && Number(gp.is_active) === 0) throw new Error(`🚫 Grand-parent (Famille "${gp.nom}") enfermé. Impossible de restaurer.`);
-            } 
-            else if (type === 'groups') {
-                const lineage = db.prepare(`
-                    SELECT c.is_active as cat_active, c.nom as cat_nom, f.is_active as fam_active, f.nom as fam_nom
-                    FROM product_groups g
-                    JOIN categories c ON g.category_id = c.id
-                    JOIN familles f ON c.famille_id = f.id
-                    WHERE g.id = ? AND g.company_id = ?
-                `).get(id, companyId);
-                if (lineage && (Number(lineage.fam_active) === 0 || Number(lineage.cat_active) === 0)) {
-                    throw new Error(`🚫 Lignée verrouillée (Famille ou Catégorie enfermée).`);
+                const famille = await CloudFamille.findOne({ 
+                    $or: [{ localId: targetDoc.famille_id }, { _id: mongoose.isValidObjectId(targetDoc.famille_id) ? targetDoc.famille_id : null }] 
+                }).session(session);
+                if (famille && Number(famille.is_active) === 0) {
+                    throw new Error(`🚫 Grand-parent (Famille "${famille.nom}") enfermé. Impossible de restaurer.`);
                 }
-            }
-
-            // ⚡ CASCADE DE LIBÉRATION + SÉCURISATION DES IDS POUR LA SYNCHRONISATION
-            if (type === 'familles') {
-                subCategories = db.prepare(`SELECT id FROM categories WHERE famille_id = ? AND company_id = ?`).all(id, companyId).map(r => r.id);
-                subGroups = db.prepare(`SELECT id FROM product_groups WHERE category_id IN (SELECT id FROM categories WHERE famille_id = ?) AND company_id = ?`).all(id, companyId).map(r => r.id);
-                subProducts = db.prepare(`SELECT id FROM products WHERE group_id IN (SELECT id FROM product_groups WHERE category_id IN (SELECT id FROM categories WHERE famille_id = ?)) AND company_id = ?`).all(id, companyId).map(r => r.id);
-
-                db.prepare(`UPDATE categories SET is_active = 1, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE famille_id = ? AND company_id = ?`).run(id, companyId);
-                db.prepare(`UPDATE product_groups SET is_active = 1, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE category_id IN (SELECT id FROM categories WHERE famille_id = ?) AND company_id = ?`).run(id, companyId);
-                db.prepare(`UPDATE products SET is_active = 1, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE group_id IN (SELECT id FROM product_groups WHERE category_id IN (SELECT id FROM categories WHERE famille_id = ?)) AND company_id = ?`).run(id, companyId);
-            } 
-            else if (type === 'categories') {
-                subGroups = db.prepare(`SELECT id FROM product_groups WHERE category_id = ? AND company_id = ?`).all(id, companyId).map(r => r.id);
-                subProducts = db.prepare(`SELECT id FROM products WHERE group_id IN (SELECT id FROM product_groups WHERE category_id = ?) AND company_id = ?`).all(id, companyId).map(r => r.id);
-
-                db.prepare(`UPDATE product_groups SET is_active = 1, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE category_id = ? AND company_id = ?`).run(id, companyId);
-                // 🛠️ CORRECTION EXÉCUTÉE ICI : Retrait du doublon d'argument "id" pour éviter le crash SQL
-                db.prepare(`UPDATE products SET is_active = 1, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE group_id IN (SELECT id FROM product_groups WHERE category_id = ?) AND company_id = ?`).run(id, companyId);
-            }
-            else if (type === 'groups') {
-                subProducts = db.prepare(`SELECT id FROM products WHERE group_id = ? AND company_id = ?`).all(id, companyId).map(r => r.id);
-                db.prepare(`UPDATE products SET is_active = 1, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE group_id = ? AND company_id = ?`).run(id, companyId);
-            }
-        }
-
-        // --- 🔴 CAS 2 : ARCHIVAGE (VÉRIFICATION SÉCURISÉE DU STOCK RESTE EN AMONT) ---
-        else {
-            // Extraction préalable des identifiants impactés pour la file de synchronisation réseau
-            if (type === 'familles') {
-                subCategories = db.prepare(`SELECT id FROM categories WHERE famille_id = ? AND company_id = ?`).all(id, companyId).map(r => r.id);
-                subGroups = db.prepare(`SELECT id FROM product_groups WHERE category_id IN (SELECT id FROM categories WHERE famille_id = ?) AND company_id = ?`).all(id, companyId).map(r => r.id);
-                subProducts = db.prepare(`SELECT id FROM products WHERE group_id IN (SELECT id FROM product_groups WHERE category_id IN (SELECT id FROM categories WHERE famille_id = ?)) AND company_id = ?`).all(id, companyId).map(r => r.id);
-            } 
-            else if (type === 'categories') {
-                subGroups = db.prepare(`SELECT id FROM product_groups WHERE category_id = ? AND company_id = ?`).all(id, companyId).map(r => r.id);
-                subProducts = db.prepare(`SELECT id FROM products WHERE group_id IN (SELECT id FROM product_groups WHERE category_id = ?) AND company_id = ?`).all(id, companyId).map(r => r.id);
-            }
-            else if (type === 'groups') {
-                subProducts = db.prepare(`SELECT id FROM products WHERE group_id = ? AND company_id = ?`).all(id, companyId).map(r => r.id);
-            }
-
-            // 🛡️ VERROU COMPTABLE COMPLEMENTAIRE : Interdire l'archivage en cascade s'il reste du stock sur un produit de la lignée
-            if (subProducts.length > 0) {
-                const checkStockStmt = db.prepare(`SELECT nom, stock_actuel FROM products WHERE id = ? AND stock_actuel > 0`);
-                for (const prodId of subProducts) {
-                    const itemAvecStock = checkStockStmt.get(prodId);
-                    if (itemAvecStock) {
-                        throw new Error(`🚫 Opération refusée : Impossible d'archiver la structure, car l'article "${itemAvecStock.nom}" possède encore ${itemAvecStock.stock_actuel} unité(s) en stock.`);
+            } else if (type === 'groups') {
+                const category = await CloudCategory.findOne({ 
+                    $or: [{ localId: targetDoc.category_id }, { _id: mongoose.isValidObjectId(targetDoc.category_id) ? targetDoc.category_id : null }] 
+                }).session(session);
+                if (category) {
+                    const famille = await CloudFamille.findOne({ 
+                        $or: [{ localId: category.famille_id }, { _id: mongoose.isValidObjectId(category.famille_id) ? category.famille_id : null }] 
+                    }).session(session);
+                    if (famille && (Number(famille.is_active) === 0 || Number(category.is_active) === 0)) {
+                        throw new Error(`🚫 Lignée verrouillée (Famille ou Catégorie enfermée).`);
                     }
                 }
             }
 
-            // EXECUTION DES EXCLUSIONS EN CASCADE
+            // Cascade de libération
             if (type === 'familles') {
-                db.prepare(`UPDATE categories SET is_active = 0, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE famille_id = ? AND company_id = ?`).run(id, companyId);
-                db.prepare(`UPDATE product_groups SET is_active = 0, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE category_id IN (SELECT id FROM categories WHERE famille_id = ?) AND company_id = ?`).run(id, companyId);
-                db.prepare(`UPDATE products SET is_active = 0, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE group_id IN (SELECT id FROM product_groups WHERE category_id IN (SELECT id FROM categories WHERE famille_id = ?)) AND company_id = ?`).run(id, companyId);
-            } 
-            else if (type === 'categories') {
-                db.prepare(`UPDATE product_groups SET is_active = 0, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE category_id = ? AND company_id = ?`).run(id, companyId);
-                db.prepare(`UPDATE products SET is_active = 0, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE group_id IN (SELECT id FROM product_groups WHERE category_id = ?) AND company_id = ?`).run(id, companyId);
+                const cats = await CloudCategory.find({ famille_id: targetLocalId, company_id: companyStr }).session(session);
+                const catIds = cats.map(c => c.localId || c._id.toString());
+                
+                const groups = await CloudProductGroup.find({ category_id: { $in: catIds }, company_id: companyStr }).session(session);
+                const groupIds = groups.map(g => g.localId || g._id.toString());
+
+                await CloudCategory.updateMany({ famille_id: targetLocalId, company_id: companyStr }, { $set: { is_active: 1, updated_at: new Date() } }).session(session);
+                await CloudProductGroup.updateMany({ category_id: { $in: catIds }, company_id: companyStr }, { $set: { is_active: 1, updated_at: new Date() } }).session(session);
+                await CloudProduct.updateMany({ group_id: { $in: groupIds }, company_id: companyStr }, { $set: { is_active: 1, updated_at: new Date() } }).session(session);
+            } else if (type === 'categories') {
+                const groups = await CloudProductGroup.find({ category_id: targetLocalId, company_id: companyStr }).session(session);
+                const groupIds = groups.map(g => g.localId || g._id.toString());
+
+                await CloudProductGroup.updateMany({ category_id: targetLocalId, company_id: companyStr }, { $set: { is_active: 1, updated_at: new Date() } }).session(session);
+                await CloudProduct.updateMany({ group_id: { $in: groupIds }, company_id: companyStr }, { $set: { is_active: 1, updated_at: new Date() } }).session(session);
+            } else if (type === 'groups') {
+                await CloudProduct.updateMany({ group_id: targetLocalId, company_id: companyStr }, { $set: { is_active: 1, updated_at: new Date() } }).session(session);
             }
-            else if (type === 'groups') {
-                db.prepare(`UPDATE products SET is_active = 0, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE group_id = ? AND company_id = ?`).run(id, companyId);
+        } else {
+            // Archivage & vérification de stock
+            let subProducts = [];
+            if (type === 'familles') {
+                const cats = await CloudCategory.find({ famille_id: targetLocalId, company_id: companyStr }).session(session);
+                const catIds = cats.map(c => c.localId || c._id.toString());
+                const groups = await CloudProductGroup.find({ category_id: { $in: catIds }, company_id: companyStr }).session(session);
+                const groupIds = groups.map(g => g.localId || g._id.toString());
+                subProducts = await CloudProduct.find({ group_id: { $in: groupIds }, company_id: companyStr }).session(session);
+            } else if (type === 'categories') {
+                const groups = await CloudProductGroup.find({ category_id: targetLocalId, company_id: companyStr }).session(session);
+                const groupIds = groups.map(g => g.localId || g._id.toString());
+                subProducts = await CloudProduct.find({ group_id: { $in: groupIds }, company_id: companyStr }).session(session);
+            } else if (type === 'groups') {
+                subProducts = await CloudProduct.find({ group_id: targetLocalId, company_id: companyStr }).session(session);
+            }
+
+            for (const prod of subProducts) {
+                if (prod.stock_actuel > 0) {
+                    throw new Error(`🚫 Opération refusée : Impossible d'archiver la structure, car l'article "${prod.nom}" possède encore ${prod.stock_actuel} unité(s) en stock.`);
+                }
+            }
+
+            if (type === 'familles') {
+                const cats = await CloudCategory.find({ famille_id: targetLocalId, company_id: companyStr }).session(session);
+                const catIds = cats.map(c => c.localId || c._id.toString());
+                const groups = await CloudProductGroup.find({ category_id: { $in: catIds }, company_id: companyStr }).session(session);
+                const groupIds = groups.map(g => g.localId || g._id.toString());
+
+                await CloudCategory.updateMany({ famille_id: targetLocalId, company_id: companyStr }, { $set: { is_active: 0, updated_at: new Date() } }).session(session);
+                await CloudProductGroup.updateMany({ category_id: { $in: catIds }, company_id: companyStr }, { $set: { is_active: 0, updated_at: new Date() } }).session(session);
+                await CloudProduct.updateMany({ group_id: { $in: groupIds }, company_id: companyStr }, { $set: { is_active: 0, updated_at: new Date() } }).session(session);
+            } else if (type === 'categories') {
+                const groups = await CloudProductGroup.find({ category_id: targetLocalId, company_id: companyStr }).session(session);
+                const groupIds = groups.map(g => g.localId || g._id.toString());
+
+                await CloudProductGroup.updateMany({ category_id: targetLocalId, company_id: companyStr }, { $set: { is_active: 0, updated_at: new Date() } }).session(session);
+                await CloudProduct.updateMany({ group_id: { $in: groupIds }, company_id: companyStr }, { $set: { is_active: 0, updated_at: new Date() } }).session(session);
+            } else if (type === 'groups') {
+                await CloudProduct.updateMany({ group_id: targetLocalId, company_id: companyStr }, { $set: { is_active: 0, updated_at: new Date() } }).session(session);
             }
         }
 
-        // 3️⃣ INSERER COMPLÈTEMENT LES IDS CASCADÉS DANS LA FILE D'ATTENTE SYNC_QUEUE
-        const syncQueueStmt = db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES (?, ?, 'UPDATE', ?)`);
-        
-        subCategories.forEach(subId => syncQueueStmt.run('categories', subId, companyId));
-        subGroups.forEach(subId => syncQueueStmt.run('product_groups', subId, companyId));
-        subProducts.forEach(subId => syncQueueStmt.run('products', subId, companyId));
+        const updateRes = await Model.updateOne({ _id: targetDoc._id }, { $set: { is_active: activeValue, updated_at: new Date() } }).session(session);
 
-        // 4️⃣ MISE À JOUR FINALE ET QUEUE DE L'ÉLÉMENT RACINE DECLENCHEUR
-        const result = db.prepare(`UPDATE ${table} SET is_active = ?, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND company_id = ?`).run(activeValue, id, companyId);
-        syncQueueStmt.run(table, id, companyId);
-
-        logAction({
-            userId, userName, actionType: 'MODIFICATION',
-            tableConcernee: table, referenceId: id,
-            description: `${activeValue === 1 ? 'RESTAURATION' : 'ARCHIVAGE'} en cascade structurelle pour l'ID : ${id}`,
-            companyId
+        await logAction({
+            userId, 
+            userName: userName || 'user', 
+            actionType: 'MODIFICATION',
+            tableConcernee: table, 
+            referenceId: targetLocalId,
+            description: `${activeValue === 1 ? 'RESTAURATION' : 'ARCHIVAGE'} en cascade structurelle pour l'ID : ${targetLocalId}`,
+            companyId: companyStr
         });
 
-        return result;
-    })();
+        await session.commitTransaction();
+        session.endSession();
+        return updateRes;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
-exports.update = ({ type, id, data, companyId, userId, userName }) => {
-    const db = getDb();
+
+exports.update = async ({ type, id, data, companyId, userId, userName }) => {
     const { nom, famille_id, category_id } = data;
-    
-    checkInventoryLock(db, companyId);
+    const companyStr = companyId.toString();
+
+    await checkInventoryLock(companyStr);
 
     const table = type === 'groups' ? 'product_groups' : type;
+    const Model = getModelByType(type);
     const nomPropre = nom ? nom.toUpperCase().trim() : null;
 
     if (!nomPropre) {
         throw new Error("Le nom de l'élément de structure ne peut pas être vide.");
     }
 
-    return db.transaction(() => {
-        // 🛠️ MISE À JOUR ADAPTATIVE DES CHAMPS TEXTUELS SELON LE MODULE
-        if (type === 'familles') {
-            db.prepare(`
-                UPDATE familles 
-                SET nom = ?, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP 
-                WHERE id = ? AND company_id = ?
-            `).run(nomPropre, id, companyId);
-        } 
-        else if (type === 'categories') {
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const updateData = { nom: nomPropre, updated_at: new Date() };
+
+        if (type === 'categories') {
             if (!famille_id) throw new Error("La famille associée est obligatoire.");
-            db.prepare(`
-                UPDATE categories 
-                SET nom = ?, famille_id = ?, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP 
-                WHERE id = ? AND company_id = ?
-            `).run(nomPropre, famille_id, id, companyId);
-        } 
-        else if (type === 'groups') {
+            updateData.famille_id = famille_id;
+        } else if (type === 'groups') {
             if (!category_id) throw new Error("La catégorie associée est obligatoire.");
-            db.prepare(`
-                UPDATE product_groups 
-                SET nom = ?, category_id = ?, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP 
-                WHERE id = ? AND company_id = ?
-            `).run(nomPropre, category_id, id, companyId);
+            updateData.category_id = category_id;
         }
 
-        // 💾 ALIMENTATION DE LA QUEUE DE SYNCHRONISATION RÉSEAU
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES (?, ?, 'UPDATE', ?)
-        `).run(table, id, companyId);
+        const res = await Model.updateOne(
+            { $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }], company_id: companyStr },
+            { $set: updateData }
+        ).session(session);
 
-        logAction({
-            userId, userName, actionType: 'MODIFICATION', tableConcernee: table, referenceId: id,
-            description: `Modification du nom de la ${type} (ID: ${id}) -> ${nomPropre}`, companyId
+        if (res.matchedCount === 0) throw new Error("Élément introuvable.");
+
+        await logAction({
+            userId, 
+            userName: userName || 'user', 
+            actionType: 'MODIFICATION', 
+            tableConcernee: table, 
+            referenceId: id,
+            description: `Modification du nom de la ${type} (ID: ${id}) -> ${nomPropre}`, 
+            companyId: companyStr
         });
 
+        await session.commitTransaction();
+        session.endSession();
         return true;
-    })();
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
 exports.processMassiveImport = async (type, items, user) => {
-    const db = getDb();
     const prefix = type === 'familles' ? 'FAM' : (type === 'categories' ? 'CAT' : 'GRP');
-    const table = type === 'groups' ? 'product_groups' : type;
+    const Model = getModelByType(type);
+    const companyStr = user.companyId.toString();
 
-    return db.transaction(() => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
         for (const item of items) {
-            // 🎯 GÉNÉRATION AUTO DE L'ID
             const newId = `${prefix}-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 100)}`;
             const nomPropre = item.nom.toUpperCase().trim();
             
             let parentId = null;
 
-            // Recherche du parent par nom
             if (type === 'categories' && item.parentNom) {
-                const parent = db.prepare("SELECT id FROM familles WHERE nom = ? AND company_id = ?")
-                                 .get(item.parentNom.toUpperCase(), user.companyId);
+                const parent = await CloudFamille.findOne({ nom: item.parentNom.toUpperCase(), company_id: companyStr }).session(session);
                 if (!parent) throw new Error(`La famille '${item.parentNom}' est introuvable. Importation annulée.`);
-                parentId = parent.id;
-            } 
-            else if (type === 'groups' && item.parentNom) {
-                const parent = db.prepare("SELECT id FROM categories WHERE nom = ? AND company_id = ?")
-                                 .get(item.parentNom.toUpperCase(), user.companyId);
+                parentId = parent.localId || parent._id.toString();
+            } else if (type === 'groups' && item.parentNom) {
+                const parent = await CloudCategory.findOne({ nom: item.parentNom.toUpperCase(), company_id: companyStr }).session(session);
                 if (!parent) throw new Error(`La catégorie '${item.parentNom}' est introuvable. Importation annulée.`);
-                parentId = parent.id;
+                parentId = parent.localId || parent._id.toString();
             }
 
-            // Insertion SQL
-            if (type === 'familles') {
-                db.prepare(`INSERT INTO familles (id, nom, company_id, is_active, sync_status) VALUES (?, ?, ?, ?, 'pending')`)
-                  .run(newId, nomPropre, user.companyId, item.is_active);
-            } else if (type === 'categories') {
-                db.prepare(`INSERT INTO categories (id, nom, famille_id, company_id, is_active, sync_status) VALUES (?, ?, ?, ?, ?, 'pending')`)
-                  .run(newId, nomPropre, parentId, user.companyId, item.is_active);
-            } else if (type === 'groups') {
-                db.prepare(`INSERT INTO product_groups (id, nom, category_id, company_id, is_active, sync_status) VALUES (?, ?, ?, ?, ?, 'pending')`)
-                  .run(newId, nomPropre, parentId, user.companyId, item.is_active);
-            }
+            const docData = {
+                localId: newId,
+                nom: nomPropre,
+                company_id: companyStr,
+                is_active: item.is_active,
+                sync_status: 'synced'
+            };
 
-            // Enregistrement pour la synchronisation Cloud
-            db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES (?, ?, 'INSERT', ?)`)
-              .run(table, newId, user.companyId);
+            if (type === 'categories') docData.famille_id = parentId;
+            if (type === 'groups') docData.category_id = parentId;
+
+            await Model.create([docData], { session });
         }
-    })();
+
+        await session.commitTransaction();
+        session.endSession();
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };

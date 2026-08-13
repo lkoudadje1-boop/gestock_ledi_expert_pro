@@ -1,43 +1,113 @@
-const { getDb } = require('../config/database');
+// backend/controllers/Rap_tafir.controller.js
 const TafirService = require('../services/Rap_tafir.service');
+const { CloudExercice, CloudPlanComptable, CloudReportANouveau, CloudLigneEcriture, CloudJournal } = require('../models/cloud.model');
 
 // --- COMPTE DE RÉSULTAT ---
 exports.getCompteResultat = async (req, res) => {
-    const db = getDb();
     const companyId = req.user?.company_id || req.user?.companyId;
     const { exerciceId, dateDebut, dateFin } = req.query;
 
     try {
-        if (!exerciceId) return res.status(400).json({ error: "ID Exercice manquant" });
+        if (!companyId) return res.status(401).json({ success: false, error: "Session invalide." });
+        if (!exerciceId) return res.status(400).json({ success: false, error: "ID Exercice manquant" });
 
-        const exInfo = db.prepare("SELECT date_debut, date_fin FROM exercices WHERE id = ?").get(exerciceId);
-        if (!exInfo) return res.status(400).json({ error: "Exercice introuvable" });
+        const cid = companyId.toString();
+        const exInfo = await CloudExercice.findOne({ localId: exerciceId.toString(), company_id: cid }).lean();
+        if (!exInfo) return res.status(400).json({ success: false, error: "Exercice introuvable" });
 
-        const prevEx = db.prepare(`
-            SELECT id, date_debut, date_fin FROM exercices 
-            WHERE company_id = ? AND date_debut < ? 
-            ORDER BY date_debut DESC LIMIT 1
-        `).get(companyId, exInfo.date_debut);
+        const prevEx = await CloudExercice.findOne({
+            company_id: cid,
+            date_debut: { $lt: exInfo.date_debut }
+        }).sort({ date_debut: -1 }).lean();
 
-        const sqlN = `
-            SELECT 
-                p.numero_compte, 
-                (SELECT IFNULL(SUM(montant_debit - montant_credit), 0) FROM reports_a_nouveau 
-                 WHERE exercice_id = ? AND num_compte = p.numero_compte AND company_id = ?) as ran,
-                IFNULL(SUM(l.debit), 0) as mov_debit, 
-                IFNULL(SUM(l.credit), 0) as mov_credit
-            FROM plan_comptable p
-            LEFT JOIN lignes_ecritures l ON p.numero_compte = l.num_compte 
-                AND l.is_deleted = 0 
-                AND l.exercice_id = ? 
-                AND l.company_id = ?
-                AND l.date_ecriture >= ? 
-                AND l.date_ecriture <= ?
-                AND l.journal_id NOT IN (SELECT id FROM journaux WHERE type_journal = 'RAN' OR code = 'RAN')
-            WHERE p.company_id = ? AND p.numero_compte GLOB '[6-8]*'
-            GROUP BY p.numero_compte
-        `;
-        const rowsN = db.prepare(sqlN).all(exerciceId, companyId, exerciceId, companyId, dateDebut, dateFin, companyId);
+        // Journaux à exclure (RAN)
+        const ranJournaux = await CloudJournal.find({
+            company_id: cid,
+            $or: [{ type_journal: 'RAN' }, { code: 'RAN' }]
+        }, { localId: 1 }).lean();
+        const ranJournalIds = ranJournaux.map(j => j.localId);
+
+        const rowsN = await CloudPlanComptable.aggregate([
+            {
+                $match: {
+                    company_id: cid,
+                    numero_compte: { $regex: /^[6-8]/ }
+                }
+            },
+            {
+                $lookup: {
+                    from: 'cloud_report_a_nouveaus',
+                    let: { cptNum: '$numero_compte', cid: cid, exId: exerciceId.toString() },
+                    pipeline: [
+                        {
+                            $match: {
+                                $expr: {
+                                    $and: [
+                                        { $eq: ['$exercice_id', '$$exId'] },
+                                        { $eq: ['$num_compte', '$$cptNum'] },
+                                        { $eq: ['$company_id', '$$cid'] }
+                                    ]
+                                }
+                            }
+                        },
+                        {
+                            $group: {
+                                _id: null,
+                                total: { $sum: { $subtract: ['$montant_debit', '$montant_credit'] } }
+                            }
+                        }
+                    ],
+                    as: 'ran'
+                }
+            },
+            {
+                $lookup: {
+                    from: 'cloud_ligne_ecritures',
+                    let: { 
+                        cptNum: '$numero_compte', 
+                        cid: cid, 
+                        exId: exerciceId.toString(), 
+                        dStart: new Date(dateDebut), 
+                        dEnd: new Date(dateFin + 'T23:59:59.999Z'), 
+                        excludedJournals: ranJournalIds 
+                    },
+                    pipeline: [
+                        {
+                            $match: {
+                                $expr: {
+                                    $and: [
+                                        { $eq: ['$num_compte', '$$cptNum'] },
+                                        { $eq: ['$company_id', '$$cid'] },
+                                        { $eq: ['$exercice_id', '$$exId'] },
+                                        { $ne: ['$is_deleted', 1] },
+                                        { $gte: ['$date_ecriture', '$$dStart'] },
+                                        { $lte: ['$date_ecriture', '$$dEnd'] },
+                                        { $not: { $in: ['$journal_id', '$$excludedJournals'] } }
+                                    ]
+                                }
+                            }
+                        },
+                        {
+                            $group: {
+                                _id: null,
+                                mov_debit: { $sum: '$debit' },
+                                mov_credit: { $sum: '$credit' }
+                            }
+                        }
+                    ],
+                    as: 'mouvements'
+                }
+            },
+            {
+                $project: {
+                    _id: 0,
+                    numero_compte: 1,
+                    ran: { $ifNull: [{ $arrayElemAt: ['$ran.total', 0] }, 0] },
+                    mov_debit: { $ifNull: [{ $arrayElemAt: ['$mouvements.mov_debit', 0] }, 0] },
+                    mov_credit: { $ifNull: [{ $arrayElemAt: ['$mouvements.mov_credit', 0] }, 0] }
+                }
+            }
+        ]);
         
         const soldesN = {};
         const soldesN1 = {};
@@ -48,9 +118,25 @@ exports.getCompteResultat = async (req, res) => {
         });
 
         if (prevEx) {
-            const sqlN1 = `SELECT num_compte, SUM(debit - credit) as solde FROM lignes_ecritures WHERE exercice_id = ? AND company_id = ? AND is_deleted = 0 AND num_compte GLOB '[6-8]*' GROUP BY num_compte`;
-            db.prepare(sqlN1).all(prevEx.id, companyId).forEach(r => {
-                soldesN1[r.num_compte.toString().trim()] = r.solde;
+            const linesN1 = await CloudLigneEcriture.aggregate([
+                {
+                    $match: {
+                        exercice_id: prevEx.localId,
+                        company_id: cid,
+                        is_deleted: { $ne: 1 },
+                        num_compte: { $regex: /^[6-8]/ }
+                    }
+                },
+                {
+                    $group: {
+                        _id: '$num_compte',
+                        solde: { $sum: { $subtract: ['$debit', '$credit'] } }
+                    }
+                }
+            ]);
+
+            linesN1.forEach(r => {
+                soldesN1[r._id.toString().trim()] = r.solde;
             });
         }
 
@@ -131,32 +217,130 @@ exports.getCompteResultat = async (req, res) => {
         ];
 
         res.json({ success: true, data: fullMapping.map(m => ({ code: m.code, libelle: m.libelle, montant_n: m.n, montant_prec: m.n1 }))});
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) { 
+        console.error("❌ Erreur getCompteResultat:", err.message);
+        res.status(500).json({ success: false, error: err.message }); 
+    }
 };
 
 // --- TABLEAU DES FLUX DE TRÉSORERIE (TFT) ---
 exports.getTFT = async (req, res) => {
-    const db = getDb();
     const companyId = req.user?.company_id || req.user?.companyId;
     const { exerciceId, dateDebut, dateFin } = req.query;
 
     try {
-        if (!exerciceId) return res.status(400).json({ error: "ID Exercice manquant" });
+        if (!companyId) return res.status(401).json({ success: false, error: "Session invalide." });
+        if (!exerciceId) return res.status(400).json({ success: false, error: "ID Exercice manquant" });
 
-        const sqlN = `
-            SELECT p.numero_compte, 
-                (SELECT IFNULL(SUM(montant_debit - montant_credit), 0) FROM reports_a_nouveau 
-                 WHERE exercice_id = ? AND num_compte = p.numero_compte AND company_id = ?) as ran,
-                IFNULL(SUM(l.debit), 0) as mov_debit, 
-                IFNULL(SUM(l.credit), 0) as mov_credit
-            FROM plan_comptable p
-            LEFT JOIN lignes_ecritures l ON p.numero_compte = l.num_compte 
-                AND l.is_deleted = 0 AND l.exercice_id = ? AND l.company_id = ?
-                AND l.date_ecriture >= ? AND l.date_ecriture <= ?
-                AND l.journal_id NOT IN (SELECT id FROM journaux WHERE type_journal = 'RAN' OR code = 'RAN')
-            WHERE p.company_id = ? GROUP BY p.numero_compte
-        `;
-        const rows = db.prepare(sqlN).all(exerciceId, companyId, exerciceId, companyId, dateDebut, dateFin, companyId);
+        const cid = companyId.toString();
+
+        const ranJournaux = await CloudJournal.find({
+            company_id: cid,
+            $or: [{ type_journal: 'RAN' }, { code: 'RAN' }]
+        }, { localId: 1 }).lean();
+        const ranJournalIds = ranJournaux.map(j => j.localId);
+
+        const fetchBalanceForEx = async (exId, dStart, dEnd) => {
+            return await CloudPlanComptable.aggregate([
+                { $match: { company_id: cid } },
+                {
+                    $lookup: {
+                        from: 'cloud_report_a_nouveaus',
+                        let: { cptNum: '$numero_compte', cid: cid, exId: exId.toString() },
+                        pipeline: [
+                            {
+                                $match: {
+                                    $expr: {
+                                        $and: [
+                                            { $eq: ['$exercice_id', '$$exId'] },
+                                            { $eq: ['$num_compte', '$$cptNum'] },
+                                            { $eq: ['$company_id', '$$cid'] }
+                                        ]
+                                    }
+                                }
+                            },
+                            {
+                                $group: {
+                                    _id: null,
+                                    total: { $sum: { $subtract: ['$montant_debit', '$montant_credit'] } }
+                                }
+                            }
+                        ],
+                        as: 'ran'
+                    }
+                },
+                ...(dStart && dEnd ? [{
+                    $lookup: {
+                        from: 'cloud_ligne_ecritures',
+                        let: { cptNum: '$numero_compte', cid: cid, exId: exId.toString(), startDate: new Date(dStart), endDate: new Date(dEnd + 'T23:59:59.999Z'), excludedJournals: ranJournalIds },
+                        pipeline: [
+                            {
+                                $match: {
+                                    $expr: {
+                                        $and: [
+                                            { $eq: ['$num_compte', '$$cptNum'] },
+                                            { $eq: ['$company_id', '$$cid'] },
+                                            { $eq: ['$exercice_id', '$$exId'] },
+                                            { $ne: ['$is_deleted', 1] },
+                                            { $gte: ['$date_ecriture', '$$startDate'] },
+                                            { $lte: ['$date_ecriture', '$$endDate'] },
+                                            { $not: { $in: ['$journal_id', '$$excludedJournals'] } }
+                                        ]
+                                    }
+                                }
+                            },
+                            {
+                                $group: {
+                                    _id: null,
+                                    mov_debit: { $sum: '$debit' },
+                                    mov_credit: { $sum: '$credit' }
+                                }
+                            }
+                        ],
+                        as: 'mouvements'
+                    }
+                }] : [{
+                    $lookup: {
+                        from: 'cloud_ligne_ecritures',
+                        let: { cptNum: '$numero_compte', cid: cid, exId: exId.toString(), excludedJournals: ranJournalIds },
+                        pipeline: [
+                            {
+                                $match: {
+                                    $expr: {
+                                        $and: [
+                                            { $eq: ['$num_compte', '$$cptNum'] },
+                                            { $eq: ['$company_id', '$$cid'] },
+                                            { $eq: ['$exercice_id', '$$exId'] },
+                                            { $ne: ['$is_deleted', 1] },
+                                            { $not: { $in: ['$journal_id', '$$excludedJournals'] } }
+                                        ]
+                                    }
+                                }
+                            },
+                            {
+                                $group: {
+                                    _id: null,
+                                    mov_debit: { $sum: '$debit' },
+                                    mov_credit: { $sum: '$credit' }
+                                }
+                            }
+                        ],
+                        as: 'mouvements'
+                    }
+                }]),
+                {
+                    $project: {
+                        _id: 0,
+                        numero_compte: 1,
+                        ran: { $ifNull: [{ $arrayElemAt: ['$ran.total', 0] }, 0] },
+                        mov_debit: { $ifNull: [{ $arrayElemAt: ['$mouvements.mov_debit', 0] }, 0] },
+                        mov_credit: { $ifNull: [{ $arrayElemAt: ['$mouvements.mov_credit', 0] }, 0] }
+                    }
+                }
+            ]);
+        };
+
+        const rows = await fetchBalanceForEx(exerciceId, dateDebut, dateFin);
         
         const sN = {}; const sN1 = {};
         rows.forEach(r => {
@@ -167,20 +351,15 @@ exports.getTFT = async (req, res) => {
 
         let sN_prec = {}; let sN1_prec = {}; let rowsPrec = []; 
         try {
-            const currentEx = db.prepare("SELECT date_debut FROM exercices WHERE id = ?").get(exerciceId);
+            const currentEx = await CloudExercice.findOne({ localId: exerciceId.toString(), company_id: cid }).lean();
             if (currentEx) {
-                const prevEx = db.prepare("SELECT id FROM exercices WHERE company_id = ? AND date_debut < ? ORDER BY date_debut DESC LIMIT 1").get(companyId, currentEx.date_debut);
+                const prevEx = await CloudExercice.findOne({
+                    company_id: cid,
+                    date_debut: { $lt: currentEx.date_debut }
+                }).sort({ date_debut: -1 }).lean();
+
                 if (prevEx) {
-                    rowsPrec = db.prepare(`
-                        SELECT p.numero_compte, 
-                            (SELECT IFNULL(SUM(montant_debit - montant_credit), 0) FROM reports_a_nouveau WHERE exercice_id = ? AND num_compte = p.numero_compte) as ran,
-                            IFNULL(SUM(l.debit), 0) as mov_debit, IFNULL(SUM(l.credit), 0) as mov_credit
-                        FROM plan_comptable p
-                        LEFT JOIN lignes_ecritures l ON p.numero_compte = l.num_compte AND l.exercice_id = ? AND l.is_deleted = 0
-                            AND l.journal_id NOT IN (SELECT id FROM journaux WHERE type_journal = 'RAN' OR code = 'RAN')
-                        WHERE p.company_id = ? GROUP BY p.numero_compte
-                    `).all(prevEx.id, prevEx.id, companyId);
-                    
+                    rowsPrec = await fetchBalanceForEx(prevEx.localId, null, null);
                     rowsPrec.forEach(rp => {
                         const numP = rp.numero_compte.trim();
                         sN_prec[numP] = (rp.ran + (rp.mov_debit - rp.mov_credit));
@@ -188,7 +367,7 @@ exports.getTFT = async (req, res) => {
                     });
                 }
             }
-        } catch (e) { console.error("Erreur import N-1:", e); }
+        } catch (e) { console.error("Erreur import N-1 TFT:", e.message); }
 
         const fN = TafirService.generateTFTData(sN, sN1, rows);
         const fN1 = rowsPrec.length > 0 ? TafirService.generateTFTData(sN_prec, sN1_prec, rowsPrec) : {};
@@ -220,5 +399,8 @@ exports.getTFT = async (req, res) => {
         ];
 
         res.json({ success: true, data: mapping.map(m => ({ code: m.code, libelle: m.libelle, montant_n: m.n, montant_prec: m.n1 })) });
-    } catch (err) { res.status(500).json({ error: err.message }); }
+    } catch (err) { 
+        console.error("❌ Erreur getTFT:", err.message);
+        res.status(500).json({ success: false, error: err.message }); 
+    }
 };

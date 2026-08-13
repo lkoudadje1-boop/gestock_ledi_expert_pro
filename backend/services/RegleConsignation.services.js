@@ -1,4 +1,5 @@
-const { getDb } = require('../config/database');
+// backend/services/RegleConsignation.services.js
+const { CloudPackagingRule, CloudPackagingRuleTier, CloudPackaging } = require('../models/cloud.model');
 const { logAction } = require('../utils/auditHelper');
 
 /**
@@ -12,7 +13,6 @@ const genererIdLocal = (prefix) =>
 
 /**
  * Normalise de manière agressive les chaînes des types de calcul 
- * (Pour rattraper l'UI ou les anciennes lignes défectueuses en DB)
  */
 const normaliserTypeCalcul = (typeStr) => {
     if (!typeStr) return 'POURCENTAGE_REPRISE';
@@ -31,241 +31,155 @@ const normaliserTypeCalcul = (typeStr) => {
 };
 
 // 📌 RÉCUPÉRER TOUTES LES RÈGLES D'UNE ENTREPRISE (AVEC LEURS PALIERS)
-exports.getAllRules = (companyId) => {
-    const db = getDb();
-    
-    const rules = db.prepare(`
-        SELECT * FROM packaging_rules 
-        WHERE company_id = ? 
-        ORDER BY created_at DESC
-    `).all(companyId);
+exports.getAllRules = async (companyId) => {
+    const cid = companyId.toString();
+    const rules = await CloudPackagingRule.find({ company_id: cid }).sort({ createdAt: -1 }).lean();
 
-    return rules.map(rule => {
-        const tiers = db.prepare(`
-            SELECT * FROM packaging_rule_tiers 
-            WHERE rule_id = ? AND company_id = ?
-            ORDER BY jours_min ASC
-        `).all(rule.id, companyId);
-        
-        return { ...rule, tiers };
-    });
+    const results = [];
+    for (const rule of rules) {
+        const tiers = await CloudPackagingRuleTier.find({ rule_id: rule.localId, company_id: cid }).sort({ jours_min: 1 }).lean();
+        results.push({ ...rule, id: rule.localId, tiers });
+    }
+
+    return results;
 };
 
 // 📌 RÉCUPÉRER UNE RÈGLE AVEC SES PALIERS VIA SON ID
-exports.getRuleById = (id, companyId) => {
-    const db = getDb();
-    
-    const rule = db.prepare(`
-        SELECT * FROM packaging_rules 
-        WHERE id = ? AND company_id = ?
-    `).get(id, companyId);
+exports.getRuleById = async (id, companyId) => {
+    const cid = companyId.toString();
+    const rule = await CloudPackagingRule.findOne({ localId: id.toString(), company_id: cid }).lean();
 
     if (!rule) return null;
 
-    const tiers = db.prepare(`
-        SELECT * FROM packaging_rule_tiers 
-        WHERE rule_id = ? AND company_id = ?
-        ORDER BY jours_min ASC
-    `).all(id, companyId);
+    const tiers = await CloudPackagingRuleTier.find({ rule_id: id.toString(), company_id: cid }).sort({ jours_min: 1 }).lean();
 
-    return { ...rule, tiers };
+    return { ...rule, id: rule.localId, tiers };
 };
 
-// 📌 CRÉER UNE RÈGLE ET SES PALIERS (TRANSACTIONNEL AVEC ENQUEUE CLOUD)
-exports.createRuleWithTiers = ({ companyId, userId, userName, data }) => {
-    const db = getDb();
+// 📌 CRÉER UNE RÈGLE ET SES PALIERS (CLOUD MONGODB)
+exports.createRuleWithTiers = async ({ companyId, userId, userName, data }) => {
+    const cid = companyId.toString();
     const ruleId = genererIdLocal('REG');
     const { code_regle, libelle, tiers } = data;
 
     validateTiersLogic(tiers);
 
-    const transaction = db.transaction(() => {
-        // 1. Insertion de la règle maîtresse
-        db.prepare(`
-            INSERT INTO packaging_rules (id, code_regle, libelle, company_id, sync_status)
-            VALUES (?, ?, ?, ?, 'pending')
-        `).run(ruleId, code_regle.toUpperCase(), libelle, companyId);
-
-        // 2. Insertion des paliers (tiers)
-        if (tiers && tiers.length > 0) {
-            const insertTierStmt = db.prepare(`
-                INSERT INTO packaging_rule_tiers (
-                    id, rule_id, jours_min, jours_max, type_calcul, valeur, company_id, sync_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-            `);
-
-            for (const tier of tiers) {
-                const tierId = genererIdLocal('TLR');
-                insertTierStmt.run(
-                    tierId,
-                    ruleId,
-                    parseInt(tier.jours_min, 10),
-                    tier.jours_max ? parseInt(tier.jours_max, 10) : null,
-                    normaliserTypeCalcul(tier.type_calcul),
-                    cleanNum(tier.valeur),
-                    companyId
-                );
-
-                // Ajout du palier individuel dans la file de synchronisation
-                db.prepare(`
-                    INSERT INTO sync_queue (table_name, record_id, operation, company_id)
-                    VALUES ('packaging_rule_tiers', ?, 'INSERT', ?)
-                `).run(tierId, companyId);
-            }
-        }
-
-        // 3. Enqueue de la règle maîtresse pour le Cloud
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id)
-            VALUES ('packaging_rules', ?, 'INSERT', ?)
-        `).run(ruleId, companyId);
-
-        // 4. Track de l'action locale (Audit Trail)
-        logAction({ 
-            userId, userName, actionType: 'INSERTION', tableConcernee: 'packaging_rules', 
-            referenceId: ruleId, description: `Création de la règle de consignation : ${code_regle} - ${libelle}`, companyId 
-        });
-
-        return ruleId;
+    // 1. Insertion de la règle maîtresse
+    await CloudPackagingRule.create({
+        localId: ruleId,
+        code_regle: code_regle.toUpperCase(),
+        libelle,
+        company_id: cid,
+        sync_status: 'synced'
     });
 
-    return transaction();
+    // 2. Insertion des paliers (tiers)
+    if (tiers && tiers.length > 0) {
+        for (const tier of tiers) {
+            const tierId = genererIdLocal('TLR');
+            await CloudPackagingRuleTier.create({
+                localId: tierId,
+                rule_id: ruleId,
+                jours_min: parseInt(tier.jours_min, 10),
+                jours_max: tier.jours_max ? parseInt(tier.jours_max, 10) : null,
+                type_calcul: normaliserTypeCalcul(tier.type_calcul),
+                valeur: cleanNum(tier.valeur),
+                company_id: cid,
+                sync_status: 'synced'
+            });
+        }
+    }
+
+    // 3. Track de l'action (Audit Trail)
+    await logAction({ 
+        userId, userName, actionType: 'INSERTION', tableConcernee: 'packaging_rules', 
+        referenceId: ruleId, description: `Création de la règle de consignation : ${code_regle} - ${libelle}`, companyId: cid 
+    });
+
+    return ruleId;
 };
 
-// 📌 MODIFIER UNE RÈGLE ET SES PALIERS (PURGE ET RECONSTRUCTION TRACÉE)
-exports.updateRuleWithTiers = ({ id, companyId, userId, userName, data }) => {
-    const db = getDb();
+// 📌 MODIFIER UNE RÈGLE ET SES PALIERS
+exports.updateRuleWithTiers = async ({ id, companyId, userId, userName, data }) => {
+    const cid = companyId.toString();
     const { code_regle, libelle, tiers } = data;
 
     validateTiersLogic(tiers);
 
-    const transaction = db.transaction(() => {
-        // 1. Récupérer les ID des anciens paliers pour notifier leur suppression au Cloud
-        const oldTiers = db.prepare(`SELECT id FROM packaging_rule_tiers WHERE rule_id = ? AND company_id = ?`).all(id, companyId);
-        for (const oldTier of oldTiers) {
-            db.prepare(`
-                INSERT INTO sync_queue (table_name, record_id, operation, company_id)
-                VALUES ('packaging_rule_tiers', ?, 'DELETE', ?)
-            `).run(oldTier.id, companyId);
+    // 1. Mettre à jour la règle maîtresse
+    const updateResult = await CloudPackagingRule.updateOne(
+        { localId: id.toString(), company_id: cid },
+        { 
+            code_regle: code_regle.toUpperCase(), 
+            libelle, 
+            sync_status: 'synced', 
+            updated_at: new Date() 
         }
+    );
 
-        // 2. Mettre à jour la règle maîtresse
-        const updateResult = db.prepare(`
-            UPDATE packaging_rules 
-            SET code_regle = ?, libelle = ?, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP
-            WHERE id = ? AND company_id = ?
-        `).run(code_regle.toUpperCase(), libelle, id, companyId);
+    if (updateResult.matchedCount === 0) throw new Error("Règle de consignation introuvable ou non modifiée.");
 
-        if (updateResult.changes === 0) throw new Error("Règle de consignation introuvable ou non modifiée.");
+    // 2. Purger les anciens paliers
+    await CloudPackagingRuleTier.deleteMany({ rule_id: id.toString(), company_id: cid });
 
-        // 3. Purger localement les anciens paliers
-        db.prepare(`DELETE FROM packaging_rule_tiers WHERE rule_id = ? AND company_id = ?`).run(id, companyId);
-
-        // 4. Réinsérer les nouveaux paliers mis à jour
-        if (tiers && tiers.length > 0) {
-            const insertTierStmt = db.prepare(`
-                INSERT INTO packaging_rule_tiers (
-                    id, rule_id, jours_min, jours_max, type_calcul, valeur, company_id, sync_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending')
-            `);
-
-            for (const tier of tiers) {
-                const tierId = genererIdLocal('TLR');
-                insertTierStmt.run(
-                    tierId,
-                    id,
-                    parseInt(tier.jours_min, 10),
-                    tier.jours_max ? parseInt(tier.jours_max, 10) : null,
-                    normaliserTypeCalcul(tier.type_calcul),
-                    cleanNum(tier.valeur),
-                    companyId
-                );
-
-                // Enqueue du nouveau palier
-                db.prepare(`
-                    INSERT INTO sync_queue (table_name, record_id, operation, company_id)
-                    VALUES ('packaging_rule_tiers', ?, 'INSERT', ?)
-                `).run(tierId, companyId);
-            }
+    // 3. Réinsérer les nouveaux paliers mis à jour
+    if (tiers && tiers.length > 0) {
+        for (const tier of tiers) {
+            const tierId = genererIdLocal('TLR');
+            await CloudPackagingRuleTier.create({
+                localId: tierId,
+                rule_id: id.toString(),
+                jours_min: parseInt(tier.jours_min, 10),
+                jours_max: tier.jours_max ? parseInt(tier.jours_max, 10) : null,
+                type_calcul: normaliserTypeCalcul(tier.type_calcul),
+                valeur: cleanNum(tier.valeur),
+                company_id: cid,
+                sync_status: 'synced'
+            });
         }
+    }
 
-        // 5. Enqueue de la modification de la règle maîtresse
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id)
-            VALUES ('packaging_rules', ?, 'UPDATE', ?)
-        `).run(id, companyId);
-
-        logAction({ 
-            userId, userName, actionType: 'MODIFICATION', tableConcernee: 'packaging_rules', 
-            referenceId: id, description: `Mise à jour globale de la règle de consignation ID: ${id}`, companyId 
-        });
-
-        return { changes: 1 };
+    await logAction({ 
+        userId, userName, actionType: 'MODIFICATION', tableConcernee: 'packaging_rules', 
+        referenceId: id.toString(), description: `Mise à jour globale de la règle de consignation ID: ${id}`, companyId: cid 
     });
 
-    return transaction();
+    return { modifiedCount: 1 };
 };
 
-// 📌 SUPPRIMER UNE RÈGLE ET TOUS SES PALIERS ASSOCIES
-exports.deleteRule = ({ id, companyId, userId, userName }) => {
-    const db = getDb();
+// 📌 SUPPRIMER UNE RÈGLE ET TOUS SES PALIERS ASSOCIÉS
+exports.deleteRule = async ({ id, companyId, userId, userName }) => {
+    const cid = companyId.toString();
 
-    const transaction = db.transaction(() => {
-        const linkedTiers = db.prepare(`SELECT id FROM packaging_rule_tiers WHERE rule_id = ? AND company_id = ?`).all(id, companyId);
-        for (const tier of linkedTiers) {
-            db.prepare(`
-                INSERT INTO sync_queue (table_name, record_id, operation, company_id)
-                VALUES ('packaging_rule_tiers', ?, 'DELETE', ?)
-            `).run(tier.id, companyId);
-        }
+    await CloudPackagingRuleTier.deleteMany({ rule_id: id.toString(), company_id: cid });
+    const result = await CloudPackagingRule.deleteOne({ localId: id.toString(), company_id: cid });
 
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id)
-            VALUES ('packaging_rules', ?, 'DELETE', ?)
-        `).run(id, companyId);
-
-        const result = db.prepare("DELETE FROM packaging_rules WHERE id = ? AND company_id = ?").run(id, companyId);
-
-        logAction({ 
-            userId, userName, actionType: 'SUPPRESSION', tableConcernee: 'packaging_rules', 
-            referenceId: id, description: `Suppression de la règle de consignation ID: ${id}`, companyId 
-        });
-
-        return result;
+    await logAction({ 
+        userId, userName, actionType: 'SUPPRESSION', tableConcernee: 'packaging_rules', 
+        referenceId: id.toString(), description: `Suppression de la règle de consignation ID: ${id}`, companyId: cid 
     });
 
-    return transaction();
+    return { deletedCount: result.deletedCount };
 };
 
 // 📌 VÉRIFIER SI LA RÈGLE EST LIÉE À DES EMBALLAGES ACTIFS
-exports.isRuleLinkedToPackaging = (ruleId, companyId) => {
-    const db = getDb();
-    const result = db.prepare(`
-        SELECT COUNT(*) as count FROM packaging 
-        WHERE rule_id = ? AND company_id = ? AND is_active = 1
-    `).get(ruleId, companyId);
+exports.isRuleLinkedToPackaging = async (ruleId, companyId) => {
+    const cid = companyId.toString();
+    const count = await CloudPackaging.countDocuments({
+        rule_id: ruleId.toString(),
+        company_id: cid,
+        is_active: 1
+    });
     
-    return result.count > 0;
+    return count > 0;
 };
 
-// 📌 SIMULER LE PRIX DE REMBOURSEMENT AUTOMATIQUE (VERSION ENRICHIE ET CORRIGÉE)
-/**
- * Calcule le prix de déconsignation unitaire.
- * Utilise en priorité le snapshot s'il est fourni, sinon recalcule en temps réel (rétroactif).
- * @param {string} packagingId - ID de l'emballage
- * @param {string} dateConsignation - Date de création de la consignation (ISO)
- * @param {string} companyId - ID de l'entreprise
- * @param {string|null} regleSnapshotJson - JSON optionnel contenant la règle figée
- */
-exports.simulerPrixRemboursement = (packagingId, dateConsignation, companyId, regleSnapshotJson = null) => {
-    const db = getDb();
+// 📌 SIMULER LE PRIX DE REMBOURSEMENT AUTOMATIQUE (CLOUD)
+exports.simulerPrixRemboursement = async (packagingId, dateConsignation, companyId, regleSnapshotJson = null) => {
+    const cid = companyId.toString();
 
     // 1. Récupérer les prix de base de l'emballage
-    const packaging = db.prepare(`
-        SELECT prix_consigne, prix_deconsigne 
-        FROM packaging 
-        WHERE id = ? AND company_id = ?
-    `).get(packagingId, companyId);
+    const packaging = await CloudPackaging.findOne({ localId: packagingId.toString(), company_id: cid }).lean();
 
     if (!packaging) {
         throw new Error("Emballage introuvable.");
@@ -274,12 +188,11 @@ exports.simulerPrixRemboursement = (packagingId, dateConsignation, companyId, re
     const prixConsigneBase = packaging.prix_consigne || 0;
     const prixDeconsigneBase = packaging.prix_deconsigne || 0;
 
-    // 2. Calculer les jours écoulés (Toujours basé sur la date du flux d'origine)
-    const datePropre = dateConsignation.split('T')[0]; 
-    const dateQuery = db.prepare(`
-        SELECT CAST(julianday(date('now')) - julianday(date(?)) AS INTEGER) AS jours_ecoules
-    `).get(datePropre);
-    const joursEcoules = Math.max(0, dateQuery ? dateQuery.jours_ecoules : 0);
+    // 2. Calculer les jours écoulés par rapport à la date actuelle
+    const datePropre = new Date(dateConsignation);
+    const today = new Date();
+    const diffTime = Math.abs(today - datePropre);
+    const joursEcoules = Math.max(0, Math.floor(diffTime / (1000 * 60 * 60 * 24)));
 
     // 3. Charger les paliers : Soit depuis le SNAPSHOT, soit depuis la DB
     let tiers = [];
@@ -287,22 +200,15 @@ exports.simulerPrixRemboursement = (packagingId, dateConsignation, companyId, re
     if (regleSnapshotJson) {
         try {
             const ruleObj = JSON.parse(regleSnapshotJson);
-            tiers = ruleObj.tiers || []; // Utilise les paliers figés
+            tiers = ruleObj.tiers || [];
         } catch (e) {
             console.error("Erreur lecture snapshot, bascule vers mode dynamique", e);
         }
     }
 
-    // Si pas de snapshot (ou erreur), on va chercher dans la DB (Mode historique/dynamique)
     if (tiers.length === 0) {
-        const pkg = db.prepare(`SELECT rule_id FROM packaging WHERE id = ? AND company_id = ?`).get(packagingId, companyId);
-        if (pkg && pkg.rule_id) {
-            tiers = db.prepare(`
-                SELECT jours_min, jours_max, type_calcul, valeur 
-                FROM packaging_rule_tiers 
-                WHERE rule_id = ? AND company_id = ?
-                ORDER BY jours_min ASC
-            `).all(pkg.rule_id, companyId);
+        if (packaging.rule_id) {
+            tiers = await CloudPackagingRuleTier.find({ rule_id: packaging.rule_id.toString(), company_id: cid }).sort({ jours_min: 1 }).lean();
         }
     }
 
@@ -367,7 +273,7 @@ function validateTiersLogic(tiers) {
     for (let i = 0; i < tiers.length; i++) {
         const current = tiers[i];
         const jMin = parseInt(current.jours_min, 10);
-        const jMax = current.jours_max ? parseInt(current.jours_max, 10) : null;
+        const jMax = current.jours_max !== null && current.jours_max !== undefined && current.jours_max !== '' ? parseInt(current.jours_max, 10) : null;
 
         if (isNaN(jMin) || jMin < 0) {
             throw new Error(`Le jour minimum (${current.jours_min}) doit être un entier positif.`);
@@ -376,7 +282,6 @@ function validateTiersLogic(tiers) {
             throw new Error(`Incohérence sur les bornes : Le jour maximum (${jMax}) doit être strictement supérieur au jour minimum (${jMin}).`);
         }
 
-        // Utilisation du normalisateur pour passer la validation JS même si l'UI envoie du texte brut
         const typeNormalise = normaliserTypeCalcul(current.type_calcul);
         const typesAutorises = ['POURCENTAGE_REPRISE', 'MONTANT_FIXE_PENALITE', 'CONSIDERE_VENDU'];
         
@@ -390,7 +295,7 @@ function validateTiersLogic(tiers) {
 
         if (i > 0) {
             const previous = tiers[i - 1];
-            const prevMax = previous.jours_max ? parseInt(previous.jours_max, 10) : null;
+            const prevMax = previous.jours_max !== null && previous.jours_max !== undefined && previous.jours_max !== '' ? parseInt(previous.jours_max, 10) : null;
 
             if (prevMax === null) {
                 throw new Error("Interdiction de superposition : Aucun palier additionnel ne peut être traité après un palier défini avec une limite maximale infinie.");

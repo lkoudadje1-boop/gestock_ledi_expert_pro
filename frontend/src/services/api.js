@@ -1,27 +1,18 @@
+// frontend/src/services/api.js
 import axios from 'axios';
 import { io } from 'socket.io-client';
 
 /**
  * ==========================================
- * CONFIGURATION ERP LEDI EXPERT PRO
- * MODE LOCAL LAN + ELECTRON COMPATIBLE
+ * CONFIGURATION ERP LEDI EXPERT PRO (100% WEB SAAS)
  * ==========================================
  */
 
-// IMPORTANT :
-// window.location.hostname devient vide après le build Electron
-// donc on utilise localhost par défaut
-const SERVER_IP =
-    localStorage.getItem('server_ip') ||
-    'localhost';
+// URL de base du backend sur Railway (modifiable via variable d'environnement React)
+const BASE_URL = process.env.REACT_APP_API_URL || 'https://ton-projet.railway.app/api';
+const SOCKET_URL = process.env.REACT_APP_WS_URL || 'https://ton-projet.railway.app';
 
-const PORT = 3030;
-
-// URLs principales
-const SOCKET_URL = `http://${SERVER_IP}:${PORT}`;
-const BASE_URL = `http://${SERVER_IP}:${PORT}/api`;
-
-console.log('🚀 LEDI ERP - Mode LOCAL LAN activé');
+console.log('🚀 LEDI ERP - Mode Cloud Web activé');
 console.log(`📡 Connexion au serveur : ${BASE_URL}`);
 
 /**
@@ -31,7 +22,7 @@ console.log(`📡 Connexion au serveur : ${BASE_URL}`);
  */
 
 export const socket = io(SOCKET_URL, {
-    transports: ['websocket', 'polling'], // IMPORTANT pour Electron
+    transports: ['websocket', 'polling'],
     reconnection: true,
     reconnectionAttempts: 10,
     reconnectionDelay: 1000,
@@ -45,7 +36,8 @@ export const socket = io(SOCKET_URL, {
  */
 
 socket.on('connect', () => {
-    console.log('✅ Socket connecté');
+    console.log('✅ Socket connecté au Cloud');
+    joinCompanyRoom();
 });
 
 socket.on('disconnect', () => {
@@ -65,25 +57,16 @@ socket.on('connect_error', (err) => {
 export const joinCompanyRoom = () => {
     try {
         const user = JSON.parse(localStorage.getItem('user') || '{}');
-
-        const companyId =
-            user.company_id ||
-            user.companyId;
+        const companyId = user.company_id || user.companyId;
 
         if (companyId && socket.connected) {
             socket.emit('join_company', companyId.toString());
-
             console.log(`🏢 Room entreprise rejointe : ${companyId}`);
         }
     } catch (err) {
         console.error('Erreur joinCompanyRoom :', err);
     }
 };
-
-// Rejoindre automatiquement après connexion socket
-socket.on('connect', () => {
-    joinCompanyRoom();
-});
 
 /**
  * ==========================================
@@ -106,12 +89,8 @@ const API = axios.create({
 
 API.interceptors.request.use(
     (config) => {
-
         const token = localStorage.getItem('token');
-
-        const user = JSON.parse(
-            localStorage.getItem('user') || '{}'
-        );
+        const user = JSON.parse(localStorage.getItem('user') || '{}');
 
         const companyId =
             user.company_id ||
@@ -124,24 +103,18 @@ API.interceptors.request.use(
             config.headers.Authorization = `Bearer ${token}`;
         }
 
-        // Société active
+        // Société active (Multi-tenant)
         config.headers['x-company-id'] = companyId;
 
         // Infos utilisateur
         if (user.id) {
-
             config.headers['x-user-id'] = user.id;
-
-            config.headers['x-user-permissions'] =
-                JSON.stringify(user.permissions || {});
-
-            config.headers['x-license-caps'] =
-                JSON.stringify(user.mod || []);
+            config.headers['x-user-permissions'] = JSON.stringify(user.permissions || {});
+            config.headers['x-license-caps'] = JSON.stringify(user.mod || []);
         }
 
         return config;
     },
-
     (error) => Promise.reject(error)
 );
 
@@ -152,79 +125,46 @@ API.interceptors.request.use(
  */
 
 API.interceptors.response.use(
-
     (response) => {
+        const method = response.config.method?.toLowerCase();
 
-        const method =
-            response.config.method?.toLowerCase();
-
-        // Synchronisation temps réel
-        if (
-            ['GET','POST','PUT','DELETE','PATCH','OPTIONS']
-                .includes(method)
-        ) {
-
-            const user = JSON.parse(
-                localStorage.getItem('user') || '{}'
-            );
-
-            const companyId =
-                user.company_id ||
-                user.companyId;
+        // Synchronisation temps réel optionnelle
+        if (['get','post','put','delete','patch','options'].includes(method)) {
+            const user = JSON.parse(localStorage.getItem('user') || '{}');
+            const companyId = user.company_id || user.companyId;
 
             if (companyId && socket.connected) {
-
                 socket.emit('DATA_CHANGED', {
                     companyId: companyId.toString(),
                     url: response.config.url
                 });
-
-                console.log('🔄 DATA_CHANGED envoyé');
             }
         }
 
         return response;
     },
-
     (error) => {
-
         // Serveur inaccessible
         if (!error.response) {
-
-            console.error(
-                '🌐 ERREUR RÉSEAU : Le serveur local est-il allumé ?'
-            );
-
-            console.error(
-                `📡 URL testée : ${BASE_URL}`
-            );
-
+            console.error('🌐 ERREUR RÉSEAU : Impossible de joindre le serveur Railway.');
+            console.error(`📡 URL testée : ${BASE_URL}`);
             return Promise.reject(error);
         }
 
-        /**
-         * 403 - Permissions insuffisantes
-         */
+        // 403 - Permissions insuffisantes
         if (error.response.status === 403) {
-
             console.warn('⛔ Accès refusé');
-
             return Promise.reject(error);
         }
 
-        /**
-         * 401 - Session expirée
-         */
+        // 401 - Session expirée
         if (error.response.status === 401) {
-
             console.warn('🔒 Session expirée');
 
             localStorage.removeItem('token');
             localStorage.removeItem('user');
 
-            if (
-                !window.location.hash.includes('/login')
-            ) {
+            if (!window.location.hash.includes('/login')) {
                 window.location.href = '/#/login';
             }
         }

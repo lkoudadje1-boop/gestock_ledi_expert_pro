@@ -1,24 +1,30 @@
-const { syncLocalToCloud } = require('../services/sync.service');
+// backend/utils/notifier.js
 
-const broadcastChange = (req, table) => {
+/**
+ * Notifie en temps réel tous les utilisateurs connectés d'une même entreprise 
+ * via WebSocket (Socket.io) qu'une modification a eu lieu.
+ * 
+ * @param {Object} req - L'objet requête Express
+ * @param {string} table - Le nom de la ressource ou collection modifiée
+ * @param {string} [operation='UPDATE'] - Le type d'opération (CREATE, UPDATE, DELETE)
+ */
+const broadcastChange = (req, table, operation = 'UPDATE') => {
     const io = req.app.get('socketio');
-    const companyId = req.user?.company_id || req.body?.company_id;
+    
+    // Récupération sécurisée du companyId normalisé par les middlewares
+    const companyId = req.companyId || req.user?.companyId || req.user?.company_id;
 
     if (!io || !companyId) return;
 
-    // 1. On prévient immédiatement tous les écrans (PC locaux + Web)
-    // C'est ce signal qui fera que l'écran de ton collègue s'actualise
-    io.to(String(companyId)).emit('DATA_EVENT', {
-        table: table,
-        type: 'UPDATE',
-        timestamp: new Date(),
-        message: `Mise à jour de la table ${table}`
-    });
+    const cid = companyId.toString();
 
-    // 2. Si on est sur le PC, on lance le PUSH vers le Cloud sans attendre
-    if (process.env.NODE_ENV === 'development') {
-        syncLocalToCloud().catch(err => console.error("Sync Cloud auto échouée:", err.message));
-    }
+    // Diffusion instantanée à tous les écrans connectés pour cette entreprise
+    io.to(cid).emit('DATA_EVENT', {
+        table: table,
+        type: operation,
+        timestamp: new Date(),
+        message: `Mise à jour de la ressource ${table}`
+    });
 };
 
 module.exports = { broadcastChange };

@@ -1,3 +1,4 @@
+// backend/controllers/ConfirgurationAuto.controller.js
 const configService = require('../services/ConfirgurationAuto.service');
 
 // Utilitaire interne harmonisé
@@ -9,7 +10,7 @@ const getContext = (req) => {
     return {
         companyId: companyId,
         userId: userId || 'USR-SYSTEM',
-        userName: user.username || 'Utilisateur'
+        userName: 'user' // Respect strict de la consigne [2026-02-08]
     };
 };
 
@@ -45,11 +46,11 @@ exports.createOrUpdateConfig = async (req, res) => {
             });
         }
 
-        res.json({ success: true, message: "Configuration enregistrée avec succès !", id: final_config_id });
+        return res.json({ success: true, message: "Configuration enregistrée avec succès !", id: final_config_id });
 
     } catch (error) {
         console.error("❌ ERREUR ANALYTIQUE_CONFIG :", error.message);
-        res.status(500).json({ success: false, error: error.message });
+        return res.status(500).json({ success: false, error: error.message });
     }
 };
 
@@ -60,9 +61,9 @@ exports.getConfigs = async (req, res) => {
     const { companyId } = getContext(req);
     try {
         const data = await configService.fetchConfigs(companyId);
-        res.json({ success: true, data });
+        return res.json({ success: true, data });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        return res.status(500).json({ success: false, error: error.message });
     }
 };
 
@@ -92,9 +93,9 @@ exports.deleteConfig = async (req, res) => {
             req.io.to(room).emit('REFRESH_UI', { url: '/api/analytique/repartitions' });
         }
 
-        res.json({ success: true, message: "Règle supprimée avec succès." });
+        return res.json({ success: true, message: "Règle supprimée avec succès." });
     } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
+        return res.status(500).json({ success: false, error: error.message });
     }
 };
 
@@ -124,12 +125,12 @@ exports.getAutomaticVentilation = async (req, res) => {
         }
 
         const repartitions = [];
-        for (const [anaId, pourcentage] of Object.entries(rule.repartitions)) {
+        for (const [anaId, pourcentage] of Object.entries(rule.repartitions || {})) {
             const montantLigne = Math.round((montantGlobal * (parseFloat(pourcentage) / 100)) * 100) / 100;
             
             repartitions.push({
                 plan_analytique_id: anaId,
-                libelle: rule.details_plans[anaId]?.libelle || 'Analytique',
+                libelle: rule.details_plans?.[anaId]?.libelle || 'Analytique',
                 montant: montantLigne,
                 pourcentage: pourcentage
             });
@@ -143,6 +144,6 @@ exports.getAutomaticVentilation = async (req, res) => {
 
     } catch (error) {
         console.error("Erreur moteur ventilation:", error);
-        res.status(500).json({ success: false, error: error.message });
+        return res.status(500).json({ success: false, error: error.message });
     }
 };

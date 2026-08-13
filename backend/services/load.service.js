@@ -1,26 +1,10 @@
-const fs = require('fs');
-const path = require('path');
+// backend/services/load.service.js
 const nacl = require('tweetnacl');
 const util = require('tweetnacl-util');
-const { machineIdSync } = require('node-machine-id');
-
-// 🛡️ Capturer l'empreinte matérielle unique du PC actuel
-const CURRENT_MACHINE_ID = machineIdSync();
+const { CloudCompany } = require('../models/cloud.model');
 
 // 🔑 Clé publique textuelle issue de votre fichier 'public.key'
-// Elle sert uniquement à vérifier la signature et est 100% sécurisée ici.
 const PUBLIC_KEY_BASE64 = process.env.PUBLIC_KEY_BASE64 || "taR+bN75NlI/pZ1L4kxWqyc6HK/gsw+inhYqWOuy/PM=";
-
-/**
- * Gère les chemins de fichiers de manière intelligente (Dev vs Prod)
- */
-const getStoragePath = (fileName) => {
-    const baseDir = process.env.USER_DATA_PATH || path.join(__dirname, '../data');
-    if (!fs.existsSync(baseDir)) {
-        fs.mkdirSync(baseDir, { recursive: true });
-    }
-    return path.join(baseDir, fileName);
-};
 
 const parseLicenseDate = (dateStr) => {
     if (!dateStr || dateStr === "--") return new Date(0);
@@ -28,15 +12,13 @@ const parseLicenseDate = (dateStr) => {
 };
 
 const LoadService = {
-    getSystemStatus: (companyId) => {
-        const { getDb } = require('../config/database'); 
-        const db = getDb();
-        const configPath = getStoragePath(`metadata_${companyId}.dat`);
+    getSystemStatus: async (companyId) => {
+        const cid = companyId.toString();
         const now = new Date();
 
         try {
-            // --- 1. RÉCUPÉRATION BDD ---
-            const companyInDb = db.prepare(`SELECT id, company_code, last_access_date FROM companies WHERE id = ?`).get(companyId);
+            // --- 1. RÉCUPÉRATION MONGODB CLOUD ---
+            const companyInDb = await CloudCompany.findOne({ localId: cid }).lean();
             
             if (!companyInDb) {
                 return { nom: "ENTREPRISE INCONNUE", valid: false, allowed_modules: [] };
@@ -56,18 +38,18 @@ const LoadService = {
             }
 
             // Mise à jour du verrou temporel
-            db.prepare(`UPDATE companies SET last_access_date = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
-              .run(now.toISOString(), companyId);
+            await CloudCompany.updateOne(
+                { localId: cid },
+                { $set: { last_access_date: now, updated_at: now } }
+            );
 
-            // --- 2. LECTURE DU FICHIER ---
-            if (!fs.existsSync(configPath)) {
-                return LoadService.getFallback(db, companyId);
+            // --- 2. VÉRIFICATION DE LA CLÉ DE LICENCE STOCKÉE ---
+            const licenseKey = companyInDb.license_key;
+            if (!licenseKey || !licenseKey.includes('.')) {
+                return LoadService.getFallback(companyInDb, cid);
             }
 
-            const rawContent = fs.readFileSync(configPath, 'utf8').trim();
-            if (!rawContent.includes('.')) return LoadService.getFallback(db, companyId);
-
-            const [encodedData, providedSignature] = rawContent.split('.');
+            const [encodedData, providedSignature] = licenseKey.split('.');
 
             // --- 3. VÉRIFICATION CRYPTOGRAPHIQUE ASYMÉTRIQUE Ed25519 ---
             const publicKey = util.decodeBase64(PUBLIC_KEY_BASE64);
@@ -83,40 +65,42 @@ const LoadService = {
             const data = JSON.parse(decodedString);
 
             // --- 4. VÉRIFICATION IDENTITÉ ENTREPRISE ---
-            if (data.cid && String(data.cid) !== String(companyId)) {
+            if (data.cid && String(data.cid) !== cid) {
                 return { nom: "NON ENREGISTRÉ", valid: false, reason: "IDENTITY_MISMATCH", allowed_modules: [] };
             }
 
-            // --- 5. 🛡️ VERROU MACHINE PHYSIQUE (ANTI-COPIE) ---
-            if (!data.mid || data.mid !== CURRENT_MACHINE_ID) {
-                return { nom: "LOGICIEL DUPLIQUÉ INTERDIT", valid: false, reason: "HARDWARE_ID_MISMATCH", allowed_modules: [] };
-            }
+            // (Note : L'ID machine a été retiré de l'équation Cloud, la licence est rattachée au Company ID)
 
-            // --- 6. LOGIQUE D'EXPIRATION ---
-            const expirationDate = parseLicenseDate(data.exp);
+            // --- 5. LOGIQUE D'EXPIRATION ---
+            const expirationDate = parseLicenseDate(data.exp || companyInDb.license_expiry);
             const isExpired = now > expirationDate;
 
             return {
-                nom: data.owner || "Utilisateur Enregistré",
-                exp: data.exp || "01/01/2000",
+                nom: data.owner || companyInDb.name || "Utilisateur Enregistré",
+                exp: data.exp || companyInDb.license_expiry || "01/01/2000",
                 valid: !isExpired,
                 isExpired: isExpired,
-                allowed_modules: !isExpired ? (data.mod || []) : [],
-                db_local_id: companyInDb.id
+                allowed_modules: !isExpired ? (data.mod || companyInDb.modules || []) : [],
+                db_local_id: companyInDb.localId
             };
 
         } catch (err) {
-            console.error("❌ Erreur LoadService:", err.message);
+            console.error("❌ Erreur LoadService Cloud:", err.message);
             return { nom: "Mode Dégradé", valid: false, allowed_modules: [] };
         }
     },
 
-    getFallback: (db, companyId) => {
-        return { nom: "NON ENREGISTRÉ", exp: "Aucune licence", valid: false, allowed_modules: [] };
+    getFallback: (company, companyId) => {
+        return { 
+            nom: company?.name || "NON ENREGISTRÉ", 
+            exp: company?.license_expiry || "Aucune licence", 
+            valid: false, 
+            allowed_modules: [] 
+        };
     },
 
-    saveMetadata: (licenseData, companyId) => {
-        const CompanyModel = require('../models/Company.model'); 
+    saveMetadata: async (licenseData, companyId) => {
+        const cid = companyId.toString();
         const now = new Date();
         
         try {
@@ -137,23 +121,18 @@ const LoadService = {
             const decodedString = Buffer.from(encodedData, 'base64').toString('utf8');
             const data = JSON.parse(decodedString);
 
-            // 2. VÉRIFICATION D'IDENTITÉ
-            if (!data.cid || String(data.cid) !== String(companyId)) {
+            // 2. VÉRIFICATION D'IDENTITÉ CLOUD
+            if (!data.cid || String(data.cid) !== cid) {
                 throw new Error("Cette licence appartient à une autre structure d'entreprise.");
             }
 
-            // 3. 🛡️ VERROU MATÉRIEL STRICT À L'ACTIVATION
-            if (!data.mid || data.mid !== CURRENT_MACHINE_ID) {
-                throw new Error("Cette licence ne correspond pas à la signature de votre carte mère / processeur.");
-            }
-
-            // 4. VÉRIFICATION D'EXPIRATION
+            // 3. VÉRIFICATION D'EXPIRATION
             const expirationDate = parseLicenseDate(data.exp);
             if (now > expirationDate) {
                 throw new Error(`Cette licence a expiré le ${data.exp} et ne peut pas être injectée.`);
             }
 
-            // 5. NETTOYAGE DES MODULES
+            // 4. NETTOYAGE DES MODULES
             let modulesToStore = data.mod || [];
             if (typeof modulesToStore === 'string') {
                 try {
@@ -165,23 +144,29 @@ const LoadService = {
             }
             const finalModules = [...new Set(Array.isArray(modulesToStore) ? modulesToStore : [modulesToStore])];
 
-            // 6. MISE À JOUR BDD
-            CompanyModel.renouvelerLicence(companyId, {
-                type: data.type || 'PRO',
-                modules: finalModules, 
-                key: licenseData,
-                expiry: data.exp
-            });
+            // 5. MISE À JOUR MONGODB CLOUD
+            const updateResult = await CloudCompany.updateOne(
+                { localId: cid },
+                {
+                    $set: {
+                        license_type: data.type || 'PRO',
+                        modules: finalModules,
+                        license_key: licenseData,
+                        license_expiry: data.exp,
+                        updated_at: now
+                    }
+                }
+            );
 
-            // 7. PERSISTANCE PHYSIQUE (Dans AppData)
-            const configPath = getStoragePath(`metadata_${companyId}.dat`);
-            fs.writeFileSync(configPath, licenseData, 'utf8');
+            if (updateResult.matchedCount === 0) {
+                throw new Error("Entreprise introuvable dans la base de données Cloud.");
+            }
 
-            console.log(`✅ Licence validée matériellement pour ${companyId}. Modules débloqués.`);
-            return { success: true, message: "Licence matérielle activée avec succès !" };
+            console.log(`✅ Licence validée et activée dans le Cloud pour Company ID: ${cid}. Modules débloqués.`);
+            return { success: true, message: "Licence Cloud activée avec succès !" };
 
         } catch (err) {
-            console.error("❌ Erreur Activation Licence:", err.message);
+            console.error("❌ Erreur Activation Licence Cloud:", err.message);
             throw err; 
         }
     }

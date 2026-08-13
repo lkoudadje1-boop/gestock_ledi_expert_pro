@@ -1,46 +1,44 @@
+// backend/controllers/load.controller.js
 const LoadService = require('../services/load.service');
 const { MODULE_ROUTES } = require('../config/licenseMap');
-const CompanyModel = require('../models/Company.model');
 
-exports.getSystemStatus = (req, res) => {
+exports.getSystemStatus = async (req, res) => {
     try {
-        const companyId = req.headers['x-company-id'] || req.user?.companyId || 1;
-        const data = LoadService.getSystemStatus(companyId);
+        const companyId = req.headers['x-company-id'] || req.user?.companyId || req.user?.company_id || '1';
+        const data = await LoadService.getSystemStatus(companyId.toString());
         
-        console.log(`[LICENCE] Status envoyé pour Company ${companyId}:`, data.valid ? "VALIDE" : "INVALIDE");
+        console.log(`[LICENCE CLOUD] Status envoyé pour Company ${companyId}:`, data.valid ? "VALIDE" : "INVALIDE");
         res.json(data);
     } catch (err) {
         console.error("❌ Error LoadController (Status):", err.message);
-        res.status(500).json({ error: "Erreur lors du chargement système" });
+        res.status(500).json({ success: false, error: "Erreur lors du chargement système" });
     }
 };
 
-exports.updateLicense = (req, res) => {
+exports.updateLicense = async (req, res) => {
     try {
         const { licenseData } = req.body;
-        const activeCompanyId = req.headers['x-company-id'] || req.user?.companyId;
+        const activeCompanyId = req.headers['x-company-id'] || req.user?.companyId || req.user?.company_id;
 
-        // Validation rapide
-        if (!licenseData) return res.status(400).json({ error: "Données absentes" });
+        if (!licenseData) return res.status(400).json({ success: false, error: "Données absentes" });
+        if (!activeCompanyId) return res.status(401).json({ success: false, error: "Entreprise non identifiée" });
 
-        // On délègue TOUTE la logique au service
-        // (Le service va mettre à jour la BDD ET le fichier .dat)
-        LoadService.saveMetadata(licenseData, activeCompanyId);
+        // En mode Cloud, la licence est rattachée au companyId et stockée dans MongoDB (via le service)
+        await LoadService.saveMetadata(licenseData, activeCompanyId.toString());
 
         // Rafraîchissement du statut pour le renvoyer au client
-        const updatedStatus = LoadService.getSystemStatus(activeCompanyId);
+        const updatedStatus = await LoadService.getSystemStatus(activeCompanyId.toString());
         
-        // Optionnel : Mise à jour du cache global de l'app si nécessaire
         req.app.set('license', updatedStatus); 
 
         res.json({ 
             success: true, 
-            message: "Système activé avec succès",
+            message: "Licence d'entreprise activée avec succès",
             newStatus: updatedStatus 
         });
 
     } catch (err) {
-        console.error("❌ [CONTROLLER] Erreur activation:", err.message);
-        res.status(500).json({ error: err.message || "Erreur interne" });
+        console.error("❌ [CONTROLLER] Erreur activation licence cloud:", err.message);
+        res.status(500).json({ success: false, error: err.message || "Erreur interne" });
     }
 };

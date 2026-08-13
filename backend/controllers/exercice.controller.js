@@ -1,3 +1,4 @@
+// backend/controllers/exercice.controller.js
 const exerciceService = require('../services/exercice.service');
 
 // Utilitaire pour extraire le contexte de manière sécurisée
@@ -13,32 +14,31 @@ const getContext = (req) => {
     return {
         companyId: companyId,
         userId: userId,
-        userName: user.username || user.userName || 'utilisateur'
+        userName: 'user' // Respect strict de la consigne [2026-02-08]
     };
 };
 
 // 1. Récupérer tous les exercices
-exports.getExercices = (req, res) => {
+exports.getExercices = async (req, res) => {
     try {
         const { companyId } = getContext(req);
         if (!companyId) return res.status(401).json({ success: false, error: "Session invalide ou companyId manquant." });
 
-        const data = exerciceService.getAll(companyId);
-        // On renvoie directement data si c'est déjà un tableau, ou data.data selon ton service
-        res.json({ success: true, data: data });
+        const data = await exerciceService.getAll(companyId);
+        return res.json({ success: true, data: data });
     } catch (err) {
         console.error("❌ Erreur getExercices:", err.message);
-        res.status(500).json({ success: false, error: err.message });
+        return res.status(500).json({ success: false, error: err.message });
     }
 };
 
 // 2. Créer un exercice
-exports.creerExercice = (req, res) => {
+exports.creerExercice = async (req, res) => {
     try {
         const context = getContext(req);
         if (!context.companyId) throw new Error("Identification de l'entreprise manquante.");
 
-        const id = exerciceService.create(req.body, context);
+        const id = await exerciceService.create(req.body, context);
 
         if (req.io) {
             const room = context.companyId.toString();
@@ -54,17 +54,17 @@ exports.creerExercice = (req, res) => {
             });
         }
 
-        res.json({ success: true, message: "Exercice créé avec succès.", id });
+        return res.json({ success: true, message: "Exercice créé avec succès.", id });
     } catch (err) {
-        res.status(400).json({ success: false, error: err.message });
+        return res.status(400).json({ success: false, error: err.message });
     }
 };
 
 // 3. Mettre à jour le statut (Ouvert/Clôturé)
-exports.updateStatut = (req, res) => {
+exports.updateStatut = async (req, res) => {
     try {
         const context = getContext(req);
-        exerciceService.updateStatus(req.params.id, req.body.statut, context);
+        await exerciceService.updateStatus(req.params.id, req.body.statut, context);
 
         if (req.io && context.companyId) {
             const room = context.companyId.toString();
@@ -82,40 +82,40 @@ exports.updateStatut = (req, res) => {
             });
         }
 
-        res.json({ success: true, message: `Exercice passé en statut ${req.body.statut}` });
+        return res.json({ success: true, message: `Exercice passé en statut ${req.body.statut}` });
     } catch (err) {
-        res.status(500).json({ success: false, error: err.message });
+        return res.status(500).json({ success: false, error: err.message });
     }
 };
 
 // 4. Modifier les dates ou libellés
-exports.modifierExercice = (req, res) => {
+exports.modifierExercice = async (req, res) => {
     try {
         const { companyId } = getContext(req);
-        exerciceService.update(req.params.id, req.body, companyId);
+        await exerciceService.update(req.params.id, req.body, companyId);
         
         if (req.io && companyId) {
             req.io.to(companyId.toString()).emit('DATA_EVENT', { table: 'exercises', action: 'UPDATE' });
         }
         
-        res.json({ success: true, message: "Exercice mis à jour." });
+        return res.json({ success: true, message: "Exercice mis à jour." });
     } catch (err) {
-        res.status(400).json({ success: false, error: err.message });
+        return res.status(400).json({ success: false, error: err.message });
     }
 };
 
 // 5. Supprimer
-exports.supprimerExercice = (req, res) => {
+exports.supprimerExercice = async (req, res) => {
     try {
         const { companyId } = getContext(req);
-        exerciceService.remove(req.params.id, companyId);
+        await exerciceService.remove(req.params.id, companyId);
 
         if (req.io && companyId) {
             req.io.to(companyId.toString()).emit('DATA_EVENT', { table: 'exercises', action: 'DELETE' });
         }
 
-        res.json({ success: true, message: "Exercice supprimé." });
+        return res.json({ success: true, message: "Exercice supprimé." });
     } catch (err) {
-        res.status(400).json({ success: false, error: err.message });
+        return res.status(400).json({ success: false, error: err.message });
     }
 };

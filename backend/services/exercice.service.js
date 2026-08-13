@@ -1,4 +1,9 @@
-const { getDb } = require('../config/database');
+// backend/services/exercice.service.js
+const mongoose = require('mongoose');
+const { 
+    CloudExercice, CloudEcriture, CloudLigneEcriture, 
+    CloudBrouillonLigne, CloudReportANouveau, CloudAuditLog 
+} = require('../models/cloud.model');
 const { logAction } = require('../utils/auditHelper');
 
 /**
@@ -16,11 +21,7 @@ const validerPeriodeComptable = (libelle, date_debut, date_fin) => {
         throw new Error(`Pour l'exercice ${libelle}, la date de fin doit être postérieure à la date de début.`);
     }
 
-    // Calcul de l'écart en mois
     const diffMois = (fin.getFullYear() - debut.getFullYear()) * 12 + (fin.getMonth() - debut.getMonth());
-
-    // En comptabilité standard, l'écart entre le 01/01 et le 31/12 d'une même année est de 11 mois.
-    // Un écart de 12 mois ou plus signifie que l'exercice déborde sur une deuxième année.
     if (diffMois >= 12) {
         throw new Error(`Incohérence sur ${libelle} : La durée d'un exercice ne peut pas dépasser 12 mois.`);
     }
@@ -29,178 +30,183 @@ const validerPeriodeComptable = (libelle, date_debut, date_fin) => {
 /**
  * Récupère la liste des exercices
  */
-exports.getAll = (companyId) => {
-    const db = getDb();
-    try {
-        const rows = db.prepare(`
-            SELECT * FROM exercices 
-            WHERE company_id = ? 
-            ORDER BY date_debut DESC
-        `).all(companyId);
-        
-        return rows || []; 
-    } catch (err) {
-        console.error("Erreur SQL getAll Exercices:", err.message);
-        throw err;
-    }
+exports.getAll = async (companyId) => {
+    return await CloudExercice.find({ company_id: companyId.toString() }).sort({ date_debut: -1 }).lean();
 };
 
 /**
  * Logique de création d'un exercice
  */
-exports.create = (data, user) => {
-    const db = getDb();
+exports.create = async (data, user) => {
     const { libelle, date_debut, date_fin, genererRAN } = data;
     const { companyId, userId, userName } = user;
 
-    // 🛡️ Validation de la durée avant insertion
     validerPeriodeComptable(libelle, date_debut, date_fin);
 
-    const id = `EX-${Date.now()}`;
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-    db.transaction(() => {
-        // 1. Vérifier le dernier exercice
-        const dernierEx = db.prepare(`
-            SELECT id, libelle, statut FROM exercices 
-            WHERE company_id = ? ORDER BY date_debut DESC LIMIT 1
-        `).get(companyId);
+    try {
+        const dernierEx = await CloudExercice.findOne({ company_id: companyId.toString() })
+            .sort({ date_debut: -1 })
+            .session(session);
 
         if (dernierEx && dernierEx.statut === 'OUVERT') {
             throw new Error(`L'exercice ${dernierEx.libelle} doit être au moins en clôture provisoire.`);
         }
 
-        // 2. Insertion
-        db.prepare(`
-            INSERT INTO exercices (id, company_id, libelle, date_debut, date_fin, statut, sync_status)
-            VALUES (?, ?, ?, ?, ?, 'OUVERT', 'pending')
-        `).run(id, companyId, libelle.toUpperCase(), date_debut, date_fin);
+        const id = `EX-${Date.now()}`;
+        await CloudExercice.create([{
+            localId: id,
+            company_id: companyId.toString(),
+            libelle: libelle.toUpperCase(),
+            date_debut: new Date(date_debut),
+            date_fin: new Date(date_fin),
+            statut: 'OUVERT',
+            sync_status: 'synced'
+        }], { session });
 
-        // Synchronisation Cloud
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('exercices', ?, 'INSERT', ?)
-        `).run(id, companyId);
-
-        // 3. Logique RAN
-        if (genererRAN && dernierEx) {
-            logAction({
-                userId, userName,
-                actionType: 'INSERTION',
-                tableConcernee: 'ecritures',
-                description: `Génération automatique des RAN pour l'exercice ${libelle}`,
-                companyId
-            });
-        }
-
-        // 4. Audit
-        logAction({
+        await logAction({
             userId, userName,
             actionType: 'INSERTION',
             tableConcernee: 'exercices',
             referenceId: id,
             description: `Ouverture exercice ${libelle} (RAN: ${genererRAN ? 'OUI' : 'NON'})`,
-            companyId
+            companyId: companyId.toString()
         });
-    })();
 
-    return id;
+        await session.commitTransaction();
+        session.endSession();
+        return id;
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
 /**
- * Mise à jour du statut (Ouvert, Pré-clôture, Clôture)
+ * Mise à jour du statut
  */
-exports.updateStatus = (id, statut, user) => {
-    const db = getDb();
+exports.updateStatus = async (id, statut, user) => {
     const { companyId, userName, userId } = user;
-    const dateCloture = statut === 'CLOTURE' ? new Date().toISOString() : null;
-    const userCloture = statut === 'CLOTURE' ? userName : null;
+    const dateCloture = statut === 'CLOTURE' ? new Date() : null;
 
-    db.transaction(() => {
-        const ex = db.prepare("SELECT statut FROM exercices WHERE id = ? AND company_id = ?").get(id, companyId);
-        if (!ex) throw new Error("Exercice introuvable.");
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-        db.prepare(`
-            UPDATE exercices 
-            SET statut = ?, date_cloture = ?, user_cloture = ?, sync_status = 'pending'
-            WHERE id = ? AND company_id = ?
-        `).run(statut, dateCloture, userCloture, id, companyId);
-
-        db.prepare(`
-            INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-            VALUES ('exercices', ?, 'UPDATE', ?)
-        `).run(id, companyId);
-
-        let descAudit = statut === 'PRE_CLOTURE' ? `Clôture provisoire de l'exercice` 
-                      : statut === 'CLOTURE' ? `Clôture DÉFINITIVE de l'exercice` 
-                      : `Réouverture de l'exercice`;
-
-        logAction({
-            userId, userName, 
-            actionType: 'MODIFICATION',
-            tableConcernee: 'exercices', 
-            referenceId: id,
-            description: descAudit,
-            companyId
-        });
-    })();
-};
-
-/**
- * Modification sécurisée (Verrouillage si activité)
- */
-exports.update = (id, data, companyId) => {
-    const db = getDb();
-    const { libelle, date_debut, date_fin } = data;
-
-    // 🛡️ Validation de la durée avant mise à jour
-    validerPeriodeComptable(libelle, date_debut, date_fin);
-
-    db.transaction(() => {
-        const check = db.prepare(`
-            SELECT 
-                (SELECT COUNT(*) FROM lignes_ecritures WHERE exercice_id = ? AND company_id = ? AND is_deleted = 0) as nb_lignes,
-                (SELECT COUNT(*) FROM ecritures WHERE exercice_id = ? AND company_id = ?) as nb_entetes,
-                (SELECT COUNT(*) FROM brouillon_lignes WHERE exercice_id = ? AND company_id = ?) as nb_brouillons
-        `).get(id, companyId, id, companyId, id, companyId);
-
-        const aDeLActivite = (check.nb_lignes > 0 || check.nb_entetes > 0 || check.nb_brouillons > 0);
-
-        if (aDeLActivite) {
-            const exActuel = db.prepare("SELECT date_debut, date_fin FROM exercices WHERE id = ?").get(id);
-            // Si activité, on interdit de toucher aux dates
-            if (date_debut !== exActuel.date_debut || date_fin !== exActuel.date_fin) {
-                throw new Error(`🔒 Verrouillé : Cet exercice contient déjà des écritures ou brouillons. Modification des dates impossible.`);
+    try {
+        const updateQuery = {
+            $set: {
+                statut: statut,
+                updated_at: new Date(),
+                sync_status: 'synced'
             }
-            db.prepare(`UPDATE exercices SET libelle = ?, updated_at = CURRENT_TIMESTAMP, sync_status = 'pending' WHERE id = ? AND company_id = ?`)
-              .run(libelle.toUpperCase(), id, companyId);
-        } else {
-            // Si aucune activité, on autorise la modification complète
-            db.prepare(`UPDATE exercices SET libelle = ?, date_debut = ?, date_fin = ?, updated_at = CURRENT_TIMESTAMP, sync_status = 'pending' WHERE id = ? AND company_id = ?`)
-              .run(libelle.toUpperCase(), date_debut, date_fin, id, companyId);
+        };
+        if (dateCloture) {
+            updateQuery.$set.date_cloture = dateCloture;
+            updateQuery.$set.user_cloture = userName;
         }
 
-        db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('exercices', ?, 'UPDATE', ?)`).run(id, companyId);
-    })();
+        const result = await CloudExercice.updateOne(
+            { $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }], company_id: companyId.toString() },
+            updateQuery
+        ).session(session);
+
+        if (result.matchedCount === 0) throw new Error("Exercice introuvable.");
+
+        let descAudit = statut === 'PRE_CLOTURE' ? `Clôture provisoire de l'exercice` 
+                        : statut === 'CLOTURE' ? `Clôture DÉFINITIVE de l'exercice` 
+                        : `Réouverture de l'exercice`;
+
+        await logAction({
+            userId, userName,
+            actionType: 'MODIFICATION',
+            tableConcernee: 'exercices',
+            referenceId: id,
+            description: descAudit,
+            companyId: companyId.toString()
+        });
+
+        await session.commitTransaction();
+        session.endSession();
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
+};
+
+/**
+ * Modification sécurisée
+ */
+exports.update = async (id, data, companyId) => {
+    const { libelle, date_debut, date_fin } = data;
+    validerPeriodeComptable(libelle, date_debut, date_fin);
+
+    const session = await mongoose.startSession();
+    session.startTransaction();
+
+    try {
+        const ex = await CloudExercice.findOne({ $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }], company_id: companyId.toString() }).session(session);
+        if (!ex) throw new Error("Exercice introuvable.");
+
+        const aDeLActivite = await CloudEcriture.exists({ exercice_id: ex.localId, company_id: companyId.toString() }) ||
+                            await CloudLigneEcriture.exists({ exercice_id: ex.localId, company_id: companyId.toString() }) ||
+                            await CloudBrouillonLigne.exists({ exercice_id: ex.localId, company_id: companyId.toString() });
+
+        if (aDeLActivite) {
+            if (new Date(date_debut).getTime() !== new Date(ex.date_debut).getTime() || 
+                new Date(date_fin).getTime() !== new Date(ex.date_fin).getTime()) {
+                throw new Error(`🔒 Verrouillé : Cet exercice contient déjà des écritures. Modification des dates impossible.`);
+            }
+            await CloudExercice.updateOne({ _id: ex._id }, { $set: { libelle: libelle.toUpperCase(), updated_at: new Date() } }).session(session);
+        } else {
+            await CloudExercice.updateOne({ _id: ex._id }, { 
+                $set: { 
+                    libelle: libelle.toUpperCase(), 
+                    date_debut: new Date(date_debut), 
+                    date_fin: new Date(date_fin), 
+                    updated_at: new Date() 
+                } 
+            }).session(session);
+        }
+
+        await session.commitTransaction();
+        session.endSession();
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };
 
 /**
  * Suppression
  */
-exports.remove = (id, companyId) => {
-    const db = getDb();
-    db.transaction(() => {
-        const check = db.prepare(`
-            SELECT 
-                (SELECT COUNT(*) FROM ecritures WHERE exercice_id = ? AND company_id = ?) as nb_e,
-                (SELECT COUNT(*) FROM lignes_ecritures WHERE exercice_id = ? AND company_id = ?) as nb_l
-        `).get(id, companyId, id, companyId);
+exports.remove = async (id, companyId) => {
+    const session = await mongoose.startSession();
+    session.startTransaction();
 
-        if (check.nb_e > 0 || check.nb_l > 0) {
-            throw new Error(`🔒 Suppression impossible : ${check.nb_e + check.nb_l} enregistrements sont rattachés à cet exercice.`);
+    try {
+        const ex = await CloudExercice.findOne({ $or: [{ localId: id }, { _id: mongoose.isValidObjectId(id) ? id : null }], company_id: companyId.toString() }).session(session);
+        if (!ex) throw new Error("Exercice introuvable.");
+
+        const aDeLActivite = await CloudEcriture.exists({ exercice_id: ex.localId }) || 
+                             await CloudLigneEcriture.exists({ exercice_id: ex.localId });
+
+        if (aDeLActivite) {
+            throw new Error(`🔒 Suppression impossible : des enregistrements sont rattachés à cet exercice.`);
         }
 
-        db.prepare("DELETE FROM reports_a_nouveau WHERE exercice_id = ? AND company_id = ?").run(id, companyId);
-        db.prepare("DELETE FROM exercices WHERE id = ? AND company_id = ?").run(id, companyId);
-        db.prepare(`INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('exercices', ?, 'DELETE', ?)`).run(id, companyId);
-    })();
+        await CloudReportANouveau.deleteMany({ exercice_id: ex.localId }).session(session);
+        await CloudExercice.deleteOne({ _id: ex._id }).session(session);
+
+        await session.commitTransaction();
+        session.endSession();
+    } catch (err) {
+        await session.abortTransaction();
+        session.endSession();
+        throw err;
+    }
 };

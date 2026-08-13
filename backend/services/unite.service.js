@@ -1,4 +1,5 @@
-const { getDb } = require('../config/database');
+// backend/services/unite.service.js
+const { CloudUnite, CloudProduct } = require('../models/cloud.model');
 const { logAction } = require('../utils/auditHelper');
 const crypto = require('crypto');
 
@@ -6,22 +7,20 @@ class UniteService {
     /**
      * Récupère la liste des unités actives
      */
-    findAll(companyId) {
-        const db = getDb();
-        return db.prepare(`
-            SELECT id, code, libelle, coefficient, unite_reference 
-            FROM unites 
-            WHERE (company_id = ? OR company_id IS NULL) 
-            AND is_active = 1
-            ORDER BY libelle ASC
-        `).all(companyId);
+    async findAll(companyId) {
+        return await CloudUnite.find({
+            company_id: companyId.toString(),
+            is_active: true
+        })
+        .select('localId code libelle coefficient unite_reference')
+        .sort({ libelle: 1 })
+        .lean();
     }
 
     /**
      * Crée une nouvelle unité de mesure
      */
     async create(data, user) {
-        const db = getDb();
         const { companyId, id: userId, username: userName } = user;
         
         // Validation
@@ -35,33 +34,33 @@ class UniteService {
         const libelleFmt = data.libelle.trim();
         const refFmt = data.unite_reference ? data.unite_reference.trim() : 'Bouteille';
 
-        const result = db.transaction(() => {
-            db.prepare(`
-                INSERT INTO unites (id, code, libelle, coefficient, unite_reference, company_id, sync_status, is_active)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', 1)
-            `).run(id, codeFmt, libelleFmt, coeffFmt, refFmt, companyId);
-            
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('unites', ?, 'INSERT', ?)").run(id, companyId);
-            return id;
-        })();
+        await CloudUnite.create({
+            localId: id,
+            code: codeFmt,
+            libelle: libelleFmt,
+            coefficient: coeffFmt,
+            unite_reference: refFmt,
+            company_id: companyId.toString(),
+            sync_status: 'synced',
+            is_active: true
+        });
 
-        logAction({
+        await logAction({
             userId, userName,
             actionType: 'CREATE',
             tableConcernee: 'unites',
             referenceId: id,
             description: `Création unité: ${libelleFmt} (1 ${codeFmt} = ${coeffFmt} ${refFmt})`,
-            companyId
+            companyId: companyId.toString()
         });
 
-        return result;
+        return id;
     }
 
     /**
      * Modifie une unité de mesure existante
      */
     async update(id, data, user) {
-        const db = getDb();
         const { companyId, id: userId, username: userName } = user;
         
         const coeffFmt = parseFloat(data.coefficient);
@@ -70,28 +69,30 @@ class UniteService {
         }
 
         const codeFmt = data.code.toUpperCase().trim();
+        const libelleFmt = data.libelle.trim();
         const refFmt = data.unite_reference ? data.unite_reference.trim() : 'Bouteille';
 
-        db.transaction(() => {
-            const existing = db.prepare('SELECT id FROM unites WHERE id = ? AND company_id = ?').get(id, companyId);
-            if (!existing) throw new Error("Unité de mesure introuvable.");
+        const updated = await CloudUnite.findOneAndUpdate(
+            { localId: id.toString(), company_id: companyId.toString() },
+            { 
+                code: codeFmt, 
+                libelle: libelleFmt, 
+                coefficient: coeffFmt, 
+                unite_reference: refFmt, 
+                sync_status: 'synced', 
+                updated_at: new Date() 
+            }
+        );
 
-            db.prepare(`
-                UPDATE unites 
-                SET code = ?, libelle = ?, coefficient = ?, unite_reference = ?, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND company_id = ?
-            `).run(codeFmt, data.libelle.trim(), coeffFmt, refFmt, id, companyId);
+        if (!updated) throw new Error("Unité de mesure introuvable.");
 
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('unites', ?, 'UPDATE', ?)").run(id, companyId);
-        })();
-
-        logAction({
+        await logAction({
             userId, userName,
             actionType: 'UPDATE',
             tableConcernee: 'unites',
-            referenceId: id,
-            description: `Modification unité: ${data.libelle}`,
-            companyId
+            referenceId: id.toString(),
+            description: `Modification unité: ${libelleFmt}`,
+            companyId: companyId.toString()
         });
 
         return { success: true };
@@ -101,33 +102,29 @@ class UniteService {
      * Supprime une unité de mesure (Soft Delete)
      */
     async delete(id, user) {
-        const db = getDb();
         const { companyId, id: userId, username: userName } = user;
 
-        const libelleUnite = db.transaction(() => {
-            const current = db.prepare('SELECT libelle FROM unites WHERE id = ? AND company_id = ?').get(id, companyId);
-            if (!current) throw new Error("Unité de mesure introuvable.");
+        const unite = await CloudUnite.findOne({ localId: id.toString(), company_id: companyId.toString() });
+        if (!unite) throw new Error("Unité de mesure introuvable.");
 
-            // Vérification intégrité avant désactivation
-            const inUse = db.prepare("SELECT id FROM products WHERE unite_id = ? LIMIT 1").get(id);
-            if (inUse) {
-                throw new Error("Impossible : Cette unité est utilisée par des produits.");
-            }
+        // Vérification intégrité avant désactivation
+        const inUse = await CloudProduct.findOne({ unite_id: id.toString() });
+        if (inUse) {
+            throw new Error("Impossible : Cette unité est utilisée par des produits.");
+        }
 
-            // Désactivation au lieu de suppression physique
-            db.prepare("UPDATE unites SET is_active = 0, sync_status = 'pending' WHERE id = ? AND company_id = ?").run(id, companyId);
-            db.prepare("INSERT INTO sync_queue (table_name, record_id, operation, company_id) VALUES ('unites', ?, 'DELETE', ?)").run(id, companyId);
+        // Désactivation au lieu de suppression physique
+        unite.is_active = false;
+        unite.sync_status = 'synced';
+        await unite.save();
 
-            return current.libelle;
-        })();
-
-        logAction({
+        await logAction({
             userId, userName,
             actionType: 'DELETE',
             tableConcernee: 'unites',
-            referenceId: id,
-            description: `Désactivation de l'unité : ${libelleUnite}`,
-            companyId
+            referenceId: id.toString(),
+            description: `Désactivation de l'unité : ${unite.libelle}`,
+            companyId: companyId.toString()
         });
 
         return { success: true };

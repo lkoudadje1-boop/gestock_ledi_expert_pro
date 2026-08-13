@@ -1,5 +1,6 @@
-const { getDb } = require('../config/database');
-const { logAction } = require('../utils/auditHelper');
+// backend/services/others_tiers.controller.service.js
+const mongoose = require('mongoose');
+const { CloudOthersTiers, CloudAuditLog } = require('../models/cloud.model');
 
 class OthersTiersService {
     // Générateur d'ID spécifique
@@ -8,100 +9,159 @@ class OthersTiersService {
     }
 
     // Récupérer tous les tiers
-    getAll(companyId) {
-        const db = getDb();
-        return db.prepare(`SELECT * FROM others_tiers WHERE company_id = ? ORDER BY nom ASC`).all(companyId);
+    async getAll(companyId) {
+        return await CloudOthersTiers.find({ company_id: companyId.toString() }).sort({ nom: 1 }).lean();
     }
 
     // Créer un tiers
-    create(data, user) {
-        const db = getDb();
-        const { companyId, userId, username: userName } = user;
-        const { nom, nif, contact, telephone, email, adresse } = data;
+    async create(data, user) {
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            const companyId = user?.companyId?.toString() || user?.company_id?.toString();
+            const userId = user?.userId?.toString() || user?.id?.toString();
+            const userName = user?.username || "utilisateur";
+            const { nom, nif, contact, telephone, email, adresse } = data;
 
-        const tierId = this.genererIdOtherTier();
-        const nomPropre = nom.toUpperCase();
+            const tierId = this.genererIdOtherTier();
+            const nomPropre = nom.toUpperCase();
 
-        db.transaction(() => {
-            db.prepare(`
-                INSERT INTO others_tiers (id, company_id, nom, nif, contact, telephone, email, adresse, is_active, sync_status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending')
-            `).run(tierId, companyId, nomPropre, nif || '0', contact || nomPropre, telephone || '', email || '', adresse || '');
+            // 1. Création du tiers dans MongoDB Atlas
+            await CloudOthersTiers.create([{
+                localId: tierId,
+                company_id: companyId,
+                nom: nomPropre,
+                nif: nif || '0',
+                contact: contact || nomPropre,
+                telephone: telephone || '',
+                email: email || '',
+                adresse: adresse || '',
+                is_active: 1,
+                sync_status: 'synced'
+            }], { session });
 
-            // 🔄 Synchronisation Cloud (INSERT)
-            db.prepare(`
-                INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-                VALUES ('others_tiers', ?, 'INSERT', ?)
-            `).run(tierId, companyId);
+            // 2. Journalisation de l'audit
+            const logId = `LOG-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+            await CloudAuditLog.create([{
+                localId: logId,
+                user_id: userId,
+                user_name: userName,
+                action_type: 'INSERTION',
+                table_concernee: 'others_tiers',
+                reference_id: tierId,
+                description: `Création tiers divers: ${nomPropre}`,
+                date_action: new Date(),
+                company_id: companyId,
+                sync_status: 'synced'
+            }], { session });
 
-            logAction({ 
-                userId, userName, actionType: 'INSERTION', 
-                tableConcernee: 'others_tiers', referenceId: tierId, 
-                description: `Création tiers divers: ${nomPropre}`, companyId 
-            });
-        })();
+            await session.commitTransaction();
+            session.endSession();
 
-        return { tierId, nomPropre };
+            return { tierId, nomPropre };
+        } catch (error) {
+            await session.abortTransaction();
+            session.endSession();
+            throw error;
+        }
     }
 
     // Mettre à jour un tiers
-    update(id, data, user) {
-        const db = getDb();
-        const { companyId, userId, username: userName } = user;
-        const { nom, nif, contact, telephone, email, adresse, is_active } = data;
-        const nomPropre = nom.toUpperCase();
+    async update(id, data, user) {
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            const companyId = user?.companyId?.toString() || user?.company_id?.toString();
+            const userId = user?.userId?.toString() || user?.id?.toString();
+            const userName = user?.username || "utilisateur";
+            const { nom, nif, contact, telephone, email, adresse, is_active } = data;
+            const nomPropre = nom.toUpperCase();
 
-        let result;
-        db.transaction(() => {
-            result = db.prepare(`
-                UPDATE others_tiers 
-                SET nom = ?, nif = ?, contact = ?, telephone = ?, email = ?, adresse = ?, is_active = ?, sync_status = 'pending', updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND company_id = ?
-            `).run(nomPropre, nif || '0', contact || nomPropre, telephone || '', email || '', adresse || '', is_active ? 1 : 0, id, companyId);
+            // 1. Mise à jour du tiers
+            const result = await CloudOthersTiers.updateOne(
+                { localId: id, company_id: companyId },
+                {
+                    $set: {
+                        nom: nomPropre,
+                        nif: nif || '0',
+                        contact: contact || nomPropre,
+                        telephone: telephone || '',
+                        email: email || '',
+                        adresse: adresse || '',
+                        is_active: is_active ? 1 : 0,
+                        sync_status: 'synced',
+                        updated_at: new Date()
+                    }
+                },
+                { session }
+            );
 
-            if (result.changes > 0) {
-                // 🔄 Synchronisation Cloud (UPDATE)
-                db.prepare(`
-                    INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-                    VALUES ('others_tiers', ?, 'UPDATE', ?)
-                `).run(id, companyId);
-
-                logAction({ 
-                    userId, userName, actionType: 'MODIFICATION', 
-                    tableConcernee: 'others_tiers', referenceId: id, 
-                    description: `Mise à jour tiers divers: ${nomPropre}`, companyId 
-                });
+            if (result.matchedCount > 0) {
+                // 2. Journalisation de l'audit si modifié
+                const logId = `LOG-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+                await CloudAuditLog.create([{
+                    localId: logId,
+                    user_id: userId,
+                    user_name: userName,
+                    action_type: 'MODIFICATION',
+                    table_concernee: 'others_tiers',
+                    reference_id: id,
+                    description: `Mise à jour tiers divers: ${nomPropre}`,
+                    date_action: new Date(),
+                    company_id: companyId,
+                    sync_status: 'synced'
+                }], { session });
             }
-        })();
 
-        return result.changes > 0;
+            await session.commitTransaction();
+            session.endSession();
+
+            return result.matchedCount > 0;
+        } catch (error) {
+            await session.abortTransaction();
+            session.endSession();
+            throw error;
+        }
     }
 
     // Supprimer un tiers
-    delete(id, user) {
-        const db = getDb();
-        const { companyId, userId, username: userName } = user;
+    async delete(id, user) {
+        const session = await mongoose.startSession();
+        session.startTransaction();
+        try {
+            const companyId = user?.companyId?.toString() || user?.company_id?.toString();
+            const userId = user?.userId?.toString() || user?.id?.toString();
+            const userName = user?.username || "utilisateur";
 
-        let result;
-        db.transaction(() => {
-            result = db.prepare(`DELETE FROM others_tiers WHERE id = ? AND company_id = ?`).run(id, companyId);
-            
-            if (result.changes > 0) {
-                // 🔄 Synchronisation Cloud (DELETE) avant ou après l'opération
-                db.prepare(`
-                    INSERT INTO sync_queue (table_name, record_id, operation, company_id) 
-                    VALUES ('others_tiers', ?, 'DELETE', ?)
-                `).run(id, companyId);
+            // 1. Suppression du tiers
+            const result = await CloudOthersTiers.deleteOne({ localId: id, company_id: companyId }).session(session);
 
-                logAction({ 
-                    userId, userName, actionType: 'SUPPRESSION', 
-                    tableConcernee: 'others_tiers', referenceId: id, 
-                    description: `Suppression tiers divers ${id}`, companyId 
-                });
+            if (result.deletedCount > 0) {
+                // 2. Journalisation de l'audit si supprimé
+                const logId = `LOG-${Date.now().toString().slice(-6)}-${Math.floor(Math.random() * 1000)}`;
+                await CloudAuditLog.create([{
+                    localId: logId,
+                    user_id: userId,
+                    user_name: userName,
+                    action_type: 'SUPPRESSION',
+                    table_concernee: 'others_tiers',
+                    reference_id: id,
+                    description: `Suppression tiers divers ${id}`,
+                    date_action: new Date(),
+                    company_id: companyId,
+                    sync_status: 'synced'
+                }], { session });
             }
-        })();
 
-        return result.changes > 0;
+            await session.commitTransaction();
+            session.endSession();
+
+            return result.deletedCount > 0;
+        } catch (error) {
+            await session.abortTransaction();
+            session.endSession();
+            throw error;
+        }
     }
 }
 
