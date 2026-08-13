@@ -679,6 +679,9 @@ const deleteTemporaryFactureCart = async (vendeurId, companyId) => {
 const getTemporaryFactureCart = async (vendeurId, companyId) => {
     return [];
 };
+const syncTemporaryFactureCart = async (vendeurId, companyId, lignes) => {
+    return true;
+};
 
 const getSaleByLotId = async (lotId, companyId) => {
     const companyStr = companyId.toString();
