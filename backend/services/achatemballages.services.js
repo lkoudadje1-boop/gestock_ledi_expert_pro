@@ -4,7 +4,7 @@ const {
     CloudPackagingPurchase, 
     CloudPackaging, 
     CloudPackagingMovement 
-} = require('./cloud.model'); // Assurez-vous que ces modèles Mongoose sont bien exportés depuis cloud.model.js
+} = require('../models/cloud.model');
 const { logAction } = require('../utils/auditHelper');
 
 function genererIdAchat() {
