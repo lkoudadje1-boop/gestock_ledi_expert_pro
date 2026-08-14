@@ -1,23 +1,30 @@
-// backend/middlewares/permissionManager.js
 const LoadService = require('../services/load.service');
 const { aAccesAuModule } = require('../config/licenseMap');
 
 const gatekeeper = async (req, res, next) => {
     const path = req.path.toLowerCase();
 
-    // 1. BYPASS DÉVELOPPEMENT
-    if (process.env.NODE_ENV !== 'production') {
-        return next();
-    }
-
-    // 2. ROUTES PUBLIQUES / SYSTÈME
-    if (path.includes('/api/license') || path.includes('/api/auth/login')) {
+    // 1. ROUTES PUBLIQUES / SYSTÈME & FRONTEND INITIAL
+    // On autorise l'authentification, les licences, les compagnies et les requêtes GET non-API (Frontend React)
+    if (
+        (req.method === 'GET' && !path.startsWith('/api')) ||
+        path.includes('/api/auth') || 
+        path.includes('/api/license') || 
+        path.includes('/api/company') || 
+        path.includes('/api/companies') ||
+        path.includes('/api/settings')
+    ) {
         return next();
     }
 
     try {
         // Récupération sécurisée du companyId depuis les headers ou l'utilisateur connecté
         const companyId = req.headers['x-company-id'] || req.user?.companyId || req.user?.company_id;
+
+        // Si aucun identifiant d'entreprise n'est fourni, on laisse passer (la route API spécifique gérera l'erreur si besoin)
+        if (!companyId) {
+            return next();
+        }
 
         // 3. RÉCUPÉRATION DU STATUT (Asynchrone Cloud)
         let status = req.app.get('license');
