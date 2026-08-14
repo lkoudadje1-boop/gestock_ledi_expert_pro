@@ -1,5 +1,5 @@
 import React, { forwardRef } from 'react';
-import conversestock from '../../services/conversestock';
+import { ConversionStockService } from '../../utils/converisonstock';
 
 /**
  * Composant BonCommandePrint
