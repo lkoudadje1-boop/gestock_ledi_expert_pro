@@ -4,7 +4,7 @@ import axios from 'axios';
 // ======================================================
 // URL DE BASE CLOUD (Railway - SaaS 100% Web)
 // ======================================================
-const BASE_URL = process.env.REACT_APP_API_URL || 'https://ton-projet.railway.app/api';
+const BASE_URL = process.env.REACT_APP_API_URL || '/api';
 
 // ======================================================
 // INSTANCE AXIOS
