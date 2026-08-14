@@ -3,7 +3,6 @@ import { useNavigate, Link } from 'react-router-dom';
 import { useTranslation } from 'react-i18next'; // Hook de traduction global
 import { Mail, Lock, Building2, ArrowRight, HelpCircle, Eye, EyeOff, AlertTriangle, Home } from 'lucide-react';
 import API from '../services/api';
-import { initAutoSync } from '../services/syncManager'; // 🚀 IMPORT DU SERVICE DE SYNCHRO AUTO
 import './Login.css'; 
 
 const Login = () => {
@@ -47,18 +46,13 @@ const Login = () => {
           localStorage.setItem('licenseStatus', JSON.stringify(license));
         }
 
-        // 🚀 2. DÉMARRAGE DE LA SYNCHRONISATION AUTOMATIQUE EN ARRIÈRE-PLAN (POLLING 30s)
-        // Permet au PC de l'employé de remonter ses données locales et de récupérer 
-        // en temps réel les modifications faites par le patron sur le Cloud.
-        initAutoSync(user.company_id, 30000);
-
-        // 3. Détermination de la route cible selon le rôle
+        // 2. Détermination de la route cible selon le rôle
         let targetPath = '/admin/dashboard';
         if (user.role !== 'admin' && user.role !== 'super_admin' && user.branch_id) {
           targetPath = `/branch/${user.branch_id}/dashboard`;
         }
 
-        // 4. Redirection immédiate
+        // 3. Redirection immédiate
         navigate(targetPath);
       }
     } catch (err) {
