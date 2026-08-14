@@ -9,8 +9,8 @@ import { io } from 'socket.io-client';
  */
 
 // URL de base du backend sur Railway (modifiable via variable d'environnement React)
-const BASE_URL = process.env.REACT_APP_API_URL || 'https://ton-projet.railway.app/api';
-const SOCKET_URL = process.env.REACT_APP_WS_URL || 'https://ton-projet.railway.app';
+const BASE_URL = process.env.REACT_APP_API_URL || '/api';
+const SOCKET_URL = process.env.REACT_APP_WS_URL || '';
 
 console.log('🚀 LEDI ERP - Mode Cloud Web activé');
 console.log(`📡 Connexion au serveur : ${BASE_URL}`);
